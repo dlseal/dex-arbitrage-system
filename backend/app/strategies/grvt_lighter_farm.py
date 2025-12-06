@@ -16,6 +16,8 @@ class GrvtLighterFarmStrategy:
         self.active_orders: Dict[str, str] = {}
         self.active_order_prices: Dict[str, float] = {}
 
+        self.order_create_time: Dict[str, float] = {}
+
         self.is_hedging: Dict[str, bool] = {}
         self.last_quote_time: Dict[str, float] = {}
         self.QUOTE_INTERVAL = Config.TRADE_COOLDOWN if hasattr(Config, 'TRADE_COOLDOWN') else 2.0
@@ -74,6 +76,7 @@ class GrvtLighterFarmStrategy:
                 if symbol in self.active_orders and self.active_orders[symbol] == order_id:
                     del self.active_orders[symbol]
                     del self.active_order_prices[symbol]
+                    self.order_create_time.pop(symbol, None)
         except Exception:
             pass
 
@@ -92,16 +95,14 @@ class GrvtLighterFarmStrategy:
 
     async def _manage_maker_orders(self, symbol: str):
         now = time.time()
-        if now - self.last_quote_time.get(symbol, 0) < self.QUOTE_INTERVAL: return
+        # 降低频率控制，让循环跑得快一点，但下单由逻辑控制
+        if now - self.last_quote_time.get(symbol, 0) < 0.5: return
         self.last_quote_time[symbol] = now
 
         grvt_tick = self.tickers[symbol]['GRVT']
         lighter_tick = self.tickers[symbol]['Lighter']
 
-        # 获取当前应该交易的方向
         maker_side = self._get_current_side(symbol)
-
-        # 计算目标价格 (传入方向)
         target_price = self._calculate_safe_maker_price(symbol, grvt_tick, lighter_tick, maker_side)
 
         if not target_price:
@@ -114,6 +115,10 @@ class GrvtLighterFarmStrategy:
         # 1. 挂新单
         if not current_order_id:
             logger.info(f"🆕 [挂单] {symbol} {maker_side} {quantity} @ {target_price}")
+
+            # 记录下单时间
+            self.order_create_time[symbol] = time.time()
+
             new_id = await self.adapters['GRVT'].create_order(
                 symbol=f"{symbol}-USDT",
                 side=maker_side,
@@ -121,7 +126,6 @@ class GrvtLighterFarmStrategy:
                 price=target_price,
                 order_type="LIMIT"
             )
-            # 兼容处理
             if new_id and new_id != "0x00":
                 self.active_orders[symbol] = new_id
                 self.active_order_prices[symbol] = target_price
@@ -130,25 +134,29 @@ class GrvtLighterFarmStrategy:
 
         # 2. 改单检查
         else:
+            # 🟢 保护机制：如果订单存活小于 10 秒，强行不改单 (除非价格偏差极大)
+            # 这能有效解决“刚挂就撤”的问题，给订单成交的机会
+            order_age = time.time() - self.order_create_time.get(symbol, 0)
+            if order_age < 10.0:
+                return
+
             price_diff_pct = abs(target_price - current_price) / current_price
             should_cancel = False
 
+            # 只依赖阈值检查 (例如偏差 > 0.05% 才改单)
+            # 删除了之前激进的 < grvt_tick['bid'] 检查
             if price_diff_pct > Config.REQUOTE_THRESHOLD:
                 should_cancel = True
 
-            # 抢占盘口检查
-            if maker_side == 'BUY' and current_price < grvt_tick['bid']:
-                should_cancel = True
-            elif maker_side == 'SELL' and current_price > grvt_tick['ask']:
-                should_cancel = True
-
             if should_cancel:
-                logger.info(f"♻️ [调价] {symbol} {maker_side} 当前:{current_price} -> 目标:{target_price}")
+                logger.info(
+                    f"♻️ [调价] {symbol} {maker_side} 当前:{current_price} -> 目标:{target_price} (Diff: {price_diff_pct:.4%})")
                 try:
                     await self.adapters['GRVT'].cancel_order(current_order_id)
                 except Exception as e:
                     logger.error(f"撤单失败: {e}")
 
+                # 清理状态，下一次循环会重新下单
                 if symbol in self.active_orders:
                     del self.active_orders[symbol]
                     del self.active_order_prices[symbol]
@@ -196,6 +204,7 @@ class GrvtLighterFarmStrategy:
         if symbol in self.active_orders:
             del self.active_orders[symbol]
             del self.active_order_prices[symbol]
+            self.order_create_time.pop(symbol, None)
 
         asyncio.create_task(self._execute_hedge_loop(symbol, side, size))
 
