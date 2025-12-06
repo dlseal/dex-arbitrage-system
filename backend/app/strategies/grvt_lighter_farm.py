@@ -248,7 +248,10 @@ class GrvtLighterFarmStrategy:
         """
         # GRVT 买 -> Lighter 卖； GRVT 卖 -> Lighter 买
         hedge_side = 'SELL' if grvt_side.upper() == 'BUY' else 'BUY'
-        symbol_pair = f"{symbol}-USDT"
+
+        # 🔴 修复1：Lighter 的 symbol 是 "BTC" 而不是 "BTC-USDT"
+        # symbol_pair = f"{symbol}-USDT"
+        target_symbol = symbol
 
         retry_count = 0
         max_retries = 20  # 高频场景多试几次
@@ -261,14 +264,30 @@ class GrvtLighterFarmStrategy:
                     logger.error("❌ 超过最大连续失败次数，暂停重试以防风控")
                     # 这里可以加入更复杂的熔断逻辑
 
-                logger.info(f"🌊 [对冲] Lighter {hedge_side} {size} (第 {retry_count + 1} 次)")
+                # 🔴 修复2：计算市价单的滑点保护价格
+                lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
+                execution_price = 0.0
+
+                if lighter_tick:
+                    # 宽松的滑点保护 (5%)，确保成交。Lighter 是订单簿DEX，必须给价格。
+                    if hedge_side == 'BUY':
+                        # 买入：允许价格高一点 (Ask * 1.05)
+                        base_price = lighter_tick['ask'] if lighter_tick['ask'] > 0 else lighter_tick['bid']
+                        execution_price = base_price * 1.05
+                    else:
+                        # 卖出：允许价格低一点 (Bid * 0.95)
+                        base_price = lighter_tick['bid'] if lighter_tick['bid'] > 0 else lighter_tick['ask']
+                        execution_price = base_price * 0.95
+
+                logger.info(f"🌊 [对冲] Lighter {hedge_side} {size} @ ~{execution_price:.2f} (第 {retry_count + 1} 次)")
 
                 # Lighter 适配器已封装 create_order，传入 order_type="MARKET"
-                # 注意：Lighter 的 Market Order 需要 API 支持，适配器里必须有相应实现
+                # 注意：传入正确的 target_symbol 和 execution_price
                 order_id = await self.adapters['Lighter'].create_order(
-                    symbol=symbol_pair,
+                    symbol=target_symbol,
                     side=hedge_side,
                     amount=size,
+                    price=execution_price,
                     order_type="MARKET"
                 )
 
@@ -277,7 +296,8 @@ class GrvtLighterFarmStrategy:
                     success = True
                     break
                 else:
-                    logger.warning("⚠️ Lighter 下单失败 (返回 None)，0.5s 后重试...")
+                    # 如果返回 None，通常是 symbol 不对或网络问题
+                    logger.warning("⚠️ Lighter 下单失败 (返回 None)，可能原因：Symbol不匹配或API错误")
 
             except Exception as e:
                 logger.error(f"❌ 对冲异常: {e}")

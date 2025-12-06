@@ -282,7 +282,10 @@ class LighterAdapter(BaseExchange):
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
         info = self.market_config.get(symbol)
-        if not info: return None
+        if not info:
+            logging.error(
+                f"❌ [Lighter] Symbol '{symbol}' not found in market config. Available: {list(self.market_config.keys())}")
+            return None
         amount_int = int(amount * info['size_mul'])
         price_int = int(price * info['price_mul']) if price else 0
         is_ask = True if side.lower() == 'sell' else False
