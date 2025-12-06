@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Set
 from app.config import Config
 
 logger = logging.getLogger("GL_Farm")
@@ -9,38 +9,42 @@ logger = logging.getLogger("GL_Farm")
 
 class GrvtLighterFarmStrategy:
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v1"
+        self.name = "GrvtLighter_Farm_v4_AutoFuse"
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        # 记录我们在 GRVT 的挂单状态
-        self.active_orders: Dict[str, str] = {}  # {symbol: order_id}
-        self.active_order_prices: Dict[str, float] = {}  # {symbol: price}
+        # --- 状态管理 ---
+        self.active_orders: Dict[str, str] = {}
+        self.active_order_prices: Dict[str, float] = {}
 
-        # 1. 风险控制：改单时间戳 (用于防抖动)
+        # 繁忙状态锁 (One-Shot 模式)
+        self.busy_symbols: Set[str] = set()
+
+        # 风控：改单时间戳
         self.last_quote_time: Dict[str, float] = {}
-        self.QUOTE_INTERVAL = 2.0  # 最小改单间隔 (秒)
+        self.QUOTE_INTERVAL = 2.0
 
-        # 2. 风险控制：资金枯竭保护 (临时方案)
-        self.trade_counter = 0
-        self.MAX_TRADES_PER_SESSION = 50  # 运行 50 单后自动停止，防止单边资金耗尽
+        # 🔥 核心风控：连续失败熔断机制
+        self.consecutive_failures = 0
+        self.max_failures = Config.MAX_CONSECUTIVE_FAILURES
+        self.is_broken = False  # 熔断标志位
 
-        # 锁，防止并发对冲
+        # 异步锁
         self.hedge_lock = asyncio.Lock()
+        self.farm_side = Config.FARM_SIDE
 
-        logger.info(f"🚜 刷量策略已加载: GRVT(Maker) <-> Lighter(Taker)")
-        logger.info(f"   - 单笔数量: {Config.TRADE_QUANTITIES}")
-        logger.info(f"   - 滑点容忍: {Config.MAX_SLIPPAGE_TOLERANCE}")
-        logger.info(f"   - 深度检查: 开启")
+        logger.info(f"🛡️ 自动熔断策略 v4 已加载")
+        logger.info(f"   - 熔断规则: 连续 {self.max_failures} 次对冲失败即停止")
+        logger.info(f"   - 队列策略: 自动丢弃过期数据")
+        logger.info(f"   - 交易方向: {self.farm_side}")
 
     async def on_tick(self, event: dict):
-        """主入口"""
-        # 熔断检查
-        if self.trade_counter >= self.MAX_TRADES_PER_SESSION:
-            if self.trade_counter == self.MAX_TRADES_PER_SESSION:
-                logger.warning(
-                    f"🛑 [熔断] 已达到单次运行最大交易次数 ({self.MAX_TRADES_PER_SESSION})。请检查余额并重启程序。")
-                self.trade_counter += 1  # 防止重复打印
+        # 🔥 全局熔断检查
+        if self.is_broken:
+            if int(time.time()) % 10 == 0:  # 每10秒打印一次提示，避免刷屏
+                logger.error(
+                    f"🛑 [系统已熔断] 连续失败次数过多 ({self.consecutive_failures})，策略已停止运行。请检查日志并重启。")
+                await asyncio.sleep(1)
             return
 
         event_type = event.get('type', 'tick')
@@ -51,83 +55,78 @@ class GrvtLighterFarmStrategy:
             await self._process_trade_fill(event)
 
     async def _process_tick(self, tick: dict):
-        """处理行情更新"""
         symbol = tick['symbol']
         exchange = tick['exchange']
 
-        # 更新行情缓存
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        # 只有当两边都有行情时才计算
+        if symbol in self.busy_symbols: return
+
         if 'Lighter' not in self.tickers[symbol] or 'GRVT' not in self.tickers[symbol]:
             return
 
-        # 执行挂单逻辑
         await self._manage_maker_orders(symbol)
 
     async def _manage_maker_orders(self, symbol: str):
-        """核心挂单逻辑 (带防抖和深度检查)"""
+        if symbol in self.busy_symbols: return
 
-        # --- 风控 1: 防抖动 (Rate Limit Protection) ---
         now = time.time()
-        last_time = self.last_quote_time.get(symbol, 0)
-        if now - last_time < self.QUOTE_INTERVAL:
-            return  # 还没到改单时间，跳过
+        if now - self.last_quote_time.get(symbol, 0) < self.QUOTE_INTERVAL:
+            return
 
         lighter_book = self.tickers[symbol]['Lighter']
         qty = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
-        # --- 风控 2: Lighter 深度检查 (Depth Check) ---
-        # 简单检查：虽然 Ticker 通常只给 Best Bid/Ask，但如果价格异常低，说明深度不够
-        # 更严谨的做法需要 fetch_orderbook 获取 full depth。
-        # 这里做一个简单的“价差保护”：如果 Lighter 的 Bid/Ask 价差超过 0.5%，说明流动性枯竭，不挂单
-        spread_pct = (lighter_book['ask'] - lighter_book['bid']) / lighter_book['bid']
-        if spread_pct > 0.005:  # 0.5%
-            # logger.debug(f"⚠️ [深度不足] {symbol} Lighter 价差过大 ({spread_pct*100:.2f}%)，暂停挂单")
-            return
+        # 计算价格
+        target_price = 0.0
+        ref_price = 0.0
 
-        # 计算目标买单价格
-        # 目标：GRVT_Bid = Lighter_Bid + Tolerance
-        target_bid_price = lighter_book['bid'] * (1 + Config.MAX_SLIPPAGE_TOLERANCE)
-        target_bid_price = float(f"{target_bid_price:.2f}")  # 简单精度处理
+        if self.farm_side == 'BUY':
+            if lighter_book['bid'] <= 0: return
+            ref_price = lighter_book['bid']
+            target_price = ref_price * (1 + Config.MAX_SLIPPAGE_TOLERANCE)
+            if (lighter_book['ask'] - lighter_book['bid']) / lighter_book['bid'] > 0.005: return
+        else:
+            if lighter_book['ask'] <= 0: return
+            ref_price = lighter_book['ask']
+            target_price = ref_price * (1 - Config.MAX_SLIPPAGE_TOLERANCE)
+            if (lighter_book['ask'] - lighter_book['bid']) / lighter_book['bid'] > 0.005: return
 
+        target_price = float(f"{target_price:.2f}")
+
+        # 挂单
         current_order_id = self.active_orders.get(symbol)
 
         if not current_order_id:
-            # --- 新挂单 ---
-            logger.info(f"➕ [挂单] {symbol} GRVT Buy Limit @ {target_bid_price} (Ref Lighter: {lighter_book['bid']})")
+            logger.info(f"➕ [挂单] {symbol} GRVT {self.farm_side} @ {target_price}")
+
+            if symbol in self.busy_symbols: return
 
             new_id = await self.adapters['GRVT'].create_order(
                 symbol=f"{symbol}-USDT",
-                side='BUY',
+                side=self.farm_side,
                 amount=qty,
-                price=target_bid_price,
+                price=target_price,
                 order_type="LIMIT"
             )
 
             if new_id:
                 self.active_orders[symbol] = new_id
-                self.active_order_prices[symbol] = target_bid_price
-                self.last_quote_time[symbol] = now  # 更新时间戳
-
+                self.active_order_prices[symbol] = target_price
+                self.last_quote_time[symbol] = now
         else:
-            # --- 检查重挂 (Re-quote) ---
+            # 如果下单失败，也强制冷却 2 秒，防止日志刷屏和死循环
+            logger.warning(f"⚠️ 下单失败，强制冷却 {self.QUOTE_INTERVAL}s")
+            self.last_quote_time[symbol] = now
             last_price = self.active_order_prices.get(symbol, 0)
-            if last_price <= 0: return
-
-            deviation = abs(target_bid_price - last_price) / last_price
-
-            if deviation > Config.REQUOTE_THRESHOLD:
-                # 价格偏离过大，这里为了简化，我们只做“记录”。
-                # 生产环境应当：await cancel_order() -> await create_order()
-                # 并在 active_orders 中更新 ID
-                # logger.info(f"🔄 [需重挂] {symbol} 偏离 {deviation:.4f}")
-                self.last_quote_time[symbol] = now  # 即使没动作，也更新时间防止日志刷屏
-                pass
+            if last_price > 0:
+                deviation = abs(target_price - last_price) / last_price
+                if deviation > Config.REQUOTE_THRESHOLD:
+                    self.last_quote_time[symbol] = now
+                    pass
 
     async def _process_trade_fill(self, trade: dict):
-        """处理成交：对冲 + 重试 + 回滚"""
         exchange = trade['exchange']
         symbol = trade['symbol']
         side = trade['side']
@@ -135,16 +134,24 @@ class GrvtLighterFarmStrategy:
 
         if exchange != 'GRVT': return
 
+        # 锁定
+        self.busy_symbols.add(symbol)
+
         hedge_side = 'SELL' if side.upper() == 'BUY' else 'BUY'
         symbol_pair = f"{symbol}-USDT"
 
         async with self.hedge_lock:
-            logger.info(f"🚨 [成交触发] GRVT {side} {size} {symbol} @ {trade['price']} -> 正在 Lighter 对冲...")
+            logger.info(f"🚨 [成交触发] GRVT {side} {size} {symbol} -> 🔒 锁定状态")
 
-            # 增加计数器
-            self.trade_counter += 1
+            # 清理旧单 (Cancel Remaining)
+            if symbol in self.active_orders:
+                # order_id = self.active_orders[symbol]
+                # await self.adapters['GRVT'].cancel_order(order_id)
+                del self.active_orders[symbol]
+                del self.active_order_prices[symbol]
 
-            # --- Phase 1: 尝试对冲 (Retry 3 times) ---
+            # --- 对冲逻辑 ---
+            logger.info(f"🌊 [开始对冲] Lighter {hedge_side} Market...")
             hedge_success = False
             for i in range(3):
                 try:
@@ -154,30 +161,43 @@ class GrvtLighterFarmStrategy:
                         amount=size,
                         order_type="MARKET"
                     )
-                    logger.info(f"✅ [对冲完成] Lighter Market {hedge_side} (尝试第 {i + 1} 次成功)")
+                    logger.info(f"✅ [对冲完成] Lighter Market {hedge_side}")
                     hedge_success = True
                     break
                 except Exception as e:
-                    logger.warning(f"⚠️ [对冲失败] 第 {i + 1} 次尝试 Lighter 报错: {e}")
+                    logger.warning(f"⚠️ 对冲重试 {i + 1}/3: {e}")
                     await asyncio.sleep(0.5)
 
-            # --- Phase 2: 回滚 (Unwind) ---
-            if not hedge_success:
-                logger.error(f"❌ [严重风险] Lighter 对冲彻底失败！正在尝试平掉 GRVT 仓位 (Unwind)...")
+            # --- 结果判定与熔断计数 ---
+            if hedge_success:
+                # 🎉 成功：重置连续失败计数器
+                if self.consecutive_failures > 0:
+                    logger.info(f"✨ 连续失败计数器已重置 (之前失败: {self.consecutive_failures})")
+                self.consecutive_failures = 0
+            else:
+                # ☠️ 失败：增加计数
+                self.consecutive_failures += 1
+                logger.error(f"❌ 对冲彻底失败！当前连续失败次数: {self.consecutive_failures}/{self.max_failures}")
+
+                # 执行 Unwind (即使对冲失败也要尝试平仓)
                 try:
                     unwind_side = 'SELL' if side.upper() == 'BUY' else 'BUY'
-                    # 市价强平 GRVT
                     await self.adapters['GRVT'].create_order(
-                        symbol=symbol_pair,
-                        side=unwind_side,
-                        amount=size,
-                        order_type="MARKET"
+                        symbol=symbol_pair, side=unwind_side, amount=size, order_type="MARKET"
                     )
-                    logger.warning(f"🛡️ [风控执行] GRVT 仓位已强平 (Unwind Done)。")
+                    logger.warning(f"🛡️ 回滚/强平 完成")
                 except Exception as e:
-                    logger.critical(f"💀 [灾难] GRVT 强平也失败了！请人工介入！错误: {e}")
+                    logger.critical(f"💀 回滚失败: {e}")
 
-            # 清理本地挂单记录 (因为已成交)
-            if symbol in self.active_orders:
-                del self.active_orders[symbol]
-                del self.active_order_prices[symbol]
+                # 🔥 检查是否触发熔断
+                if self.consecutive_failures >= self.max_failures:
+                    self.is_broken = True
+                    logger.critical(f"🛑 [触发熔断] 连续失败次数达到阈值 ({self.max_failures})！系统停止开新单！")
+
+            # --- 冷却与解锁 ---
+            logger.info(f"⏳ [冷却中] ...")
+            await asyncio.sleep(Config.TRADE_COOLDOWN)
+
+            if symbol in self.busy_symbols:
+                self.busy_symbols.remove(symbol)
+            logger.info(f"🔓 [解锁] {symbol}")

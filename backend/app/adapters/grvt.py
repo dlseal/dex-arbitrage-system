@@ -165,13 +165,38 @@ class GrvtAdapter(BaseExchange):
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
         info = self._get_contract_info(symbol)
-        qty = float(Decimal(str(amount)))
-        px = float(Decimal(str(price))) if price else 0.0
 
-        # 默认 Post Only 以确保拿到 Maker Rebate
+        # 1. 获取市场精度配置 (Decimal类型)
+        tick_size = info.get('tick_size')
+        min_size = info.get('min_size')  # 通常也是步长
+
+        # 2. 数量精度修正
+        # 将数量转换为 Decimal
+        d_amount = Decimal(str(amount))
+        if min_size and min_size > 0:
+            # 逻辑：(数量 / 步长) 取整 * 步长
+            # 例如: amount=0.1234, min_size=0.01 -> 12.34 -> 12 -> 0.12
+            d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
+
+        qty = float(d_amount)
+
+        # 3. 价格精度修正
+        px = 0.0
+        if price:
+            d_price = Decimal(str(price))
+            if tick_size and tick_size > 0:
+                # 逻辑：(价格 / Tick) 取整 * Tick
+                # 例如: price=89444.56, tick=0.1 -> 894445.6 -> 894446 (四舍五入) -> 89444.6
+                d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
+            px = float(d_price)
+
+        # 4. 强制小写 (修复之前的 'side' 报错)
+        side = side.lower()
+
+        # 默认 Post Only
         params = {'post_only': True, 'order_duration_secs': 2591999}
         if order_type == "MARKET":
-            params = {}  # 市价单不需要 post_only
+            params = {}
 
         loop = asyncio.get_running_loop()
         try:
@@ -185,7 +210,8 @@ class GrvtAdapter(BaseExchange):
                 ))
             return res['id']
         except Exception as e:
-            logging.info(f"❌ [GRVT] Order Error: {e}")
+            # 打印修正后的参数，方便调试
+            logging.error(f"❌ [GRVT] Order Error: {e} | Side:{side} Qty:{qty} Price:{px}")
             return None
 
     async def listen_websocket(self, queue: asyncio.Queue):

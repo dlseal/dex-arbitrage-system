@@ -48,6 +48,11 @@ class Config:
     # 重挂单阈值: 当目标价格与当前挂单价格偏差超过此比例时，撤单重挂
     REQUOTE_THRESHOLD = float(os.getenv("REQUOTE_THRESHOLD", "0.0005"))
 
+    FARM_SIDE = os.getenv("FARM_SIDE", "BUY").upper()
+    #连续失败熔断阈值
+    # 如果连续 3 次对冲失败（Lighter下单报错），则触发熔断停止策略
+    MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "3"))
+
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
