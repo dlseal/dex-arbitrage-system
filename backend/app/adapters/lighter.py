@@ -189,11 +189,7 @@ class LighterAdapter(BaseExchange):
                  symbols: List[str] = None):
         super().__init__("Lighter")
         self.base_url = "https://mainnet.zklighter.elliot.ai"
-
-        # 🟢 最终修正：加回 encoding=json 但去掉 readonly=true
-        # encoding=json 是过 AWS WAF 的关键，去掉 readonly=true 是收数据的关键
-        self.ws_url = "wss://mainnet.zklighter.elliot.ai/stream?encoding=json"
-
+        self.ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
         self.api_key = api_key
         self.private_key = private_key
         self.account_index = account_index
