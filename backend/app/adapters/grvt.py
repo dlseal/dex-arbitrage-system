@@ -4,12 +4,12 @@ import os
 import logging
 import traceback
 from decimal import Decimal
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
-# 引入 GRVT SDK 核心组件
+# 引入 GRVT SDK
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
-from pysdk.grvt_ccxt_env import GrvtEnv
+from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
 from pysdk.grvt_ccxt_logging_selector import logger as sdk_logger
 
 from .base import BaseExchange
@@ -17,17 +17,23 @@ from .base import BaseExchange
 
 class GrvtAdapter(BaseExchange):
     """
-    GRVT 交易所适配器 (基于官方 test_grvt_ccxt_ws.py 重构)
+    GRVT 交易所适配器 (增强版：修复资源清理与超时重试)
     """
 
-    def __init__(self, api_key: str, private_key: str, trading_account_id: str):
+    def __init__(self,
+                 api_key: str,
+                 private_key: str,
+                 trading_account_id: str,
+                 symbols: List[str] = None):
+
         super().__init__("GRVT")
 
         self.api_key = api_key
         self.private_key = private_key
         self.trading_account_id = trading_account_id
 
-        # 环境配置
+        self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
+
         env_str = os.getenv('GRVT_ENVIRONMENT', 'prod').lower()
         env_map = {
             'prod': GrvtEnv.PROD,
@@ -37,31 +43,53 @@ class GrvtAdapter(BaseExchange):
         }
         self.env = env_map.get(env_str, GrvtEnv.PROD)
 
+        # rest_client 是同步的，ws_client 是异步的
         self.rest_client: Optional[GrvtCcxt] = None
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
 
     async def initialize(self):
         """
-        初始化：REST 和 WS
+        初始化：带重试机制
         """
-        try:
-            # 1. 初始化 REST Client (用于获取市场信息)
-            params = {
-                'trading_account_id': self.trading_account_id,
-                'private_key': self.private_key,
-                'api_key': self.api_key
-            }
-            self.rest_client = GrvtCcxt(env=self.env, parameters=params)
+        retry_count = 3
+        for attempt in range(retry_count):
+            try:
+                await self._initialize_logic()
+                return  # 成功则退出
+            except Exception as e:
+                print(f"⚠️ [GRVT] Init Failed (Attempt {attempt + 1}/{retry_count}): {e}")
+                # 只有最后一次失败才抛出异常
+                if attempt == retry_count - 1:
+                    traceback.print_exc()
+                    await self.close()  # 安全清理
+                    raise e
 
-            # 2. 动态加载市场配置
-            print(f"⏳ [GRVT] Fetching markets from {self.env.name}...")
-            markets = await self._fetch_markets_async()
+                # 等待后重试
+                await asyncio.sleep(2)
 
-            loaded_count = 0
-            for market in markets:
-                if market.get('kind') == 'PERPETUAL' and market.get('quote') == 'USDT':
-                    symbol = f"{market.get('base')}-{market.get('quote')}"
+    async def _initialize_logic(self):
+        # 1. 初始化 REST (同步)
+        params = {
+            'trading_account_id': self.trading_account_id,
+            'private_key': self.private_key,
+            'api_key': self.api_key
+        }
+        self.rest_client = GrvtCcxt(env=self.env, parameters=params)
+
+        # 2. 动态加载市场
+        print(f"⏳ [GRVT] Fetching markets from {self.env.name}...")
+        markets = await self._fetch_markets_async()
+
+        loaded_count = 0
+        for market in markets:
+            base = market.get('base')
+            quote = market.get('quote')
+            kind = market.get('kind')
+
+            if kind == 'PERPETUAL' and quote == 'USDT':
+                if base in self.target_symbols:
+                    symbol = f"{base}-{quote}"
                     self.contract_map[symbol] = {
                         "id": market.get('instrument'),
                         "tick_size": Decimal(str(market.get('tick_size', 0))),
@@ -69,65 +97,74 @@ class GrvtAdapter(BaseExchange):
                     }
                     loaded_count += 1
 
-            print(f"   - Loaded {loaded_count} markets.")
+        if loaded_count == 0:
+            print(f"⚠️ [GRVT] Warning: No target markets found for {self.target_symbols}")
 
-            # 3. 初始化 WS Client (完全参考官方示例)
-            loop = asyncio.get_running_loop()
+        # 3. 初始化 WS
+        loop = asyncio.get_running_loop()
+        ws_params = {
+            'api_key': self.api_key,
+            'trading_account_id': self.trading_account_id,
+            'api_ws_version': 'v1',
+            'private_key': self.private_key
+        }
 
-            # 官方示例要求的 WS 参数
-            ws_params = {
-                'api_key': self.api_key,
-                'trading_account_id': self.trading_account_id,
-                'api_ws_version': 'v1',  # 关键：指定版本
-                'private_key': self.private_key
-            }
+        self.ws_client = GrvtCcxtWS(
+            env=self.env,
+            loop=loop,
+            logger=sdk_logger,
+            parameters=ws_params
+        )
 
-            # 传入 loop 和 logger
-            self.ws_client = GrvtCcxtWS(
-                env=self.env,
-                loop=loop,
-                logger=sdk_logger,
-                parameters=ws_params
-            )
+        await self.ws_client.initialize()  # 这里最容易超时
+        await asyncio.sleep(1)
 
-            await self.ws_client.initialize()
-
-            # 给一点时间建立连接
-            await asyncio.sleep(1)
-
-            self.is_connected = True
-            print(f"✅ [GRVT] Initialized.")
-
-        except Exception as e:
-            print(f"❌ [GRVT] Init Failed: {e}")
-            traceback.print_exc()
-            await self.close()  # 清理资源
-            raise e
+        self.is_connected = True
+        print(f"✅ [GRVT] Initialized. Monitoring: {self.target_symbols}")
 
     async def _fetch_markets_async(self):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.rest_client.fetch_markets)
 
     def _get_contract_info(self, symbol: str):
+        if "-" not in symbol: symbol = f"{symbol}-USDT"
         info = self.contract_map.get(symbol)
         if not info:
-            raise ValueError(f"Market {symbol} not found in GRVT configs")
+            raise ValueError(f"Market {symbol} not found (Targets: {self.target_symbols})")
         return info
 
+    # --- 修复后的 close 方法 ---
+    async def close(self):
+        """安全清理资源"""
+        # 1. 清理 WS 客户端 (异步)
+        if self.ws_client:
+            try:
+                # 尝试访问内部 session 并关闭
+                if hasattr(self.ws_client, '_session') and self.ws_client._session:
+                    if not self.ws_client._session.closed:
+                        await self.ws_client._session.close()
+            except Exception as e:
+                print(f"⚠️ [GRVT] WS Close Error: {e}")
+
+        # 2. 清理 REST 客户端 (同步)
+        # 注意：GrvtCcxt 是同步的，通常不需要 await 关闭，或者它没有显式的 close 方法
+        # 这里什么都不做，或者如果它有 close() 就同步调用
+        if self.rest_client:
+            pass
+
+            # --- 其他方法保持不变 ---
+
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        """REST 获取订单簿 (作为备用)"""
         info = self._get_contract_info(symbol)
         loop = asyncio.get_running_loop()
         ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=10))
-
         bids = ob.get('bids', [])
         asks = ob.get('asks', [])
         best_bid = float(bids[0]['price']) if bids else 0.0
         best_ask = float(asks[0]['price']) if asks else 0.0
-
         return {
             'exchange': self.name,
-            'symbol': symbol,
+            'symbol': symbol.split('-')[0],
             'bid': best_bid,
             'ask': best_ask,
             'ts': int(time.time() * 1000)
@@ -138,12 +175,7 @@ class GrvtAdapter(BaseExchange):
         info = self._get_contract_info(symbol)
         qty = float(Decimal(str(amount)))
         px = float(Decimal(str(price))) if price else 0.0
-
-        params = {
-            'post_only': True,
-            'order_duration_secs': 2591999  # 30天
-        }
-
+        params = {'post_only': True, 'order_duration_secs': 2591999}
         loop = asyncio.get_running_loop()
         try:
             if order_type == "MARKET":
@@ -160,100 +192,52 @@ class GrvtAdapter(BaseExchange):
             return None
 
     async def listen_websocket(self, queue: asyncio.Queue):
-        """
-        WS 监听 (基于官方示例的回调模式)
-        """
         print(f"📡 [GRVT] Starting WS subscriptions...")
         loop = asyncio.get_running_loop()
 
-        # --- 回调处理 ---
         async def message_callback(message: Dict[str, Any]):
-            """通用回调处理"""
             try:
-                # 提取 instrument
-                # 官方示例：message.get("feed", {}).get("instrument")
                 feed_data = message.get("feed", {})
                 instrument = feed_data.get("instrument")
-                channel = message.get("params", {}).get("channel")  # e.g. book.s, order
+                channel = message.get("params", {}).get("channel")
 
-                # 1. 处理订单簿快照 (book.s)
+                symbol_base = None
+                for s, info in self.contract_map.items():
+                    if info['id'] == instrument:
+                        symbol_base = s.split('-')[0]
+                        break
+                if not symbol_base: return
+
                 if channel == "book.s":
-                    # 解析 snapshot
-                    # 结构通常是: feed: { bids: [], asks: [], ... }
                     bids = feed_data.get("bids", [])
                     asks = feed_data.get("asks", [])
-
                     if bids and asks:
-                        best_bid = float(bids[0]['price'])
-                        best_ask = float(asks[0]['price'])
-
-                        # 找到对应的通用 Symbol (BTC-USDT)
-                        symbol = None
-                        for s, info in self.contract_map.items():
-                            if info['id'] == instrument:
-                                symbol = s
-                                break
-
-                        if symbol:
-                            tick = {
-                                'exchange': self.name,
-                                'symbol': symbol,
-                                'bid': best_bid,
-                                'ask': best_ask,
-                                'ts': int(time.time() * 1000)
-                            }
-                            # 放入队列
-                            loop.call_soon_threadsafe(queue.put_nowait, tick)
-
-                # 2. 处理订单更新 (order)
-                elif channel == "order":
-                    # 打印订单状态
-                    state = feed_data.get("state", {})
-                    print(f"🔔 [GRVT] Order Update [{instrument}]: {state.get('status')}")
-
-            except Exception as e:
-                # 生产环境请使用 logging
+                        tick = {
+                            'exchange': self.name,
+                            'symbol': symbol_base,
+                            'bid': float(bids[0]['price']),
+                            'ask': float(asks[0]['price']),
+                            'ts': int(time.time() * 1000)
+                        }
+                        loop.call_soon_threadsafe(queue.put_nowait, tick)
+            except Exception:
                 pass
-
-        # --- 执行订阅 ---
-        # 参考官方示例：await api.subscribe(stream=stream, callback=callback, params=params)
 
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
-
-            # 1. 订阅公共行情 (book.s = Snapshot)
-            # 官方示例 pub_args_dict
+            # 订阅公共行情
             await self.ws_client.subscribe(
                 stream="book.s",
                 callback=message_callback,
                 params={"instrument": instrument_id}
             )
-
-            # 2. 订阅私有订单 (order)
-            # 官方示例 prv_args_dict: 必须传 sub_account_id
+            # 订阅私有订单
             await self.ws_client.subscribe(
                 stream="order",
                 callback=message_callback,
-                params={
-                    "instrument": instrument_id,
-                    "sub_account_id": self.trading_account_id  # 关键！
-                }
+                params={"instrument": instrument_id, "sub_account_id": self.trading_account_id}
             )
-
-            # 为了防止并发订阅过快，加一点点延迟 (参考官方示例里的 sleep(0))
             await asyncio.sleep(0)
 
-        print(f"✅ [GRVT] Subscribed to {len(self.contract_map)} markets.")
-
-        # 保持连接
         while True:
             await asyncio.sleep(1)
-
-    async def close(self):
-        """清理资源"""
-        if self.rest_client and hasattr(self.rest_client, '_session') and self.rest_client._session:
-            await self.rest_client._session.close()
-
-        # WS 清理逻辑，参考 shutdown
-        # 这里简单处理，实际可能需要 cancel task
-        pass

@@ -25,10 +25,16 @@ from app.strategies.spread_arb import SpreadArbitrageStrategy
 
 # 配置日志格式
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,  # <--- 打开调试开关
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", # 增加 %(name)s 查看是哪个模块发的
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+
+# 为了防止 requests/urllib3/asyncio 产生太多垃圾日志，屏蔽掉它们
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("websockets").setLevel(logging.DEBUG) # 👈 关键：我们要看 websockets 的底层日志
+
 logger = logging.getLogger("Main")
 
 
@@ -45,37 +51,34 @@ async def main():
     # 2. 实例化交易所适配器
     adapters: List[BaseExchange] = []
 
-    # --- 初始化 GRVT ---
+    # --- 初始化 GRVT (传入 symbols) ---
     if Config.GRVT_API_KEY:
         try:
             grvt = GrvtAdapter(
                 api_key=Config.GRVT_API_KEY,
                 private_key=Config.GRVT_PRIVATE_KEY,
-                trading_account_id=Config.GRVT_TRADING_ACCOUNT_ID
+                trading_account_id=Config.GRVT_TRADING_ACCOUNT_ID,
+                symbols=Config.TARGET_SYMBOLS  # 👈 关键修改：传入配置
             )
             adapters.append(grvt)
             logger.info("📦 GRVT Adapter 已加载")
         except Exception as e:
             logger.error(f"无法加载 GRVT Adapter: {e}")
-    else:
-        logger.warning("⚠️ 未检测到 GRVT 配置，跳过加载")
 
-    # --- 初始化 Lighter ---
+    # --- 初始化 Lighter (传入 symbols) ---
     if Config.LIGHTER_API_KEY:
         try:
             lighter = LighterAdapter(
-                base_url=Config.LIGHTER_BASE_URL,
                 api_key=Config.LIGHTER_API_KEY,
                 private_key=Config.LIGHTER_PRIVATE_KEY,
                 account_index=Config.LIGHTER_ACCOUNT_INDEX,
                 api_key_index=Config.LIGHTER_API_KEY_INDEX,
+                symbols=Config.TARGET_SYMBOLS  # 👈 关键修改：传入配置
             )
             adapters.append(lighter)
             logger.info("📦 Lighter Adapter 已加载")
         except Exception as e:
             logger.error(f"无法加载 Lighter Adapter: {e}")
-    else:
-        logger.warning("⚠️ 未检测到 Lighter 配置，跳过加载")
 
     if not adapters:
         logger.error("❌ 没有可用的交易所适配器，系统退出。请检查 .env 配置。")

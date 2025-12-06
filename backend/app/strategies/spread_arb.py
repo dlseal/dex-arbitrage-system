@@ -20,7 +20,8 @@ class SpreadArbitrageStrategy:
         self.tickers: Dict[str, Dict[str, float]] = {}
 
         # 核心参数
-        self.spread_threshold = 0.0005  # 触发阈值：0.05% (万分之五)
+        self.spread_threshold = -1.0 #测试参数，无论价差多少，都会被判定为“有机会”
+        # self.spread_threshold = 0.0005  # 触发阈值：0.05% (万分之五)
         self.min_profit_usdt = 5.0  # 最小预估利润 (USDT)
 
         # 简单的状态控制

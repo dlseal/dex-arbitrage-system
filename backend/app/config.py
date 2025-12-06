@@ -6,6 +6,10 @@ load_dotenv()
 
 
 class Config:
+    # --- 全局交易标的配置 ---
+    # 默认只监听 BTC, ETH, SOL。可以通过 .env 设置 TARGET_SYMBOLS=BTC,ETH,SOL,DOGE 来覆盖
+    TARGET_SYMBOLS = os.getenv("TARGET_SYMBOLS", "BTC,ETH,SOL").split(",")
+
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
@@ -19,7 +23,6 @@ class Config:
     # 如果 .env 没填，默认设为 0 (通常主账户 index 是 0)
     LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
     LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "0"))
-    LIGHTER_BASE_URL = os.getenv('LIGHTER_BASE_URL','https://mainnet.zklighter.elliot.ai')
 
     @classmethod
     def validate(cls):

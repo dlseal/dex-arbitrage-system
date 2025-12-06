@@ -2,49 +2,52 @@ import asyncio
 import time
 import json
 import logging
+import websockets
 from typing import Dict, Optional, List
 from .base import BaseExchange
 
-# 引入 Lighter 官方 SDK
 import lighter
 from lighter import SignerClient, ApiClient, Configuration
 
 
 class LighterAdapter(BaseExchange):
     """
-    Lighter.xyz 适配器 (基于官方 WsClient 重构)
+    Lighter.xyz Adapter (Manual WebSocket Implementation)
     """
 
-    def __init__(self, base_url:str,api_key: str, private_key: str, account_index: int = 0, api_key_index: int = 0):
+    def __init__(self,
+                 api_key: str,
+                 private_key: str,
+                 account_index: int = 0,
+                 api_key_index: int = 0,
+                 base_url: str = None,
+                 symbols: List[str] = None):
+
         super().__init__("Lighter")
 
-        self.base_url = base_url
+        # REST URL
+        self.base_url = "https://mainnet.zklighter.elliot.ai"
+        # WS URL (Derived manually)
+        self.ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
 
-        # 身份凭证
         self.api_key = api_key
         self.private_key = private_key
         self.account_index = account_index
         self.api_key_index = api_key_index
 
+        self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
+
         self.client: Optional[SignerClient] = None
         self.api_client: Optional[ApiClient] = None
-        self.ws_client = None  # 保存 WsClient 实例
 
-        # 缓存：市场配置
         self.market_config = {}
-        # 反向映射：ID -> Symbol
         self.id_to_symbol = {}
 
     async def initialize(self):
-        """
-        初始化：获取市场配置并建立 REST 客户端
-        """
         try:
-            # 1. 初始化查询客户端
             config = Configuration(host=self.base_url)
             self.api_client = ApiClient(configuration=config)
 
-            # 2. 动态获取所有市场配置
             print("⏳ [Lighter] Fetching market configurations...")
             order_api = lighter.OrderApi(self.api_client)
             order_books = await order_api.order_books()
@@ -59,9 +62,10 @@ class LighterAdapter(BaseExchange):
                     'price_mul': price_mul
                 }
                 self.id_to_symbol[market.market_id] = market.symbol
-                print(f"   - Loaded {market.symbol}: ID={market.market_id}")
 
-            # 3. 初始化交易客户端
+                if market.symbol in self.target_symbols:
+                    print(f"   - Loaded {market.symbol}: ID={market.market_id}")
+
             private_keys_dict = {self.api_key_index: self.private_key}
             self.client = SignerClient(
                 url=self.base_url,
@@ -81,85 +85,102 @@ class LighterAdapter(BaseExchange):
             raise e
 
     def _get_market_info(self, symbol: str):
-        # "BTC-USDT" -> "BTC"
         target = symbol.split('-')[0]
-
         info = self.market_config.get(target)
         if not info:
-            # 调试辅助：打印前5个可用市场，方便排查
             available = list(self.market_config.keys())[:5]
             raise ValueError(f"Market '{target}' (from '{symbol}') not found. Available: {available}...")
         return info
 
     async def listen_websocket(self, queue: asyncio.Queue):
         """
-        使用 lighter.WsClient 监听数据
+        Manual WebSocket Listener
         """
         loop = asyncio.get_running_loop()
 
-        # 1. 定义回调函数 (注意：这会在 SDK 的独立线程中运行)
-        def on_ob_update(market_id, order_book):
+        while True:
             try:
-                # 找到对应的 symbol
-                if market_id not in self.id_to_symbol:
-                    return
+                print(f"📡 [Lighter] Connecting to {self.ws_url}...")
+                async with websockets.connect(self.ws_url) as ws:
+                    print(f"✅ [Lighter] WS Connected!")
 
-                symbol = self.id_to_symbol[market_id]
-                info = self.market_config[symbol]
+                    # 1. Subscribe
+                    target_ids = []
+                    for symbol, info in self.market_config.items():
+                        if symbol in self.target_symbols:
+                            target_ids.append(info['id'])
 
-                # 解析最佳买卖价
-                # order_book 结构通常是 {'bids': [['price', 'size'], ...], 'asks': ...}
-                # Lighter 返回的可能是原始字符串，需要转换
-                best_bid = 0.0
-                best_ask = 0.0
+                    # Send subscription messages
+                    for market_id in target_ids:
+                        msg = json.dumps({
+                            "type": "subscribe",
+                            "channel": f"order_book/{market_id}"
+                        })
+                        await ws.send(msg)
+                        # print(f"   -> Subscribed ID: {market_id}")
 
-                if order_book.get('bids'):
-                    # 价格需要除以 price_mul
-                    raw_price = float(order_book['bids'][0][0])
-                    best_bid = raw_price / info['price_mul']
+                    # 2. Receive Loop
+                    async for message in ws:
+                        data = json.loads(message)
+                        msg_type = data.get("type")
 
-                if order_book.get('asks'):
-                    raw_price = float(order_book['asks'][0][0])
-                    best_ask = raw_price / info['price_mul']
+                        # Handle Ping
+                        if msg_type == "ping":
+                            await ws.send(json.dumps({"type": "pong"}))
+                            continue
 
-                if best_bid > 0 or best_ask > 0:
-                    tick = {
-                        'exchange': self.name,
-                        'symbol': symbol,
-                        'bid': best_bid,
-                        'ask': best_ask,
-                        'ts': int(time.time() * 1000)
-                    }
-
-                    # 关键：线程安全地推送到 asyncio 队列
-                    loop.call_soon_threadsafe(queue.put_nowait, tick)
+                        # Handle Orderbook Update
+                        # Format based on SDK source:
+                        # {"type": "update/order_book", "channel": "order_book:1", "order_book": {...}}
+                        if msg_type in ["update/order_book", "subscribed/order_book"]:
+                            channel = data.get("channel", "")
+                            if "order_book" in channel:
+                                # Extract ID from "order_book:1"
+                                try:
+                                    market_id = int(channel.split(":")[1])
+                                    self._process_ob_data(market_id, data["order_book"], queue, loop)
+                                except Exception:
+                                    pass
 
             except Exception as e:
-                # 生产环境建议用 logging
-                print(f"⚠️ [Lighter] Callback Error: {e}")
+                print(f"❌ [Lighter] WS Disconnected: {e}. Reconnecting in 5s...")
+                await asyncio.sleep(5)
 
-        # 2. 准备参数
-        market_ids = [info['id'] for info in self.market_config.values()]
+    def _process_ob_data(self, market_id, ob_data, queue, loop):
+        """Process raw OB data from Lighter"""
+        if market_id not in self.id_to_symbol:
+            return
 
-        print(f"📡 [Lighter] Starting WsClient for IDs: {market_ids}")
+        symbol = self.id_to_symbol[market_id]
+        info = self.market_config[symbol]
 
-        # 3. 初始化 SDK WsClient
-        self.ws_client = lighter.WsClient(
-            order_book_ids=market_ids,
-            on_order_book_update=on_ob_update,
-            # 如果需要监听账户变动，可以加 on_account_update
-            # account_ids=[self.account_index]
-        )
+        best_bid = 0.0
+        best_ask = 0.0
 
-        # 4. 在独立线程中运行阻塞的 run() 方法
-        try:
-            # run_in_executor(None, ...) 会使用默认的 ThreadPoolExecutor
-            await loop.run_in_executor(None, self.ws_client.run)
-        except Exception as e:
-            print(f"❌ [Lighter] WS Loop Failed: {e}")
+        # Lighter sends lists of {'price': '...', 'size': '...'}
+        bids = ob_data.get("bids", [])
+        asks = ob_data.get("asks", [])
 
-    # --- 以下保持 REST 实现不变 ---
+        if bids:
+            # Price is likely a string int, e.g. "4200000"
+            raw_p = float(bids[0]["price"])
+            best_bid = raw_p / info["price_mul"]
 
+        if asks:
+            raw_p = float(asks[0]["price"])
+            best_ask = raw_p / info["price_mul"]
+
+        if best_bid > 0 or best_ask > 0:
+            tick = {
+                'exchange': self.name,
+                'symbol': symbol,
+                'bid': best_bid,
+                'ask': best_ask,
+                'ts': int(time.time() * 1000)
+            }
+            loop.call_soon_threadsafe(queue.put_nowait, tick)
+
+    # --- REST (Unchanged) ---
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
         info = self._get_market_info(symbol)
         order_api = lighter.OrderApi(self.api_client)
@@ -203,7 +224,6 @@ class LighterAdapter(BaseExchange):
                     is_ask=is_ask,
                     time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
                 )
-
             if err:
                 print(f"❌ [Lighter] Order Error: {err}")
                 return None
