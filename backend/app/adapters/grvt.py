@@ -210,10 +210,21 @@ class GrvtAdapter(BaseExchange):
                 res = await loop.run_in_executor(None, lambda: self.rest_client.create_limit_order(
                     symbol=info['id'], side=side, amount=qty, price=px, params=params
                 ))
-
             # 兼容不同格式的返回值
             if isinstance(res, dict):
-                return res.get('id') or res.get('order_id') or str(res.get('client_order_id', ''))
+                # 优先获取系统 ID
+                oid = res.get('id') or res.get('order_id')
+                # 获取客户端 ID
+                cid = str(res.get('client_order_id', ''))
+
+                # 修复：如果系统 ID 为 0x00 或空，则必须使用 client_order_id
+                if not oid or oid == "0x00":
+                    if cid:
+                        return cid
+                    else:
+                        logging.error(f"❌ [GRVT] 下单返回无效 ID: {res}")
+                        return None
+                return oid
             return str(res)
 
         except Exception as e:

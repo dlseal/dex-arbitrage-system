@@ -124,9 +124,11 @@ class GrvtLighterFarmStrategy:
                 price=target_price,
                 order_type="LIMIT"  # 适配器内部已默认 Post-Only
             )
-            if new_id:
+            if new_id and new_id != "0x00":
                 self.active_orders[symbol] = new_id
                 self.active_order_prices[symbol] = target_price
+            else:
+                logger.warning(f"⚠️ [GRVT] 下单返回 ID 异常 ({new_id})，暂停记录以防死循环")
 
         # 3. 如果有活跃订单 -> 检查是否需要改单 (Requote)
         else:
