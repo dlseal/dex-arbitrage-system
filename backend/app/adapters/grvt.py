@@ -214,8 +214,11 @@ class GrvtAdapter(BaseExchange):
             if isinstance(res, dict):
                 # 优先获取系统 ID
                 oid = res.get('id') or res.get('order_id')
-                # 获取客户端 ID
+
+                # 获取客户端 ID (尝试从根目录或 metadata 中获取)
                 cid = str(res.get('client_order_id', ''))
+                if not cid and 'metadata' in res:
+                    cid = str(res.get('metadata', {}).get('client_order_id', ''))
 
                 # 修复：如果系统 ID 为 0x00 或空，则必须使用 client_order_id
                 if not oid or oid == "0x00":
