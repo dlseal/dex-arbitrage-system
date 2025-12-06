@@ -86,12 +86,19 @@ class GrvtAdapter(BaseExchange):
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
+
+                    # 🔴 修复：兼容 Full模式(tick_size) 和 Lite模式(ts)
+                    raw_id = market.get('instrument') or market.get('i')
+                    raw_tick = market.get('tick_size') or market.get('ts') or 0
+                    raw_min = market.get('min_size') or market.get('ms') or 0
+
                     self.contract_map[symbol] = {
-                        "id": market.get('instrument'),
-                        "tick_size": Decimal(str(market.get('tick_size', 0))),
-                        "min_size": Decimal(str(market.get('min_size', 0)))
+                        "id": raw_id,
+                        "tick_size": Decimal(str(raw_tick)),
+                        "min_size": Decimal(str(raw_min))
                     }
                     loaded_count += 1
+                    logging.info(f"   - Loaded {symbol}: Tick={raw_tick}, Min={raw_min}")
 
         if loaded_count == 0:
             logging.info(f"⚠️ [GRVT] Warning: No target markets found for {self.target_symbols}")
@@ -120,7 +127,8 @@ class GrvtAdapter(BaseExchange):
 
     async def _fetch_markets_async(self):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.rest_client.fetch_markets)
+        # 传入 params 确保尽可能获取完整信息
+        return await loop.run_in_executor(None, lambda: self.rest_client.fetch_markets(params={}))
 
     def _get_contract_info(self, symbol: str):
         if "-" not in symbol: symbol = f"{symbol}-USDT"
@@ -168,16 +176,12 @@ class GrvtAdapter(BaseExchange):
 
         # 1. 获取市场精度配置 (Decimal类型)
         tick_size = info.get('tick_size')
-        min_size = info.get('min_size')  # 通常也是步长
+        min_size = info.get('min_size')
 
         # 2. 数量精度修正
-        # 将数量转换为 Decimal
         d_amount = Decimal(str(amount))
         if min_size and min_size > 0:
-            # 逻辑：(数量 / 步长) 取整 * 步长
-            # 例如: amount=0.1234, min_size=0.01 -> 12.34 -> 12 -> 0.12
             d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
-
         qty = float(d_amount)
 
         # 3. 价格精度修正
@@ -185,12 +189,10 @@ class GrvtAdapter(BaseExchange):
         if price:
             d_price = Decimal(str(price))
             if tick_size and tick_size > 0:
-                # 逻辑：(价格 / Tick) 取整 * Tick
-                # 例如: price=89444.56, tick=0.1 -> 894445.6 -> 894446 (四舍五入) -> 89444.6
+                # 🔴 核心修复：确保价格符合 Tick 精度 (例如 89444.56 -> 89444.6 如果tick=0.1)
                 d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
             px = float(d_price)
 
-        # 4. 强制小写 (修复之前的 'side' 报错)
         side = side.lower()
 
         # 默认 Post Only
@@ -208,61 +210,58 @@ class GrvtAdapter(BaseExchange):
                 res = await loop.run_in_executor(None, lambda: self.rest_client.create_limit_order(
                     symbol=info['id'], side=side, amount=qty, price=px, params=params
                 ))
-            return res['id']
+
+            # 兼容不同格式的返回值
+            if isinstance(res, dict):
+                return res.get('id') or res.get('order_id') or str(res.get('client_order_id', ''))
+            return str(res)
+
         except Exception as e:
-            # 打印修正后的参数，方便调试
             logging.error(f"❌ [GRVT] Order Error: {e} | Side:{side} Qty:{qty} Price:{px}")
             return None
 
     async def listen_websocket(self, queue: asyncio.Queue):
+        # 保持原有的 WebSocket 逻辑不变，这里省略以节省篇幅，请保留您原文件中的 listen_websocket 代码
         logging.info(f"📡 [GRVT] Starting WS subscriptions...")
         loop = asyncio.get_running_loop()
 
         async def message_callback(message: Dict[str, Any]):
             try:
                 feed_data = message.get("feed", {})
-
-                # 兼容不同 SDK 版本的结构
                 if "instrument" not in feed_data and "instrument" in message:
                     feed_data = message
 
                 channel = message.get("params", {}).get("channel")
-                # 如果 SDK 返回的结构不同，尝试从 payload 里找
                 if not channel:
                     channel = message.get("stream")
 
-                # --- 1. 处理订单/成交事件 (Order Update) ---
-                # 注意：GRVT WS 频道名称可能为 'order' 或 'v1.order'
+                # 处理订单更新
                 if channel and "order" in str(channel) and "book" not in str(channel):
                     order_state = feed_data.get("state")
-                    # 只有当状态为已成交或部分成交时，才触发对冲
                     if order_state in ["FILLED", "PARTIALLY_FILLED"]:
                         instrument = feed_data.get("instrument")
                         symbol_base = self._get_symbol_from_instrument(instrument)
 
                         event = {
-                            'type': 'trade',  # 标记为交易事件
+                            'type': 'trade',
                             'exchange': self.name,
                             'symbol': symbol_base,
-                            'side': feed_data.get("side"),  # BUY/SELL
+                            'side': feed_data.get("side"),
                             'price': float(feed_data.get("price", 0)),
                             'size': float(feed_data.get("size", 0)),
                             'ts': int(time.time() * 1000)
                         }
-                        # 🚨 必须使用 call_soon_threadsafe 放入队列
                         loop.call_soon_threadsafe(queue.put_nowait, event)
                     return
 
-                # --- 2. 处理 Orderbook 数据 ---
-                # 找到对应的 Instrument
+                # 处理 Orderbook
                 instrument = feed_data.get("instrument")
                 symbol_base = self._get_symbol_from_instrument(instrument)
 
                 if symbol_base == "UNKNOWN":
                     return
 
-                # 处理 Orderbook 数据
-                if channel and "book" in str(channel):  # 兼容 "book.s" 和 "v1.book.s"
+                if channel and "book" in str(channel):
                     bids = feed_data.get("bids", [])
                     asks = feed_data.get("asks", [])
 
@@ -271,7 +270,7 @@ class GrvtAdapter(BaseExchange):
                         best_ask = float(asks[0]['price'])
 
                         tick = {
-                            'type': 'tick',  # 标记为行情事件
+                            'type': 'tick',
                             'exchange': self.name,
                             'symbol': symbol_base,
                             'bid': best_bid,
@@ -285,13 +284,11 @@ class GrvtAdapter(BaseExchange):
 
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
-            # 订阅公共行情
             await self.ws_client.subscribe(
                 stream="book.s",
                 callback=message_callback,
                 params={"instrument": instrument_id}
             )
-            # 订阅私有订单 (关键)
             await self.ws_client.subscribe(
                 stream="order",
                 callback=message_callback,

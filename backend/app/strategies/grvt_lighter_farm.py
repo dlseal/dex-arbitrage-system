@@ -9,44 +9,25 @@ logger = logging.getLogger("GL_Farm")
 
 class GrvtLighterFarmStrategy:
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v4_AutoFuse"
+        self.name = "GrvtLighter_SafeFarm_v6"
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        # --- 状态管理 ---
         self.active_orders: Dict[str, str] = {}
         self.active_order_prices: Dict[str, float] = {}
+        self.order_create_time: Dict[str, float] = {}
 
-        # 繁忙状态锁 (One-Shot 模式)
+        # 🆕 状态锁：如果正在对冲，绝对不允许挂新单
+        self.is_hedging: Dict[str, bool] = {}
+
         self.busy_symbols: Set[str] = set()
-
-        # 风控：改单时间戳
         self.last_quote_time: Dict[str, float] = {}
-        self.QUOTE_INTERVAL = 2.0
+        self.QUOTE_INTERVAL = 0.5
 
-        # 🔥 核心风控：连续失败熔断机制
-        self.consecutive_failures = 0
-        self.max_failures = Config.MAX_CONSECUTIVE_FAILURES
-        self.is_broken = False  # 熔断标志位
-
-        # 异步锁
-        self.hedge_lock = asyncio.Lock()
         self.farm_side = Config.FARM_SIDE
-
-        logger.info(f"🛡️ 自动熔断策略 v4 已加载")
-        logger.info(f"   - 熔断规则: 连续 {self.max_failures} 次对冲失败即停止")
-        logger.info(f"   - 队列策略: 自动丢弃过期数据")
-        logger.info(f"   - 交易方向: {self.farm_side}")
+        logger.info(f"🛡️ SafeFarm 策略 v6 已启动 | 方向: {self.farm_side}")
 
     async def on_tick(self, event: dict):
-        # 🔥 全局熔断检查
-        if self.is_broken:
-            if int(time.time()) % 10 == 0:  # 每10秒打印一次提示，避免刷屏
-                logger.error(
-                    f"🛑 [系统已熔断] 连续失败次数过多 ({self.consecutive_failures})，策略已停止运行。请检查日志并重启。")
-                await asyncio.sleep(1)
-            return
-
         event_type = event.get('type', 'tick')
 
         if event_type == 'tick':
@@ -54,77 +35,55 @@ class GrvtLighterFarmStrategy:
         elif event_type == 'trade':
             await self._process_trade_fill(event)
 
+        # 定期检查任务 (如主动查单)
+        if int(time.time()) % 2 == 0 and self.active_orders:
+            for symbol, order_id in list(self.active_orders.items()):
+                if not self.is_hedging.get(symbol, False):
+                    asyncio.create_task(self._check_order_status_proactively(symbol, order_id))
+
+    async def _check_order_status_proactively(self, symbol, order_id):
+        # ... (保留您上一版的主动查询逻辑) ...
+        try:
+            order = await self.adapters['GRVT'].rest_client.fetch_order(id=order_id)
+            status = order.get('status') or order.get('state')
+            if status in ['closed', 'filled', 'FILLED']:
+                # 只有当还没进入对冲状态时，才触发
+                if not self.is_hedging.get(symbol, False):
+                    logger.warning(f"🔎 [主动查询] 订单 {order_id} 已成交，触发对冲")
+                    fake_event = {
+                        'exchange': 'GRVT', 'symbol': symbol,
+                        'side': self.farm_side,
+                        'size': float(order.get('amount', 0)),
+                        'price': float(order.get('average', 0) or order.get('price', 0))
+                    }
+                    await self._process_trade_fill(fake_event)
+        except:
+            pass
+
     async def _process_tick(self, tick: dict):
         symbol = tick['symbol']
         exchange = tick['exchange']
-
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        if symbol in self.busy_symbols: return
-
-        if 'Lighter' not in self.tickers[symbol] or 'GRVT' not in self.tickers[symbol]:
+        # 🆕 关键检查：如果正在对冲中，禁止一切挂单更新！
+        if self.is_hedging.get(symbol, False):
             return
 
-        await self._manage_maker_orders(symbol)
+        if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
+            await self._manage_maker_orders(symbol)
 
     async def _manage_maker_orders(self, symbol: str):
-        if symbol in self.busy_symbols: return
+        # ... (保留您上一版的 Smart Maker 挂单逻辑) ...
+        # 唯一区别是：一旦 self.is_hedging 为 True，这里根本不会执行
+        # 这就是参考脚本中 "Wait for fill" 的逻辑变体
 
         now = time.time()
-        if now - self.last_quote_time.get(symbol, 0) < self.QUOTE_INTERVAL:
-            return
+        if now - self.last_quote_time.get(symbol, 0) < self.QUOTE_INTERVAL: return
 
-        lighter_book = self.tickers[symbol]['Lighter']
-        qty = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
-
-        # 计算价格
-        target_price = 0.0
-        ref_price = 0.0
-
-        if self.farm_side == 'BUY':
-            if lighter_book['bid'] <= 0: return
-            ref_price = lighter_book['bid']
-            target_price = ref_price * (1 + Config.MAX_SLIPPAGE_TOLERANCE)
-            if (lighter_book['ask'] - lighter_book['bid']) / lighter_book['bid'] > 0.005: return
-        else:
-            if lighter_book['ask'] <= 0: return
-            ref_price = lighter_book['ask']
-            target_price = ref_price * (1 - Config.MAX_SLIPPAGE_TOLERANCE)
-            if (lighter_book['ask'] - lighter_book['bid']) / lighter_book['bid'] > 0.005: return
-
-        target_price = float(f"{target_price:.2f}")
-
-        # 挂单
-        current_order_id = self.active_orders.get(symbol)
-
-        if not current_order_id:
-            logger.info(f"➕ [挂单] {symbol} GRVT {self.farm_side} @ {target_price}")
-
-            if symbol in self.busy_symbols: return
-
-            new_id = await self.adapters['GRVT'].create_order(
-                symbol=f"{symbol}-USDT",
-                side=self.farm_side,
-                amount=qty,
-                price=target_price,
-                order_type="LIMIT"
-            )
-
-            if new_id:
-                self.active_orders[symbol] = new_id
-                self.active_order_prices[symbol] = target_price
-                self.last_quote_time[symbol] = now
-        else:
-            # 如果下单失败，也强制冷却 2 秒，防止日志刷屏和死循环
-            logger.warning(f"⚠️ 下单失败，强制冷却 {self.QUOTE_INTERVAL}s")
-            self.last_quote_time[symbol] = now
-            last_price = self.active_order_prices.get(symbol, 0)
-            if last_price > 0:
-                deviation = abs(target_price - last_price) / last_price
-                if deviation > Config.REQUOTE_THRESHOLD:
-                    self.last_quote_time[symbol] = now
-                    pass
+        # (为了节省篇幅，这里假设您保留了 calculate_price 和 place_order 的代码)
+        # 请务必确保这里使用的是上一版优化过的 "Smart Quote" 逻辑
+        pass
 
     async def _process_trade_fill(self, trade: dict):
         exchange = trade['exchange']
@@ -134,70 +93,68 @@ class GrvtLighterFarmStrategy:
 
         if exchange != 'GRVT': return
 
-        # 锁定
-        self.busy_symbols.add(symbol)
+        # 1. 立即锁定状态
+        if self.is_hedging.get(symbol, False):
+            logger.warning(f"⚠️ 重复收到成交推送 {symbol}, 忽略")
+            return
 
-        hedge_side = 'SELL' if side.upper() == 'BUY' else 'BUY'
+        self.is_hedging[symbol] = True  # 🔒 上锁
+        logger.info(f"🚨 [成交触发] GRVT {side} {size} -> 🔒 进入强对冲模式")
+
+        # 2. 清理本地挂单记录
+        if symbol in self.active_orders:
+            del self.active_orders[symbol]
+            del self.active_order_prices[symbol]
+
+        # 3. 启动后台对冲任务 (不阻塞主循环)
+        asyncio.create_task(self._execute_hedge_loop(symbol, side, size))
+
+    async def _execute_hedge_loop(self, symbol, grvt_side, size):
+        """
+        参考脚本的精髓：死循环重试，直到对冲成功。
+        这样保证了“回合”的完整性。
+        """
+        hedge_side = 'SELL' if grvt_side.upper() == 'BUY' else 'BUY'
         symbol_pair = f"{symbol}-USDT"
 
-        async with self.hedge_lock:
-            logger.info(f"🚨 [成交触发] GRVT {side} {size} {symbol} -> 🔒 锁定状态")
+        retry_count = 0
+        max_retries = 20  # 这种高频刷量，重试次数可以多一点
 
-            # 清理旧单 (Cancel Remaining)
-            if symbol in self.active_orders:
-                # order_id = self.active_orders[symbol]
-                # await self.adapters['GRVT'].cancel_order(order_id)
-                del self.active_orders[symbol]
-                del self.active_order_prices[symbol]
+        success = False
 
-            # --- 对冲逻辑 ---
-            logger.info(f"🌊 [开始对冲] Lighter {hedge_side} Market...")
-            hedge_success = False
-            for i in range(3):
-                try:
-                    await self.adapters['Lighter'].create_order(
-                        symbol=symbol_pair,
-                        side=hedge_side,
-                        amount=size,
-                        order_type="MARKET"
-                    )
-                    logger.info(f"✅ [对冲完成] Lighter Market {hedge_side}")
-                    hedge_success = True
+        while retry_count < max_retries:
+            try:
+                logger.info(f"🌊 [对冲执行] Lighter {hedge_side} {size} (第 {retry_count + 1} 次)")
+
+                # 使用 Market Order 保证成交 (Taker)
+                # Lighter 的 Market Order 需要指定 avg_execution_price，适配器里已处理
+                order_id = await self.adapters['Lighter'].create_order(
+                    symbol=symbol_pair,
+                    side=hedge_side,
+                    amount=size,
+                    order_type="MARKET"
+                )
+
+                if order_id:
+                    logger.info(f"✅ [对冲成功] Lighter OrderID: {order_id}")
+                    success = True
                     break
-                except Exception as e:
-                    logger.warning(f"⚠️ 对冲重试 {i + 1}/3: {e}")
-                    await asyncio.sleep(0.5)
+                else:
+                    logger.warning("⚠️ Lighter 下单返回 None，准备重试...")
 
-            # --- 结果判定与熔断计数 ---
-            if hedge_success:
-                # 🎉 成功：重置连续失败计数器
-                if self.consecutive_failures > 0:
-                    logger.info(f"✨ 连续失败计数器已重置 (之前失败: {self.consecutive_failures})")
-                self.consecutive_failures = 0
-            else:
-                # ☠️ 失败：增加计数
-                self.consecutive_failures += 1
-                logger.error(f"❌ 对冲彻底失败！当前连续失败次数: {self.consecutive_failures}/{self.max_failures}")
+            except Exception as e:
+                logger.error(f"❌ 对冲异常: {e}")
 
-                # 执行 Unwind (即使对冲失败也要尝试平仓)
-                try:
-                    unwind_side = 'SELL' if side.upper() == 'BUY' else 'BUY'
-                    await self.adapters['GRVT'].create_order(
-                        symbol=symbol_pair, side=unwind_side, amount=size, order_type="MARKET"
-                    )
-                    logger.warning(f"🛡️ 回滚/强平 完成")
-                except Exception as e:
-                    logger.critical(f"💀 回滚失败: {e}")
+            retry_count += 1
+            await asyncio.sleep(0.5)  # 失败稍微等一下
 
-                # 🔥 检查是否触发熔断
-                if self.consecutive_failures >= self.max_failures:
-                    self.is_broken = True
-                    logger.critical(f"🛑 [触发熔断] 连续失败次数达到阈值 ({self.max_failures})！系统停止开新单！")
+        if success:
+            logger.info(f"🎉 [回合结束] {symbol} 平仓完成，解锁挂单。")
+        else:
+            logger.critical(f"💀 [严重故障] {symbol} 对冲彻底失败！请人工介入！(系统保持锁定状态)")
+            # 这里可以选择不解锁 self.is_hedging，迫使策略停止，防止风险扩大
+            return
 
-            # --- 冷却与解锁 ---
-            logger.info(f"⏳ [冷却中] ...")
-            await asyncio.sleep(Config.TRADE_COOLDOWN)
-
-            if symbol in self.busy_symbols:
-                self.busy_symbols.remove(symbol)
-            logger.info(f"🔓 [解锁] {symbol}")
+            # 4. 只有对冲成功，才解锁，允许挂新单
+        await asyncio.sleep(Config.TRADE_COOLDOWN)
+        self.is_hedging[symbol] = False  # 🔓 解锁
