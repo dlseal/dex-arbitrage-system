@@ -29,7 +29,7 @@ class GrvtLighterFarmStrategy:
         self.hedge_lock = asyncio.Lock()
 
         logger.info(f"🚜 刷量策略已加载: GRVT(Maker) <-> Lighter(Taker)")
-        logger.info(f"   - 单笔数量: {Config.VOLUME_ORDER_SIZE}")
+        logger.info(f"   - 单笔数量: {Config.TRADE_QUANTITIES}")
         logger.info(f"   - 滑点容忍: {Config.MAX_SLIPPAGE_TOLERANCE}")
         logger.info(f"   - 深度检查: 开启")
 
@@ -76,7 +76,7 @@ class GrvtLighterFarmStrategy:
             return  # 还没到改单时间，跳过
 
         lighter_book = self.tickers[symbol]['Lighter']
-        qty = Config.VOLUME_ORDER_SIZE
+        qty = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
         # --- 风控 2: Lighter 深度检查 (Depth Check) ---
         # 简单检查：虽然 Ticker 通常只给 Best Bid/Ask，但如果价格异常低，说明深度不够

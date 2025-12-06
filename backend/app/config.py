@@ -45,9 +45,6 @@ class Config:
     # 正数表示必须要盈利才开单，负数表示愿意支付的成本
     MAX_SLIPPAGE_TOLERANCE = float(os.getenv("MAX_SLIPPAGE_TOLERANCE", "-0.0005"))
 
-    # 刷量单次下单数量 (例如 0.1 SOL)
-    VOLUME_ORDER_SIZE = float(os.getenv("VOLUME_ORDER_SIZE", "0.01"))
-
     # 重挂单阈值: 当目标价格与当前挂单价格偏差超过此比例时，撤单重挂
     REQUOTE_THRESHOLD = float(os.getenv("REQUOTE_THRESHOLD", "0.0005"))
 
