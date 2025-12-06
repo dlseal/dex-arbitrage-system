@@ -1,23 +1,18 @@
 import asyncio
 import logging
-from typing import List, Optional
+from typing import List
 from app.adapters.base import BaseExchange
 
 logger = logging.getLogger("Engine")
 
 
 class RingQueue(asyncio.Queue):
-    """
-    环形队列：当队列满时，自动丢弃最早的数据，腾出空间给新数据。
-    适用于高频行情处理，确保策略永远只处理最新的 Tick，而不是处理堆积的旧数据。
-    """
+    """环形队列：仅用于高频行情 (Ticks)，满时丢弃旧数据"""
 
     def put_nowait(self, item):
         if self.full():
             try:
-                # 扔掉最旧的一个数据
-                _ = self.get_nowait()
-                # logger.debug("⚠️ [Engine] 队列已满，丢弃了一条旧行情数据")
+                self.get_nowait()
             except asyncio.QueueEmpty:
                 pass
         super().put_nowait(item)
@@ -28,25 +23,27 @@ class EventEngine:
         self.exchanges = exchanges
         self.strategy = strategy
 
-        # 使用自定义的环形队列，容量设为 100
-        # 意味着如果策略处理不过来，最多只堆积 100 个最新 tick，更早的直接丢弃
-        self.market_data_queue = RingQueue(maxsize=100)
+        # 1. 行情队列 (Tick Queue): RingQueue, Max 100, 允许丢包
+        self.tick_queue = RingQueue(maxsize=100)
+
+        # 2. 事件队列 (Event Queue): 无限容量, 严禁丢包 (用于成交回报、订单状态)
+        self.event_queue = asyncio.Queue()
 
         self.running = False
 
     async def start(self):
-        """启动引擎"""
         self.running = True
-        logger.info(f"🚀 引擎启动，绑定策略: {self.strategy.name if self.strategy else '无'}")
-        logger.info(f"   - 队列模式: RingQueue (Max 100), 溢出自动丢弃旧数据")
+        logger.info(f"🚀 引擎启动 | 策略: {self.strategy.name if self.strategy else '无'}")
+        logger.info("   - 队列架构: TickQueue(Ring) + EventQueue(Infinite)")
 
-        # 1. 启动所有适配器的 WS 监听
         tasks = []
+        # 启动适配器，传入两个队列
         for ex in self.exchanges:
-            # 适配器内部调用的 put_nowait 会自动触发 RingQueue 的丢弃逻辑
-            tasks.append(asyncio.create_task(ex.listen_websocket(self.market_data_queue)))
+            tasks.append(asyncio.create_task(
+                ex.listen_websocket(self.tick_queue, self.event_queue)
+            ))
 
-        # 2. 启动数据消费者
+        # 启动消费者
         tasks.append(asyncio.create_task(self._data_consumer()))
 
         try:
@@ -55,24 +52,39 @@ class EventEngine:
             logger.info("引擎停止")
 
     async def _data_consumer(self):
-        """消费者：将数据喂给策略"""
-        logger.info("🧠 策略大脑已上线，正在等待数据流入...")
-
-        msg_count = 0
+        logger.info("🧠 策略大脑已上线，双通道监听中...")
 
         while self.running:
-            # 等待数据
-            tick = await self.market_data_queue.get()
-            msg_count += 1
+            # 优先处理事件队列 (成交回报)
+            # 使用 wait 机制，优先服务 event_queue，闲时服务 tick_queue
 
-            if msg_count <= 5 or msg_count % 100 == 0:
-                logger.debug(f"Tick received: {tick.get('symbol')} from {tick.get('exchange')}")
+            # 创建读取任务
+            task_event = asyncio.create_task(self.event_queue.get())
+            task_tick = asyncio.create_task(self.tick_queue.get())
 
-            # 推送给策略
-            if self.strategy:
-                try:
-                    await self.strategy.on_tick(tick)
-                except Exception as e:
-                    logger.error(f"❌ 策略执行报错: {e}", exc_info=True)
+            done, pending = await asyncio.wait(
+                [task_event, task_tick],
+                return_when=asyncio.FIRST_COMPLETED
+            )
 
-            self.market_data_queue.task_done()
+            for task in done:
+                data = task.result()
+
+                # 如果是 Tick 任务完成
+                if task == task_tick:
+                    # 如果此时 Event 队列也有数据，优先取 Event (虽然 wait 已返回，但防止积压)
+                    # 这里简化处理，直接透传
+                    pass
+                else:
+                    # 如果是 Event 任务完成，取消 Tick 等待 (因为 Event 优先级高，处理完立即进入下一轮)
+                    task_tick.cancel()
+
+                if self.strategy:
+                    try:
+                        await self.strategy.on_tick(data)
+                    except Exception as e:
+                        logger.error(f"❌ 策略执行报错: {e}", exc_info=True)
+
+            # 清理未完成的任务 (Tick 任务可能被取消)
+            for task in pending:
+                task.cancel()

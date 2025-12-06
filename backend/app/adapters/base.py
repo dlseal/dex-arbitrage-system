@@ -32,6 +32,6 @@ class BaseExchange(ABC):
         pass
 
     @abstractmethod
-    async def listen_websocket(self, queue: asyncio.Queue):
+    async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
         """维持 WebSocket 长连接"""
         pass

@@ -177,11 +177,28 @@ class LighterOrderBookManager:
         best_ask = min(self.asks.keys()) if self.asks else 0.0
         return best_bid, best_ask
 
+    def _get_depth_snapshot(self, limit=5):
+        """获取前 N 档深度"""
+        bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:limit]
+        asks_sorted = sorted(self.asks.items(), key=lambda x: x[0])[:limit]
+        return bids_sorted, asks_sorted
+
     async def _push_update(self):
         if not self.bids or not self.asks: return
-        best_bid, best_ask = self._get_bbo()
-        if best_bid > 0 and best_ask > 0:
-            await self.callback(self.symbol, best_bid, best_ask)
+
+        best_bid = max(self.bids.keys())
+        best_ask = min(self.asks.keys())
+
+        # 获取深度数据 [[price, size], ...]
+        bids_depth, asks_depth = self._get_depth_snapshot()
+
+        await self.callback(
+            self.symbol,
+            best_bid,
+            best_ask,
+            bids_depth,  # 新增
+            asks_depth  # 新增
+        )
 
 
 class LighterAdapter(BaseExchange):
@@ -235,16 +252,19 @@ class LighterAdapter(BaseExchange):
             logging.info(f"❌ [Lighter] Init Failed: {e}")
             raise e
 
-    async def listen_websocket(self, queue: asyncio.Queue):
-        async def update_callback(symbol, best_bid, best_ask):
+    async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue): # 签名修改
+        async def update_callback(symbol, best_bid, best_ask, bids_depth, asks_depth):
             tick = {
+                'type': 'tick',
                 'exchange': self.name,
                 'symbol': symbol,
                 'bid': best_bid,
                 'ask': best_ask,
+                'bids_depth': bids_depth, # 携带深度
+                'asks_depth': asks_depth,
                 'ts': int(time.time() * 1000)
             }
-            queue.put_nowait(tick)
+            tick_queue.put_nowait(tick)
 
         tasks = []
         for symbol in self.target_symbols:

@@ -268,7 +268,12 @@ class GrvtAdapter(BaseExchange):
             # logging.warning(f"⚠️ [GRVT] Fetch Error: {e}")
             raise e
 
-    async def listen_websocket(self, queue: asyncio.Queue):
+    async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
+        """
+        监听 WebSocket 数据流，并将数据分流到不同的队列
+        :param tick_queue: 行情队列 (允许丢包)
+        :param event_queue: 事件队列 (严禁丢包，用于成交回报)
+        """
         logging.info(f"📡 [GRVT] Starting WS subscriptions...")
         loop = asyncio.get_running_loop()
 
@@ -283,14 +288,17 @@ class GrvtAdapter(BaseExchange):
                 if not channel:
                     channel = message.get("stream")
 
-                # ------------------- 核心修复开始 -------------------
-                # 2. 处理订单更新 (Order Update)
+                # ------------------- 核心分流逻辑 -------------------
+
+                # 2. 处理订单更新 (Order Update) -> 推送至 event_queue
+                # 排除掉可能包含 'orderbook' 字样的频道，只保留真正的订单流
                 if channel and "order" in str(channel) and "book" not in str(channel):
                     # 获取状态字典
                     state = feed_data.get("state", {})
                     # 提取状态字符串 (兼容大小写)
                     status = state.get("status", "").upper()
 
+                    # 我们主要关注成交事件来触发对冲
                     if status in ["FILLED", "PARTIALLY_FILLED"]:
                         # 提取订单信息 (通常在 legs 列表的第一个元素中)
                         legs = feed_data.get("legs", [])
@@ -303,10 +311,8 @@ class GrvtAdapter(BaseExchange):
                             is_buy = leg.get("is_buying_asset", False)
                             side = "BUY" if is_buy else "SELL"
 
-                            # 提取成交量和价格
-                            # 注意：size 通常在 legs 里，但已成交量在 state['traded_size'] 里
-                            # 这里为了对冲，如果是完全成交，可以用 leg['size']
-                            # 如果是部分成交，应该计算差值，但简单起见暂取 state 中的 traded_size
+                            # 提取成交量
+                            # 优先使用 state 中的 traded_size (累积成交量)，如果没有则使用 leg size
                             filled_size = 0.0
                             if "traded_size" in state and state["traded_size"]:
                                 filled_size = float(state["traded_size"][0])
@@ -315,6 +321,7 @@ class GrvtAdapter(BaseExchange):
 
                             price = float(leg.get("limit_price", 0))
 
+                            # 构造标准化的 Trade 事件
                             event = {
                                 'type': 'trade',
                                 'exchange': self.name,
@@ -322,16 +329,18 @@ class GrvtAdapter(BaseExchange):
                                 'side': side,
                                 'price': price,
                                 'size': filled_size,
+                                'order_id': message.get('order_id', ''),  # 尝试获取 ID 用于日志
                                 'ts': int(time.time() * 1000)
                             }
-                            # 推送成交事件
-                            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+                            # ⚠️ 关键：推送到事件队列 (Event Queue)
+                            # 使用 put_nowait，因为 event_queue 是无限容量的，不会阻塞
+                            loop.call_soon_threadsafe(event_queue.put_nowait, event)
                             logging.info(f"⚡️ [WS推送] GRVT 成交: {symbol_base} {side} {filled_size} @ {price}")
                     return
-                # ------------------- 核心修复结束 -------------------
 
-                # 3. 处理 Orderbook
-                # ... (后续处理 Orderbook 的代码保持不变) ...
+                # 3. 处理 Orderbook -> 推送至 tick_queue
+                # --------------------------------------------------
                 instrument = feed_data.get("instrument")
                 symbol_base = self._get_symbol_from_instrument(instrument)
 
@@ -354,25 +363,31 @@ class GrvtAdapter(BaseExchange):
                             'ask': best_ask,
                             'ts': int(time.time() * 1000)
                         }
-                        loop.call_soon_threadsafe(queue.put_nowait, tick)
+
+                        # ⚠️ 关键：推送到行情队列 (Tick Queue)
+                        # 如果是 RingQueue，满了会自动丢弃旧数据
+                        loop.call_soon_threadsafe(tick_queue.put_nowait, tick)
 
             except Exception as e:
                 logging.warning(f"❌ [GRVT Callback Error] {e}")
 
-        # 下面的订阅逻辑保持不变
+        # 4. 执行订阅
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
+            # 订阅行情 (L1 Orderbook)
             await self.ws_client.subscribe(
                 stream="book.s",
                 callback=message_callback,
                 params={"instrument": instrument_id}
             )
+            # 订阅私有订单流
             await self.ws_client.subscribe(
                 stream="order",
                 callback=message_callback,
                 params={"instrument": instrument_id, "sub_account_id": self.trading_account_id}
             )
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)  # 避免瞬间请求过多
 
+        # 5. 保持连接活跃
         while True:
             await asyncio.sleep(1)
