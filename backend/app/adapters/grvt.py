@@ -234,6 +234,40 @@ class GrvtAdapter(BaseExchange):
             logging.error(f"❌ [GRVT] Order Error: {e} | Side:{side} Qty:{qty} Price:{px}")
             return None
 
+    async def cancel_order(self, order_id: str):
+        """智能撤单：自动识别 order_id 或 client_order_id"""
+        loop = asyncio.get_running_loop()
+        try:
+            # 如果 ID 是纯数字，视为 client_order_id
+            if str(order_id).isdigit():
+                return await loop.run_in_executor(None, lambda: self.rest_client.cancel_order(
+                    id=None,
+                    symbol=None,
+                    params={'client_order_id': int(order_id)}
+                ))
+            else:
+                # 否则视为系统 order_id
+                return await loop.run_in_executor(None, lambda: self.rest_client.cancel_order(id=order_id))
+        except Exception as e:
+            logging.error(f"❌ [GRVT] Cancel Error: {e}")
+            raise e
+
+    async def fetch_order(self, order_id: str):
+        """智能查单：自动识别 order_id 或 client_order_id"""
+        loop = asyncio.get_running_loop()
+        try:
+            if str(order_id).isdigit():
+                return await loop.run_in_executor(None, lambda: self.rest_client.fetch_order(
+                    id=None,
+                    symbol=None,
+                    params={'client_order_id': int(order_id)}
+                ))
+            else:
+                return await loop.run_in_executor(None, lambda: self.rest_client.fetch_order(id=order_id))
+        except Exception as e:
+            # logging.warning(f"⚠️ [GRVT] Fetch Error: {e}")
+            raise e
+
     async def listen_websocket(self, queue: asyncio.Queue):
         # 保持原有的 WebSocket 逻辑不变，这里省略以节省篇幅，请保留您原文件中的 listen_websocket 代码
         logging.info(f"📡 [GRVT] Starting WS subscriptions...")

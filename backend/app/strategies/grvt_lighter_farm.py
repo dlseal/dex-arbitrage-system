@@ -47,7 +47,7 @@ class GrvtLighterFarmStrategy:
         """主动查询订单状态，作为 WS 的兜底"""
         try:
             # 调用 GRVT REST API 查单
-            order = await self.adapters['GRVT'].rest_client.fetch_order(id=order_id)
+            order = await self.adapters['GRVT'].fetch_order(order_id)
             status = order.get('status') or order.get('state')
 
             # 如果订单已成交或部分成交，但本地没收到推送，则手动触发
@@ -154,7 +154,7 @@ class GrvtLighterFarmStrategy:
                 logger.info(
                     f"♻️ [调价] {symbol} 当前:{current_price} -> 目标:{target_price} (Diff: {price_diff_pct:.4%})")
                 try:
-                    await self.adapters['GRVT'].rest_client.cancel_order(id=current_order_id)
+                    await self.adapters['GRVT'].cancel_order(current_order_id)
                 except Exception as e:
                     logger.error(f"撤单失败: {e}")
 
