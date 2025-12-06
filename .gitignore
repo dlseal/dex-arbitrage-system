@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# PyCharm 特定文件
+*.iml
+.idea/*
+
+# 测试
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# 项目特定
+logs/
+*.log
+*.sqlite3
+*.db
+data/
+temp/
