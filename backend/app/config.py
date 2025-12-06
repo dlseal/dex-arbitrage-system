@@ -19,6 +19,7 @@ class Config:
     # 如果 .env 没填，默认设为 0 (通常主账户 index 是 0)
     LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
     LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "0"))
+    LIGHTER_BASE_URL = os.getenv('LIGHTER_BASE_URL','https://mainnet.zklighter.elliot.ai')
 
     @classmethod
     def validate(cls):
@@ -27,7 +28,6 @@ class Config:
         if not cls.GRVT_API_KEY: missing.append("GRVT_API_KEY")
         if not cls.GRVT_PRIVATE_KEY: missing.append("GRVT_PRIVATE_KEY")
         if not cls.GRVT_TRADING_ACCOUNT_ID: missing.append("GRVT_TRADING_ACCOUNT_ID")
-        if not cls.LIGHTER_API_KEY: missing.append("LIGHTER_API_KEY")
         if not cls.LIGHTER_PRIVATE_KEY: missing.append("LIGHTER_PRIVATE_KEY")
 
         if missing:

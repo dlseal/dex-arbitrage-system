@@ -1,119 +1,172 @@
 import asyncio
 import time
-import os
 import json
-
-import websockets
-from typing import Dict, Optional
+import logging
+from typing import Dict, Optional, List
 from .base import BaseExchange
 
+# 引入 Lighter 官方 SDK
 import lighter
 from lighter import SignerClient, ApiClient, Configuration
 
 
 class LighterAdapter(BaseExchange):
     """
-    Lighter.xyz 适配器 (基于官方 SDK 深度定制)
+    Lighter.xyz 适配器 (基于官方 WsClient 重构)
     """
 
-    def __init__(self, api_key: str, private_key: str):
-        # 注意：Lighter 的 api_key 在这里对应 "Public Address"
-        # private_key 对应 "Private Key"
-        super().__init__("Lighter", api_key, private_key)
+    def __init__(self, base_url:str,api_key: str, private_key: str, account_index: int = 0, api_key_index: int = 0):
+        super().__init__("Lighter")
 
-        # Lighter 特有配置 (从环境变量读取，如果未传则默认 0)
-        self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX', '0'))
-        self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX', '0'))
-        self.base_url = "https://mainnet.zklighter.elliot.ai"  # 参考代码中的主网地址
+        self.base_url = base_url
+
+        # 身份凭证
+        self.api_key = api_key
+        self.private_key = private_key
+        self.account_index = account_index
+        self.api_key_index = api_key_index
 
         self.client: Optional[SignerClient] = None
         self.api_client: Optional[ApiClient] = None
+        self.ws_client = None  # 保存 WsClient 实例
 
-        # 缓存：Market Config
-        self.market_config = {}  # {symbol: {'id': int, 'size_mul': int, 'price_mul': int}}
+        # 缓存：市场配置
+        self.market_config = {}
+        # 反向映射：ID -> Symbol
+        self.id_to_symbol = {}
 
     async def initialize(self):
         """
-        初始化：连接 Client 并自动获取市场精度配置
+        初始化：获取市场配置并建立 REST 客户端
         """
         try:
             # 1. 初始化查询客户端
             config = Configuration(host=self.base_url)
             self.api_client = ApiClient(configuration=config)
 
-            # 2. 动态获取所有市场配置 (参考源码 _get_market_config)
+            # 2. 动态获取所有市场配置
             print("⏳ [Lighter] Fetching market configurations...")
             order_api = lighter.OrderApi(self.api_client)
             order_books = await order_api.order_books()
 
             for market in order_books.order_books:
-                # 提取精度乘数
                 size_mul = int(pow(10, market.supported_size_decimals))
                 price_mul = int(pow(10, market.supported_price_decimals))
 
-                # 存入缓存，方便后续快速转换
-                # 注意：Lighter symbol 可能是 "WBTC-USDC"，需确保与系统统一
                 self.market_config[market.symbol] = {
                     'id': market.market_id,
                     'size_mul': size_mul,
                     'price_mul': price_mul
                 }
-                print(f"   - Loaded {market.symbol}: ID={market.market_id}, PriceMul={price_mul}")
+                self.id_to_symbol[market.market_id] = market.symbol
+                print(f"   - Loaded {market.symbol}: ID={market.market_id}")
 
-            # 3. 初始化交易客户端 (SignerClient)
+            # 3. 初始化交易客户端
+            private_keys_dict = {self.api_key_index: self.private_key}
             self.client = SignerClient(
                 url=self.base_url,
-                private_key=self.private_key,
                 account_index=self.account_index,
-                api_key_index=self.api_key_index
+                api_private_keys=private_keys_dict
             )
 
-            # 检查连接
             err = self.client.check_client()
             if err:
-                raise Exception(f"SignerClient Error: {err}")
+                raise Exception(f"SignerClient Error: {str(err)}")
 
             self.is_connected = True
-            print(f"✅ [Lighter] Initialized. Account Index: {self.account_index}")
+            print(f"✅ [Lighter] Initialized.")
 
         except Exception as e:
             print(f"❌ [Lighter] Init Failed: {e}")
             raise e
 
     def _get_market_info(self, symbol: str):
-        # 处理 symbol 别名 (如果需要)
-        # 例如系统传 WBTC-USDT，但 Lighter 是 WBTC-USDC
-        target = symbol
-        if symbol == "WBTC-USDT": target = "WBTC-USDC"
+        # "BTC-USDT" -> "BTC"
+        target = symbol.split('-')[0]
 
         info = self.market_config.get(target)
         if not info:
-            raise ValueError(f"Market {symbol} not found in Lighter configs")
+            # 调试辅助：打印前5个可用市场，方便排查
+            available = list(self.market_config.keys())[:5]
+            raise ValueError(f"Market '{target}' (from '{symbol}') not found. Available: {available}...")
         return info
 
+    async def listen_websocket(self, queue: asyncio.Queue):
+        """
+        使用 lighter.WsClient 监听数据
+        """
+        loop = asyncio.get_running_loop()
+
+        # 1. 定义回调函数 (注意：这会在 SDK 的独立线程中运行)
+        def on_ob_update(market_id, order_book):
+            try:
+                # 找到对应的 symbol
+                if market_id not in self.id_to_symbol:
+                    return
+
+                symbol = self.id_to_symbol[market_id]
+                info = self.market_config[symbol]
+
+                # 解析最佳买卖价
+                # order_book 结构通常是 {'bids': [['price', 'size'], ...], 'asks': ...}
+                # Lighter 返回的可能是原始字符串，需要转换
+                best_bid = 0.0
+                best_ask = 0.0
+
+                if order_book.get('bids'):
+                    # 价格需要除以 price_mul
+                    raw_price = float(order_book['bids'][0][0])
+                    best_bid = raw_price / info['price_mul']
+
+                if order_book.get('asks'):
+                    raw_price = float(order_book['asks'][0][0])
+                    best_ask = raw_price / info['price_mul']
+
+                if best_bid > 0 or best_ask > 0:
+                    tick = {
+                        'exchange': self.name,
+                        'symbol': symbol,
+                        'bid': best_bid,
+                        'ask': best_ask,
+                        'ts': int(time.time() * 1000)
+                    }
+
+                    # 关键：线程安全地推送到 asyncio 队列
+                    loop.call_soon_threadsafe(queue.put_nowait, tick)
+
+            except Exception as e:
+                # 生产环境建议用 logging
+                print(f"⚠️ [Lighter] Callback Error: {e}")
+
+        # 2. 准备参数
+        market_ids = [info['id'] for info in self.market_config.values()]
+
+        print(f"📡 [Lighter] Starting WsClient for IDs: {market_ids}")
+
+        # 3. 初始化 SDK WsClient
+        self.ws_client = lighter.WsClient(
+            order_book_ids=market_ids,
+            on_order_book_update=on_ob_update,
+            # 如果需要监听账户变动，可以加 on_account_update
+            # account_ids=[self.account_index]
+        )
+
+        # 4. 在独立线程中运行阻塞的 run() 方法
+        try:
+            # run_in_executor(None, ...) 会使用默认的 ThreadPoolExecutor
+            await loop.run_in_executor(None, self.ws_client.run)
+        except Exception as e:
+            print(f"❌ [Lighter] WS Loop Failed: {e}")
+
+    # --- 以下保持 REST 实现不变 ---
+
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        """
-        获取订单簿 (REST API 方式，作为 WS 的备用)
-        """
         info = self._get_market_info(symbol)
         order_api = lighter.OrderApi(self.api_client)
-
-        # Lighter SDK 获取 OrderBook
         ob_data = await order_api.order_book(market_id=info['id'])
 
-        # 解析最佳买卖价
-        # 注意：Lighter 返回的可能是原始 Int，需要除以乘数
-        best_ask = 0.0
-        best_bid = 0.0
-
-        if ob_data.asks and len(ob_data.asks) > 0:
-            # 假设 SDK 返回的已经是处理好的对象，或者需要转换
-            # 根据 SDK 源码，通常返回的是 decimal 字符串或 float
-            # 这里做安全转换
-            best_ask = float(ob_data.asks[0].price)
-
-        if ob_data.bids and len(ob_data.bids) > 0:
-            best_bid = float(ob_data.bids[0].price)
+        best_ask = float(ob_data.asks[0].price) if ob_data.asks else 0.0
+        best_bid = float(ob_data.bids[0].price) if ob_data.bids else 0.0
 
         return {
             'exchange': self.name,
@@ -123,41 +176,25 @@ class LighterAdapter(BaseExchange):
             'ts': int(time.time() * 1000)
         }
 
-    async def create_order(self,
-                           symbol: str,
-                           side: str,
-                           amount: float,
-                           price: Optional[float] = None,
+    async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
-        """
-        下单实现 (应用乘数逻辑)
-        """
         info = self._get_market_info(symbol)
-
-        # 1. 转换数值为 Lighter 的整数格式
         amount_int = int(amount * info['size_mul'])
         price_int = int(price * info['price_mul']) if price else 0
-
         is_ask = True if side.lower() == 'sell' else False
-
-        # 生成唯一 ID
-        client_order_index = int(time.time() * 1000) % 1000000
+        client_order_index = int(time.time() * 1000) % 2147483647
 
         try:
             res, tx_hash, err = None, None, None
-
             if order_type == "MARKET":
-                # 市价单逻辑
                 res, tx_hash, err = await self.client.create_market_order(
                     market_index=info['id'],
                     client_order_index=client_order_index,
                     base_amount=amount_int,
-                    avg_execution_price=price_int,  # 市价单的保护价格
+                    avg_execution_price=price_int,
                     is_ask=is_ask
                 )
             else:
-                # 限价单逻辑 (SignerClient 内置方法)
-                # 参考提供的代码：create_limit_order
                 res, tx_hash, err = await self.client.create_limit_order(
                     market_index=info['id'],
                     client_order_index=client_order_index,
@@ -170,58 +207,7 @@ class LighterAdapter(BaseExchange):
             if err:
                 print(f"❌ [Lighter] Order Error: {err}")
                 return None
-
-            print(f"✅ [Lighter] Order Sent: {tx_hash}")
-            return str(client_order_index)  # 返回 client_id 方便追踪
-
+            return str(client_order_index)
         except Exception as e:
             print(f"❌ [Lighter] Create Exception: {e}")
             return None
-
-    async def get_funding_rate(self, symbol: str) -> float:
-        # Lighter 是 ZK-Orderbook，费率机制特殊，暂时返回 0
-        # 实际可能需要查询 perpetual details
-        return 0.0
-
-    async def listen_websocket(self, queue: asyncio.Queue):
-        """
-        WebSocket 监听 (重写版)
-        由于没有 LighterCustomWebSocketManager，我们用 websockets 库直接实现
-        """
-        ws_url = self.base_url.replace("https", "wss") + "/stream"
-        print(f"📡 [Lighter] Connecting WS: {ws_url}")
-
-        while True:
-            try:
-                async with websockets.connect(ws_url) as ws:
-                    # 1. 订阅
-                    # 假设我们需要订阅 WBTC-USDC (ID=1) 的 orderbook
-                    # 这里需遍历我们缓存的所有 market_id 进行订阅
-                    for symbol, info in self.market_config.items():
-                        sub_msg = {
-                            "type": "subscribe",
-                            "channel": "orderbook",
-                            "marketId": info['id']
-                        }
-                        await ws.send(json.dumps(sub_msg))
-
-                    # 2. 循环接收
-                    while True:
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-
-                        # 处理心跳 (参考源码 logic)
-                        if data.get("type") == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-                            continue
-
-                        # 处理数据更新
-                        # Lighter WS 数据结构需参考具体文档，这里做通用解析假设
-                        if "type" in data and data["type"] == "orderbook":
-                            # 提取 best bid/ask 并放入队列
-                            # 伪代码：需要根据实际 WS 报文调整字段
-                            pass
-
-            except Exception as e:
-                print(f"⚠️ [Lighter] WS Disconnected: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)

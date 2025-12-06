@@ -1,54 +1,51 @@
 import asyncio
 import logging
-from typing import List
+from typing import List, Optional
 from app.adapters.base import BaseExchange
 
 logger = logging.getLogger("Engine")
 
 
 class EventEngine:
-    def __init__(self, exchanges: List[BaseExchange]):
+    def __init__(self, exchanges: List[BaseExchange], strategy=None):
         self.exchanges = exchanges
+        self.strategy = strategy  # 接收策略实例
         self.market_data_queue = asyncio.Queue()
         self.running = False
 
     async def start(self):
-        """启动主循环"""
+        """启动引擎"""
         self.running = True
+        logger.info(f"🚀 引擎启动，绑定策略: {self.strategy.name if self.strategy else '无'}")
 
-        # 1. 创建 WebSocket 监听任务
+        # 1. 启动所有适配器的 WS 监听
         tasks = []
         for ex in self.exchanges:
-            # 启动每个交易所的 WS 监听，将数据推送到 queue
-            task = asyncio.create_task(ex.listen_websocket(self.market_data_queue))
-            tasks.append(task)
+            tasks.append(asyncio.create_task(ex.listen_websocket(self.market_data_queue)))
 
-        # 2. 创建消费者任务 (这里暂时只做打印，未来接入 Strategy)
-        consumer_task = asyncio.create_task(self._data_consumer())
-        tasks.append(consumer_task)
+        # 2. 启动数据消费者
+        tasks.append(asyncio.create_task(self._data_consumer()))
 
-        logger.info(f"🚀 引擎已启动，监控 {len(self.exchanges)} 个交易所...")
-
+        # 等待运行
         try:
-            # 等待所有任务 (通常它们是无限循环)
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            logger.info("引擎任务被取消")
+            logger.info("引擎停止")
 
     async def _data_consumer(self):
-        """
-        消费者：处理接收到的行情数据
-        """
-        logger.info("👀 消费者线程启动: 等待行情数据...")
+        """消费者：将数据喂给策略"""
+        logger.info("🧠 策略大脑已上线，正在扫描市场...")
 
         while self.running:
-            # 从队列获取数据
             tick = await self.market_data_queue.get()
 
-            # --- 这里是策略入口 ---
-            # 简单打印：证明数据流是通的
-            # 格式: [GRVT] BTC-USDT Bid:65000 Ask:65001
-            print(f"⚡ [{tick['exchange']}] {tick['symbol']} \t| Bid: {tick['bid']} \t| Ask: {tick['ask']}")
+            # --- 简单的控制台心跳 (防止觉得程序死了) ---
+            # 只打印 BTC 的心跳，减少刷屏，或者您可以注释掉这行
+            if tick['symbol'] in ['BTC', 'BTC-USDT'] and int(tick['ts']) % 10 == 0:
+                print(f".", end="", flush=True)
 
-            # 标记队列任务完成
+            # --- 核心：推送给策略 ---
+            if self.strategy:
+                await self.strategy.on_tick(tick)
+
             self.market_data_queue.task_done()

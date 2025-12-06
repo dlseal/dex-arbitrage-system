@@ -20,6 +20,9 @@ from app.adapters.grvt import GrvtAdapter
 from app.adapters.lighter import LighterAdapter
 from app.core.engine import EventEngine
 
+# 交易策略
+from app.strategies.spread_arb import SpreadArbitrageStrategy
+
 # 配置日志格式
 logging.basicConfig(
     level=logging.INFO,
@@ -61,8 +64,11 @@ async def main():
     if Config.LIGHTER_API_KEY:
         try:
             lighter = LighterAdapter(
+                base_url=Config.LIGHTER_BASE_URL,
                 api_key=Config.LIGHTER_API_KEY,
-                private_key=Config.LIGHTER_PRIVATE_KEY
+                private_key=Config.LIGHTER_PRIVATE_KEY,
+                account_index=Config.LIGHTER_ACCOUNT_INDEX,
+                api_key_index=Config.LIGHTER_API_KEY_INDEX,
             )
             adapters.append(lighter)
             logger.info("📦 Lighter Adapter 已加载")
@@ -75,8 +81,11 @@ async def main():
         logger.error("❌ 没有可用的交易所适配器，系统退出。请检查 .env 配置。")
         return
 
-    # 3. 启动核心引擎
-    engine = EventEngine(exchanges=adapters)
+    # 3. 初始化策略 & 启动引擎
+    strategy = SpreadArbitrageStrategy()
+
+    # 将策略注入引擎
+    engine = EventEngine(exchanges=adapters, strategy=strategy)
 
     # 注册优雅退出信号 (Ctrl+C)
     def handle_exit(sig, frame):
