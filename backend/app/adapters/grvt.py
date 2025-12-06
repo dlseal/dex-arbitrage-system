@@ -269,40 +269,69 @@ class GrvtAdapter(BaseExchange):
             raise e
 
     async def listen_websocket(self, queue: asyncio.Queue):
-        # 保持原有的 WebSocket 逻辑不变，这里省略以节省篇幅，请保留您原文件中的 listen_websocket 代码
         logging.info(f"📡 [GRVT] Starting WS subscriptions...")
         loop = asyncio.get_running_loop()
 
         async def message_callback(message: Dict[str, Any]):
             try:
+                # 1. 提取 Feed 数据
                 feed_data = message.get("feed", {})
-                if "instrument" not in feed_data and "instrument" in message:
+                if not feed_data and "instrument" in message:
                     feed_data = message
 
                 channel = message.get("params", {}).get("channel")
                 if not channel:
                     channel = message.get("stream")
 
-                # 处理订单更新
+                # ------------------- 核心修复开始 -------------------
+                # 2. 处理订单更新 (Order Update)
                 if channel and "order" in str(channel) and "book" not in str(channel):
-                    order_state = feed_data.get("state")
-                    if order_state in ["FILLED", "PARTIALLY_FILLED"]:
-                        instrument = feed_data.get("instrument")
-                        symbol_base = self._get_symbol_from_instrument(instrument)
+                    # 获取状态字典
+                    state = feed_data.get("state", {})
+                    # 提取状态字符串 (兼容大小写)
+                    status = state.get("status", "").upper()
 
-                        event = {
-                            'type': 'trade',
-                            'exchange': self.name,
-                            'symbol': symbol_base,
-                            'side': feed_data.get("side"),
-                            'price': float(feed_data.get("price", 0)),
-                            'size': float(feed_data.get("size", 0)),
-                            'ts': int(time.time() * 1000)
-                        }
-                        loop.call_soon_threadsafe(queue.put_nowait, event)
+                    if status in ["FILLED", "PARTIALLY_FILLED"]:
+                        # 提取订单信息 (通常在 legs 列表的第一个元素中)
+                        legs = feed_data.get("legs", [])
+                        if legs:
+                            leg = legs[0]
+                            instrument = leg.get("instrument")
+                            symbol_base = self._get_symbol_from_instrument(instrument)
+
+                            # 提取方向 (is_buying_asset=True 为 BUY)
+                            is_buy = leg.get("is_buying_asset", False)
+                            side = "BUY" if is_buy else "SELL"
+
+                            # 提取成交量和价格
+                            # 注意：size 通常在 legs 里，但已成交量在 state['traded_size'] 里
+                            # 这里为了对冲，如果是完全成交，可以用 leg['size']
+                            # 如果是部分成交，应该计算差值，但简单起见暂取 state 中的 traded_size
+                            filled_size = 0.0
+                            if "traded_size" in state and state["traded_size"]:
+                                filled_size = float(state["traded_size"][0])
+                            else:
+                                filled_size = float(leg.get("size", 0))
+
+                            price = float(leg.get("limit_price", 0))
+
+                            event = {
+                                'type': 'trade',
+                                'exchange': self.name,
+                                'symbol': symbol_base,
+                                'side': side,
+                                'price': price,
+                                'size': filled_size,
+                                'ts': int(time.time() * 1000)
+                            }
+                            # 推送成交事件
+                            loop.call_soon_threadsafe(queue.put_nowait, event)
+                            logging.info(f"⚡️ [WS推送] GRVT 成交: {symbol_base} {side} {filled_size} @ {price}")
                     return
+                # ------------------- 核心修复结束 -------------------
 
-                # 处理 Orderbook
+                # 3. 处理 Orderbook
+                # ... (后续处理 Orderbook 的代码保持不变) ...
                 instrument = feed_data.get("instrument")
                 symbol_base = self._get_symbol_from_instrument(instrument)
 
@@ -330,6 +359,7 @@ class GrvtAdapter(BaseExchange):
             except Exception as e:
                 logging.warning(f"❌ [GRVT Callback Error] {e}")
 
+        # 下面的订阅逻辑保持不变
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
             await self.ws_client.subscribe(
