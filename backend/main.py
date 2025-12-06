@@ -25,7 +25,7 @@ from app.strategies.spread_arb import SpreadArbitrageStrategy
 
 # 配置日志格式
 logging.basicConfig(
-    level=logging.DEBUG,  # <--- 打开调试开关
+    level=logging.INFO,  # <--- 打开调试开关
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", # 增加 %(name)s 查看是哪个模块发的
     handlers=[logging.StreamHandler(sys.stdout)]
 )
@@ -33,7 +33,7 @@ logging.basicConfig(
 # 为了防止 requests/urllib3/asyncio 产生太多垃圾日志，屏蔽掉它们
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("websockets").setLevel(logging.DEBUG) # 👈 关键：我们要看 websockets 的底层日志
+# logging.getLogger("websockets").setLevel(logging.DEBUG) # 👈 关键：我们要看 websockets 的底层日志
 
 logger = logging.getLogger("Main")
 
@@ -85,7 +85,8 @@ async def main():
         return
 
     # 3. 初始化策略 & 启动引擎
-    strategy = SpreadArbitrageStrategy()
+    adapters_map = {ex.name: ex for ex in adapters}
+    strategy = SpreadArbitrageStrategy(adapters_map)
 
     # 将策略注入引擎
     engine = EventEngine(exchanges=adapters, strategy=strategy)

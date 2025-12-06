@@ -50,23 +50,25 @@ class GrvtAdapter(BaseExchange):
 
     async def initialize(self):
         """
-        初始化：带重试机制
+        初始化：带重试机制 (增强版)
         """
-        retry_count = 3
+        retry_count = 5  # 增加重试次数
         for attempt in range(retry_count):
             try:
+                print(f"⏳ [GRVT] 正在连接 WS (第 {attempt + 1} 次尝试)...")
                 await self._initialize_logic()
-                return  # 成功则退出
+                print("✅ [GRVT] 连接成功！")
+                return
             except Exception as e:
-                print(f"⚠️ [GRVT] Init Failed (Attempt {attempt + 1}/{retry_count}): {e}")
-                # 只有最后一次失败才抛出异常
-                if attempt == retry_count - 1:
-                    traceback.print_exc()
-                    await self.close()  # 安全清理
-                    raise e
+                logging.warning(f"⚠️ [GRVT] 连接失败: {e}")
+                # 每次失败等待时间加长 (3s, 6s, 9s...)
+                wait_time = (attempt + 1) * 3
+                print(f"   -> 等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
 
-                # 等待后重试
-                await asyncio.sleep(2)
+        # 如果全部失败
+        logging.error("❌ [GRVT] 无法建立连接，请检查网络/VPN！")
+        # raise e
 
     async def _initialize_logic(self):
         # 1. 初始化 REST (同步)
@@ -197,31 +199,56 @@ class GrvtAdapter(BaseExchange):
 
         async def message_callback(message: Dict[str, Any]):
             try:
+                # 👇 调试关键：打印接收到的消息结构，确认 feed 在哪
+                # logger.debug(f"[GRVT RAW] {str(message)[:100]}...")
+
                 feed_data = message.get("feed", {})
+
+                # 如果 message 本身就是 feed 数据 (有些 SDK 版本不同)
+                if "instrument" not in feed_data and "instrument" in message:
+                    feed_data = message
+
                 instrument = feed_data.get("instrument")
                 channel = message.get("params", {}).get("channel")
+
+                # 如果 SDK 返回的结构不同，尝试从 payload 里找
+                if not channel:
+                    channel = message.get("stream")  # 可能是 "v1.book.s"
 
                 symbol_base = None
                 for s, info in self.contract_map.items():
                     if info['id'] == instrument:
                         symbol_base = s.split('-')[0]
                         break
-                if not symbol_base: return
 
-                if channel == "book.s":
+                # 如果没找到 instrument，可能是心跳或控制消息，忽略
+                if not symbol_base:
+                    return
+
+                # 处理 Orderbook 数据
+                if "book" in str(channel):  # 兼容 "book.s" 和 "v1.book.s"
                     bids = feed_data.get("bids", [])
                     asks = feed_data.get("asks", [])
+
                     if bids and asks:
+                        # GRVT 价格通常也是字符串，转 float
+                        best_bid = float(bids[0]['price'])
+                        best_ask = float(asks[0]['price'])
+
                         tick = {
                             'exchange': self.name,
                             'symbol': symbol_base,
-                            'bid': float(bids[0]['price']),
-                            'ask': float(asks[0]['price']),
+                            'bid': best_bid,
+                            'ask': best_ask,
                             'ts': int(time.time() * 1000)
                         }
+                        # 👇 这里的 put_nowait 是将数据推进引擎的关键
                         loop.call_soon_threadsafe(queue.put_nowait, tick)
-            except Exception:
-                pass
+
+            except Exception as e:
+                # 🔴 关键修复：打印错误堆栈！不要 pass！
+                print(f"❌ [GRVT Callback Error] {e} | Msg: {str(message)[:50]}")
+                # traceback.print_exc()
 
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']

@@ -1,9 +1,9 @@
+import asyncio
 import logging
 import time
-from typing import Dict
+from typing import Dict, Any
 
 
-# 配置日志颜色，方便在刷屏中一眼看到机会
 class LogColors:
     GREEN = '\033[92m'
     RED = '\033[91m'
@@ -14,80 +14,102 @@ logger = logging.getLogger("Strategy")
 
 
 class SpreadArbitrageStrategy:
-    def __init__(self):
+    def __init__(self, adapters: Dict[str, Any]):
         self.name = "SpreadArb_v1"
-        # 缓存最新的行情快照 { 'Lighter': {'bid': 0, 'ask': 0}, 'GRVT': ... }
-        self.tickers: Dict[str, Dict[str, float]] = {}
+        self.adapters = adapters
 
-        # 核心参数
-        self.spread_threshold = -1.0 #测试参数，无论价差多少，都会被判定为“有机会”
-        # self.spread_threshold = 0.0005  # 触发阈值：0.05% (万分之五)
-        self.min_profit_usdt = 5.0  # 最小预估利润 (USDT)
+        # 🟢 核心修改 1: 数据结构改为 { symbol: { exchange: { bid, ask... } } }
+        # 例如: self.books['BTC'] = { 'Lighter': {...}, 'GRVT': {...} }
+        self.books: Dict[str, Dict[str, Dict]] = {}
 
-        # 简单的状态控制
+        # 阈值设置 (建议设为 0.002 即 0.2% 以覆盖手续费)
+        self.spread_threshold = 0.002
         self.is_active = True
+        self.is_trading = False
 
     async def on_tick(self, tick_data: dict):
-        """
-        核心回调：每当有新价格进来，都会触发一次计算
-        """
-        if not self.is_active:
-            return
+        if not self.is_active: return
 
         exchange = tick_data['exchange']
-        symbol = tick_data['symbol']  # 假设都是 "BTC" 或 "BTC-USDT"
+        symbol = tick_data['symbol']
 
-        # 1. 更新本地缓存
-        if exchange not in self.tickers:
-            self.tickers[exchange] = {}
+        # 1. 初始化该币种的存储结构
+        if symbol not in self.books:
+            self.books[symbol] = {}
 
-        self.tickers[exchange] = {
+        # 2. 更新该币种、该交易所的报价
+        self.books[symbol][exchange] = {
             'bid': tick_data['bid'],
             'ask': tick_data['ask'],
             'ts': time.time()
         }
 
-        # 2. 只有当两个交易所的数据都准备好时，才开始比价
-        if 'Lighter' in self.tickers and 'GRVT' in self.tickers:
-            await self._calculate_spread()
+        # 3. 只有当该币种在两个交易所都有数据时，才计算价差
+        if 'Lighter' in self.books[symbol] and 'GRVT' in self.books[symbol]:
+            await self._calculate_spread(symbol)
 
-    async def _calculate_spread(self):
-        """
-        计算价差逻辑
-        """
-        # 获取最新的报价
-        lighter = self.tickers['Lighter']
-        grvt = self.tickers['GRVT']
+    async def _calculate_spread(self, symbol: str):
+        # 获取该币种在两边的报价
+        lighter = self.books[symbol]['Lighter']
+        grvt = self.books[symbol]['GRVT']
 
-        # 场景 A: Lighter 价格高，GRVT 价格低 (Lighter 卖，GRVT 买)
-        # 利润 = Lighter.bid - GRVT.ask
+        # 价格有效性检查 (防止 0 价格触发除零错误或假信号)
+        if lighter['bid'] <= 0 or lighter['ask'] <= 0 or grvt['bid'] <= 0 or grvt['ask'] <= 0:
+            return
+
+        # 场景 A: Lighter 卖 (Bid), GRVT 买 (Ask)
         diff_a = lighter['bid'] - grvt['ask']
         spread_a = diff_a / grvt['ask']
 
-        # 场景 B: GRVT 价格高，Lighter 价格低 (GRVT 卖，Lighter 买)
-        # 利润 = GRVT.bid - Lighter.ask
+        # 场景 B: GRVT 卖 (Bid), Lighter 买 (Ask)
         diff_b = grvt['bid'] - lighter['ask']
         spread_b = diff_b / lighter['ask']
 
-        # --- 机会检测 ---
-
-        # 机会 A 检测
+        # --- 机会检测 (带 Symbol 标识) ---
         if spread_a > self.spread_threshold:
-            self._log_opportunity("A", "Sell Lighter / Buy GRVT", spread_a, lighter['bid'], grvt['ask'])
+            self._log_opportunity(symbol, "A", "Sell Lighter / Buy GRVT", spread_a, lighter['bid'], grvt['ask'])
+            await self.execute_trade(symbol, "Lighter", "GRVT", "SELL", "BUY", lighter['bid'], grvt['ask'])
 
-        # 机会 B 检测
         elif spread_b > self.spread_threshold:
-            self._log_opportunity("B", "Sell GRVT / Buy Lighter", spread_b, grvt['bid'], lighter['ask'])
+            self._log_opportunity(symbol, "B", "Sell GRVT / Buy Lighter", spread_b, grvt['bid'], lighter['ask'])
+            await self.execute_trade(symbol, "GRVT", "Lighter", "SELL", "BUY", grvt['bid'], lighter['ask'])
 
-    def _log_opportunity(self, type_code, action, spread, sell_price, buy_price):
-        """
-        打印漂亮的机会日志
-        """
+    def _log_opportunity(self, symbol, type_code, action, spread, sell_price, buy_price):
         pct = spread * 100
         msg = (
-            f"{LogColors.GREEN}💰 [套利机会 {type_code}] 利润率: {pct:.4f}% {LogColors.RESET}\n"
+            f"{LogColors.GREEN}💰 [{symbol} 套利机会 {type_code}] 利润率: {pct:.4f}% {LogColors.RESET}\n"
             f"   👉 动作: {action}\n"
             f"   📉 买入价: {buy_price} | 📈 卖出价: {sell_price} | 差价: {sell_price - buy_price:.2f}"
         )
         print(msg)
-        # TODO: 这里将调用 self.execute_trade()
+
+    async def execute_trade(self, symbol, ex_sell, ex_buy, side_sell, side_buy, price_sell, price_buy):
+        if self.is_trading: return
+        self.is_trading = True
+
+        try:
+            # 构造完整的交易对名称 (注意适配器内部可能需要的格式)
+            symbol_pair = f"{symbol}-USDT"
+
+            logger.info(f"⚡️ [EXECUTE] {symbol} | {ex_sell} Sell / {ex_buy} Buy")
+
+            # 测试阶段使用极小数量
+            quantity = 0.01 if symbol == 'SOL' else 0.0001
+
+            # 实际上这里应该根据交易所 API 调整 order_type，建议先打 LIMIT 做 Maker 或 Taker
+            # 为了保证成交，这里演示用 LIMIT 价格但其实是吃单逻辑
+            task_sell = self.adapters[ex_sell].create_order(
+                symbol=symbol_pair, side=side_sell, amount=quantity, price=price_sell, order_type="LIMIT"
+            )
+            task_buy = self.adapters[ex_buy].create_order(
+                symbol=symbol_pair, side=side_buy, amount=quantity, price=price_buy, order_type="LIMIT"
+            )
+
+            await asyncio.gather(task_sell, task_buy, return_exceptions=True)
+            logger.info(f"✅ 交易指令已发送")
+
+        except Exception as e:
+            logger.error(f"❌ 交易失败: {e}")
+        finally:
+            await asyncio.sleep(2)  # 冷却防止重复下单
+            self.is_trading = False
