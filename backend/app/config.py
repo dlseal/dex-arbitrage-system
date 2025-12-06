@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -9,6 +10,28 @@ class Config:
     # --- 全局交易标的配置 ---
     # 默认只监听 BTC, ETH, SOL。可以通过 .env 设置 TARGET_SYMBOLS=BTC,ETH,SOL,DOGE 来覆盖
     TARGET_SYMBOLS = os.getenv("TARGET_SYMBOLS", "BTC,ETH,SOL").split(",")
+
+    # ==========================
+    # 策略参数配置 (Strategy Config)
+    # ==========================
+
+    # 1. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
+    # 可以通过 .env 设置 SPREAD_THRESHOLD=0.001
+    SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.002"))
+
+    # 2. 交易冷却时间 (秒)，防止频繁开单
+    TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "2.0"))
+
+    # 3. 单次下单数量配置 (JSON格式)
+    # 默认值: SOL 下 0.01 个, 其他币种默认 0.0001
+    # 可以在 .env 中设置: TRADE_QUANTITIES='{"BTC": 0.001, "ETH": 0.01, "SOL": 1.0, "DEFAULT": 0.0001}'
+    _default_quantities = {"SOL": 0.01, "DEFAULT": 0.0001}
+    try:
+        _env_qty = os.getenv("TRADE_QUANTITIES")
+        TRADE_QUANTITIES = json.loads(_env_qty) if _env_qty else _default_quantities
+    except Exception as e:
+        print(f"⚠️ 解析 TRADE_QUANTITIES 失败，使用默认值: {e}")
+        TRADE_QUANTITIES = _default_quantities
 
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")

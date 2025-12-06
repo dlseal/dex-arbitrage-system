@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Any
+from app.config import Config
 
 
 class LogColors:
@@ -17,13 +18,12 @@ class SpreadArbitrageStrategy:
     def __init__(self, adapters: Dict[str, Any]):
         self.name = "SpreadArb_v1"
         self.adapters = adapters
-
-        # 🟢 核心修改 1: 数据结构改为 { symbol: { exchange: { bid, ask... } } }
-        # 例如: self.books['BTC'] = { 'Lighter': {...}, 'GRVT': {...} }
         self.books: Dict[str, Dict[str, Dict]] = {}
 
-        # 阈值设置 (建议设为 0.002 即 0.2% 以覆盖手续费)
-        self.spread_threshold = 0.002
+        # 2. 从配置读取阈值
+        self.spread_threshold = Config.SPREAD_THRESHOLD
+
+        logger.info(f"策略配置加载: 阈值={self.spread_threshold}, 冷却={Config.TRADE_COOLDOWN}s")
         self.is_active = True
         self.is_trading = False
 
@@ -88,16 +88,15 @@ class SpreadArbitrageStrategy:
         self.is_trading = True
 
         try:
-            # 构造完整的交易对名称 (注意适配器内部可能需要的格式)
+            # 构造完整的交易对名称
             symbol_pair = f"{symbol}-USDT"
 
             logger.info(f"⚡️ [EXECUTE] {symbol} | {ex_sell} Sell / {ex_buy} Buy")
 
-            # 测试阶段使用极小数量
-            quantity = 0.01 if symbol == 'SOL' else 0.0001
+            # 3. 动态获取下单数量 (配置化)
+            # 优先读取指定币种的配置，如果没有则读取 DEFAULT
+            quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
-            # 实际上这里应该根据交易所 API 调整 order_type，建议先打 LIMIT 做 Maker 或 Taker
-            # 为了保证成交，这里演示用 LIMIT 价格但其实是吃单逻辑
             task_sell = self.adapters[ex_sell].create_order(
                 symbol=symbol_pair, side=side_sell, amount=quantity, price=price_sell, order_type="LIMIT"
             )
@@ -106,10 +105,11 @@ class SpreadArbitrageStrategy:
             )
 
             await asyncio.gather(task_sell, task_buy, return_exceptions=True)
-            logger.info(f"✅ 交易指令已发送")
+            logger.info(f"✅ 交易指令已发送 (数量: {quantity})")
 
         except Exception as e:
             logger.error(f"❌ 交易失败: {e}")
         finally:
-            await asyncio.sleep(2)  # 冷却防止重复下单
+            # 4. 使用配置的冷却时间
+            await asyncio.sleep(Config.TRADE_COOLDOWN)
             self.is_trading = False

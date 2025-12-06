@@ -24,17 +24,17 @@ from app.core.engine import EventEngine
 from app.strategies.spread_arb import SpreadArbitrageStrategy
 
 # 配置日志格式
+
 logging.basicConfig(
-    level=logging.INFO,  # <--- 打开调试开关
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", # 增加 %(name)s 查看是哪个模块发的
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-
-# 为了防止 requests/urllib3/asyncio 产生太多垃圾日志，屏蔽掉它们
+logging.getLogger("GrvtCcxtWS").setLevel(logging.WARNING)
+logging.getLogger("pysdk").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-# logging.getLogger("websockets").setLevel(logging.DEBUG) # 👈 关键：我们要看 websockets 的底层日志
-
+logging.getLogger("websockets").setLevel(logging.WARNING)
 logger = logging.getLogger("Main")
 
 
@@ -107,19 +107,19 @@ async def main():
         logger.info("✅ 所有交易所连接成功！")
 
         # --- 连接性验证：打印当前的 BTC 价格 ---
-        print("\n" + "=" * 50)
-        print(f"{'Exchange':<15} | {'Symbol':<15} | {'Bid':<15} | {'Ask':<15}")
-        print("-" * 50)
+        logging.info("\n" + "=" * 50)
+        logging.info(f"{'Exchange':<15} | {'Symbol':<15} | {'Bid':<15} | {'Ask':<15}")
+        logging.info("-" * 50)
 
         for ex in adapters:
             try:
                 # 尝试获取 BTC-USDT 的订单簿
                 # 注意: 确保您的 Adapter 内部逻辑能处理 "BTC-USDT" 字符串
                 ticker = await ex.fetch_orderbook("BTC-USDT")
-                print(f"{ex.name:<15} | {ticker['symbol']:<15} | {ticker['bid']:<15} | {ticker['ask']:<15}")
+                logging.info(f"{ex.name:<15} | {ticker['symbol']:<15} | {ticker['bid']:<15} | {ticker['ask']:<15}")
             except Exception as e:
-                print(f"{ex.name:<15} | {'ERROR':<15} | {str(e):<30}")
-        print("=" * 50 + "\n")
+                logging.info(f"{ex.name:<15} | {'ERROR':<15} | {str(e):<30}")
+        logging.info("=" * 50 + "\n")
 
     except Exception as e:
         logger.error(f"❌ 初始化过程中发生严重错误: {e}")

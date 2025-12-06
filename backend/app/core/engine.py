@@ -44,8 +44,7 @@ class EventEngine:
             msg_count += 1
 
             if msg_count <= 20 or msg_count % 50 == 0:
-                print(
-                    f"🕵️ [DEBUG] 引擎收到数据: Exchange={tick['exchange']} | Symbol={tick['symbol']} | Bid={tick['bid']}")
+                logger.debug(f"Tick received: {tick['symbol']} from {tick['exchange']}")
 
             # 推送给策略
             if self.strategy:

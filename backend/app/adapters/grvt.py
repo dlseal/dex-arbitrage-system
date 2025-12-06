@@ -2,7 +2,6 @@ import asyncio
 import time
 import os
 import logging
-import traceback
 from decimal import Decimal
 from typing import Dict, Optional, Any, List
 
@@ -55,15 +54,15 @@ class GrvtAdapter(BaseExchange):
         retry_count = 5  # 增加重试次数
         for attempt in range(retry_count):
             try:
-                print(f"⏳ [GRVT] 正在连接 WS (第 {attempt + 1} 次尝试)...")
+                logging.info(f"⏳ [GRVT] 正在连接 WS (第 {attempt + 1} 次尝试)...")
                 await self._initialize_logic()
-                print("✅ [GRVT] 连接成功！")
+                logging.info("✅ [GRVT] 连接成功！")
                 return
             except Exception as e:
                 logging.warning(f"⚠️ [GRVT] 连接失败: {e}")
                 # 每次失败等待时间加长 (3s, 6s, 9s...)
                 wait_time = (attempt + 1) * 3
-                print(f"   -> 等待 {wait_time} 秒后重试...")
+                logging.info(f"   -> 等待 {wait_time} 秒后重试...")
                 await asyncio.sleep(wait_time)
 
         # 如果全部失败
@@ -80,7 +79,7 @@ class GrvtAdapter(BaseExchange):
         self.rest_client = GrvtCcxt(env=self.env, parameters=params)
 
         # 2. 动态加载市场
-        print(f"⏳ [GRVT] Fetching markets from {self.env.name}...")
+        logging.info(f"⏳ [GRVT] Fetching markets from {self.env.name}...")
         markets = await self._fetch_markets_async()
 
         loaded_count = 0
@@ -100,7 +99,7 @@ class GrvtAdapter(BaseExchange):
                     loaded_count += 1
 
         if loaded_count == 0:
-            print(f"⚠️ [GRVT] Warning: No target markets found for {self.target_symbols}")
+            logging.info(f"⚠️ [GRVT] Warning: No target markets found for {self.target_symbols}")
 
         # 3. 初始化 WS
         loop = asyncio.get_running_loop()
@@ -122,7 +121,7 @@ class GrvtAdapter(BaseExchange):
         await asyncio.sleep(1)
 
         self.is_connected = True
-        print(f"✅ [GRVT] Initialized. Monitoring: {self.target_symbols}")
+        logging.info(f"✅ [GRVT] Initialized. Monitoring: {self.target_symbols}")
 
     async def _fetch_markets_async(self):
         loop = asyncio.get_running_loop()
@@ -146,7 +145,7 @@ class GrvtAdapter(BaseExchange):
                     if not self.ws_client._session.closed:
                         await self.ws_client._session.close()
             except Exception as e:
-                print(f"⚠️ [GRVT] WS Close Error: {e}")
+                logging.info(f"⚠️ [GRVT] WS Close Error: {e}")
 
         # 2. 清理 REST 客户端 (同步)
         # 注意：GrvtCcxt 是同步的，通常不需要 await 关闭，或者它没有显式的 close 方法
@@ -190,11 +189,11 @@ class GrvtAdapter(BaseExchange):
                 ))
             return res['id']
         except Exception as e:
-            print(f"❌ [GRVT] Order Error: {e}")
+            logging.info(f"❌ [GRVT] Order Error: {e}")
             return None
 
     async def listen_websocket(self, queue: asyncio.Queue):
-        print(f"📡 [GRVT] Starting WS subscriptions...")
+        logging.info(f"📡 [GRVT] Starting WS subscriptions...")
         loop = asyncio.get_running_loop()
 
         async def message_callback(message: Dict[str, Any]):
@@ -247,8 +246,8 @@ class GrvtAdapter(BaseExchange):
 
             except Exception as e:
                 # 🔴 关键修复：打印错误堆栈！不要 pass！
-                print(f"❌ [GRVT Callback Error] {e} | Msg: {str(message)[:50]}")
-                # traceback.print_exc()
+                logging.info(f"❌ [GRVT Callback Error] {e} | Msg: {str(message)[:50]}")
+                # traceback.logging.info_exc()
 
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']

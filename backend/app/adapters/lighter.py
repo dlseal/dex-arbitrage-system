@@ -144,7 +144,7 @@ class LighterAdapter(BaseExchange):
                     'price_mul': price_mul
                 }
                 if market.symbol in self.target_symbols:
-                    print(f"   - Loaded {market.symbol}: ID={market.market_id}")
+                    logging.info(f"   - Loaded {market.symbol}: ID={market.market_id}")
 
             private_keys_dict = {self.api_key_index: self.private_key}
             self.client = SignerClient(
@@ -153,10 +153,10 @@ class LighterAdapter(BaseExchange):
                 api_private_keys=private_keys_dict
             )
             self.is_connected = True
-            print(f"✅ [Lighter] Initialized.")
+            logging.info(f"✅ [Lighter] Initialized.")
 
         except Exception as e:
-            print(f"❌ [Lighter] Init Failed: {e}")
+            logging.info(f"❌ [Lighter] Init Failed: {e}")
             raise e
 
     async def listen_websocket(self, queue: asyncio.Queue):
@@ -180,7 +180,7 @@ class LighterAdapter(BaseExchange):
                 tasks.append(asyncio.create_task(manager.run()))
 
         if tasks:
-            print(f"🚀 [Lighter] Started {len(tasks)} WS connections.")
+            logging.info(f"🚀 [Lighter] Started {len(tasks)} WS connections.")
             await asyncio.gather(*tasks)
 
     # --- REST API (修复版) ---
@@ -257,9 +257,9 @@ class LighterAdapter(BaseExchange):
                     time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
                 )
             if err:
-                print(f"❌ [Lighter] Order Error: {err}")
+                logging.info(f"❌ [Lighter] Order Error: {err}")
                 return None
             return str(client_order_index)
         except Exception as e:
-            print(f"❌ [Lighter] Create Exception: {e}")
+            logging.info(f"❌ [Lighter] Create Exception: {e}")
             return None
