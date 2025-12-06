@@ -12,19 +12,22 @@ class Config:
     TARGET_SYMBOLS = os.getenv("TARGET_SYMBOLS", "BTC,ETH,SOL").split(",")
 
     # ==========================
+    # 策略选择配置
+    # ==========================
+    # 策略类型: 'SPREAD' (价差套利) 或 'GL_FARM' (GRVT-Lighter刷量)
+    STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "GL_FARM")
+
+    # ==========================
     # 策略参数配置 (Strategy Config)
     # ==========================
 
     # 1. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
-    # 可以通过 .env 设置 SPREAD_THRESHOLD=0.001
     SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.002"))
 
     # 2. 交易冷却时间 (秒)，防止频繁开单
     TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "2.0"))
 
     # 3. 单次下单数量配置 (JSON格式)
-    # 默认值: SOL 下 0.01 个, 其他币种默认 0.0001
-    # 可以在 .env 中设置: TRADE_QUANTITIES='{"BTC": 0.001, "ETH": 0.01, "SOL": 1.0, "DEFAULT": 0.0001}'
     _default_quantities = {"SOL": 0.01, "DEFAULT": 0.0001}
     try:
         _env_qty = os.getenv("TRADE_QUANTITIES")
@@ -33,6 +36,21 @@ class Config:
         print(f"⚠️ 解析 TRADE_QUANTITIES 失败，使用默认值: {e}")
         TRADE_QUANTITIES = _default_quantities
 
+    # ==========================
+    # 刷量策略专用参数 (Volume Farming Config)
+    # ==========================
+
+    # 允许的最大价差亏损 (滑点容忍度)
+    # 例如 -0.0005 代表允许亏损 0.05% 去换取成交 (前提是 Rebate > 0.05%)
+    # 正数表示必须要盈利才开单，负数表示愿意支付的成本
+    MAX_SLIPPAGE_TOLERANCE = float(os.getenv("MAX_SLIPPAGE_TOLERANCE", "-0.0005"))
+
+    # 刷量单次下单数量 (例如 0.1 SOL)
+    VOLUME_ORDER_SIZE = float(os.getenv("VOLUME_ORDER_SIZE", "0.01"))
+
+    # 重挂单阈值: 当目标价格与当前挂单价格偏差超过此比例时，撤单重挂
+    REQUOTE_THRESHOLD = float(os.getenv("REQUOTE_THRESHOLD", "0.0005"))
+
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
@@ -40,10 +58,8 @@ class Config:
     GRVT_ENV = os.getenv("GRVT_ENVIRONMENT", "prod")  # prod / testnet
 
     # --- Lighter 配置 ---
-    # Lighter API Key 通常就是你的钱包地址 (Public Address)
     LIGHTER_API_KEY = os.getenv("LIGHTER_API_KEY")
     LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY")
-    # 如果 .env 没填，默认设为 0 (通常主账户 index 是 0)
     LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
     LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "0"))
 

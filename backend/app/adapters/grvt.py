@@ -16,7 +16,7 @@ from .base import BaseExchange
 
 class GrvtAdapter(BaseExchange):
     """
-    GRVT 交易所适配器 (增强版：修复资源清理与超时重试)
+    GRVT 交易所适配器 (增强版：支持成交推送)
     """
 
     def __init__(self,
@@ -48,10 +48,8 @@ class GrvtAdapter(BaseExchange):
         self.contract_map = {}
 
     async def initialize(self):
-        """
-        初始化：带重试机制 (增强版)
-        """
-        retry_count = 5  # 增加重试次数
+        """初始化：带重试机制"""
+        retry_count = 5
         for attempt in range(retry_count):
             try:
                 logging.info(f"⏳ [GRVT] 正在连接 WS (第 {attempt + 1} 次尝试)...")
@@ -60,14 +58,11 @@ class GrvtAdapter(BaseExchange):
                 return
             except Exception as e:
                 logging.warning(f"⚠️ [GRVT] 连接失败: {e}")
-                # 每次失败等待时间加长 (3s, 6s, 9s...)
                 wait_time = (attempt + 1) * 3
                 logging.info(f"   -> 等待 {wait_time} 秒后重试...")
                 await asyncio.sleep(wait_time)
 
-        # 如果全部失败
         logging.error("❌ [GRVT] 无法建立连接，请检查网络/VPN！")
-        # raise e
 
     async def _initialize_logic(self):
         # 1. 初始化 REST (同步)
@@ -117,7 +112,7 @@ class GrvtAdapter(BaseExchange):
             parameters=ws_params
         )
 
-        await self.ws_client.initialize()  # 这里最容易超时
+        await self.ws_client.initialize()
         await asyncio.sleep(1)
 
         self.is_connected = True
@@ -134,26 +129,22 @@ class GrvtAdapter(BaseExchange):
             raise ValueError(f"Market {symbol} not found (Targets: {self.target_symbols})")
         return info
 
-    # --- 修复后的 close 方法 ---
+    def _get_symbol_from_instrument(self, instrument_id):
+        """辅助方法：通过 ID 反查 Symbol"""
+        for s, info in self.contract_map.items():
+            if info['id'] == instrument_id:
+                return s.split('-')[0]
+        return "UNKNOWN"
+
     async def close(self):
         """安全清理资源"""
-        # 1. 清理 WS 客户端 (异步)
         if self.ws_client:
             try:
-                # 尝试访问内部 session 并关闭
                 if hasattr(self.ws_client, '_session') and self.ws_client._session:
                     if not self.ws_client._session.closed:
                         await self.ws_client._session.close()
             except Exception as e:
                 logging.info(f"⚠️ [GRVT] WS Close Error: {e}")
-
-        # 2. 清理 REST 客户端 (同步)
-        # 注意：GrvtCcxt 是同步的，通常不需要 await 关闭，或者它没有显式的 close 方法
-        # 这里什么都不做，或者如果它有 close() 就同步调用
-        if self.rest_client:
-            pass
-
-            # --- 其他方法保持不变 ---
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
         info = self._get_contract_info(symbol)
@@ -176,7 +167,12 @@ class GrvtAdapter(BaseExchange):
         info = self._get_contract_info(symbol)
         qty = float(Decimal(str(amount)))
         px = float(Decimal(str(price))) if price else 0.0
+
+        # 默认 Post Only 以确保拿到 Maker Rebate
         params = {'post_only': True, 'order_duration_secs': 2591999}
+        if order_type == "MARKET":
+            params = {}  # 市价单不需要 post_only
+
         loop = asyncio.get_running_loop()
         try:
             if order_type == "MARKET":
@@ -198,56 +194,68 @@ class GrvtAdapter(BaseExchange):
 
         async def message_callback(message: Dict[str, Any]):
             try:
-                # 👇 调试关键：打印接收到的消息结构，确认 feed 在哪
-                # logger.debug(f"[GRVT RAW] {str(message)[:100]}...")
-
                 feed_data = message.get("feed", {})
 
-                # 如果 message 本身就是 feed 数据 (有些 SDK 版本不同)
+                # 兼容不同 SDK 版本的结构
                 if "instrument" not in feed_data and "instrument" in message:
                     feed_data = message
 
-                instrument = feed_data.get("instrument")
                 channel = message.get("params", {}).get("channel")
-
                 # 如果 SDK 返回的结构不同，尝试从 payload 里找
                 if not channel:
-                    channel = message.get("stream")  # 可能是 "v1.book.s"
+                    channel = message.get("stream")
 
-                symbol_base = None
-                for s, info in self.contract_map.items():
-                    if info['id'] == instrument:
-                        symbol_base = s.split('-')[0]
-                        break
+                # --- 1. 处理订单/成交事件 (Order Update) ---
+                # 注意：GRVT WS 频道名称可能为 'order' 或 'v1.order'
+                if channel and "order" in str(channel) and "book" not in str(channel):
+                    order_state = feed_data.get("state")
+                    # 只有当状态为已成交或部分成交时，才触发对冲
+                    if order_state in ["FILLED", "PARTIALLY_FILLED"]:
+                        instrument = feed_data.get("instrument")
+                        symbol_base = self._get_symbol_from_instrument(instrument)
 
-                # 如果没找到 instrument，可能是心跳或控制消息，忽略
-                if not symbol_base:
+                        event = {
+                            'type': 'trade',  # 标记为交易事件
+                            'exchange': self.name,
+                            'symbol': symbol_base,
+                            'side': feed_data.get("side"),  # BUY/SELL
+                            'price': float(feed_data.get("price", 0)),
+                            'size': float(feed_data.get("size", 0)),
+                            'ts': int(time.time() * 1000)
+                        }
+                        # 🚨 必须使用 call_soon_threadsafe 放入队列
+                        loop.call_soon_threadsafe(queue.put_nowait, event)
+                    return
+
+                # --- 2. 处理 Orderbook 数据 ---
+                # 找到对应的 Instrument
+                instrument = feed_data.get("instrument")
+                symbol_base = self._get_symbol_from_instrument(instrument)
+
+                if symbol_base == "UNKNOWN":
                     return
 
                 # 处理 Orderbook 数据
-                if "book" in str(channel):  # 兼容 "book.s" 和 "v1.book.s"
+                if channel and "book" in str(channel):  # 兼容 "book.s" 和 "v1.book.s"
                     bids = feed_data.get("bids", [])
                     asks = feed_data.get("asks", [])
 
                     if bids and asks:
-                        # GRVT 价格通常也是字符串，转 float
                         best_bid = float(bids[0]['price'])
                         best_ask = float(asks[0]['price'])
 
                         tick = {
+                            'type': 'tick',  # 标记为行情事件
                             'exchange': self.name,
                             'symbol': symbol_base,
                             'bid': best_bid,
                             'ask': best_ask,
                             'ts': int(time.time() * 1000)
                         }
-                        # 👇 这里的 put_nowait 是将数据推进引擎的关键
                         loop.call_soon_threadsafe(queue.put_nowait, tick)
 
             except Exception as e:
-                # 🔴 关键修复：打印错误堆栈！不要 pass！
-                logging.info(f"❌ [GRVT Callback Error] {e} | Msg: {str(message)[:50]}")
-                # traceback.logging.info_exc()
+                logging.warning(f"❌ [GRVT Callback Error] {e}")
 
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
@@ -257,13 +265,13 @@ class GrvtAdapter(BaseExchange):
                 callback=message_callback,
                 params={"instrument": instrument_id}
             )
-            # 订阅私有订单
+            # 订阅私有订单 (关键)
             await self.ws_client.subscribe(
                 stream="order",
                 callback=message_callback,
                 params={"instrument": instrument_id, "sub_account_id": self.trading_account_id}
             )
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
 
         while True:
             await asyncio.sleep(1)
