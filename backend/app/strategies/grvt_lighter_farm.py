@@ -9,7 +9,7 @@ logger = logging.getLogger("SmartFarm_GL")
 
 class GrvtLighterFarmStrategy:
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_Pro_v3"
+        self.name = "GrvtLighter_Farm_Pro_v3_Fixed"
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
@@ -83,22 +83,33 @@ class GrvtLighterFarmStrategy:
             'reason': f"Hedge for GRVT {side} @ {price}"
         })
 
-        # 2. 状态重置：立即清空本地状态并触发撤单
+        # 2. 状态重置：触发清理逻辑（必须清理旧单）
         self.resetting_symbols.add(symbol)
-        self.active_orders.pop(symbol, None)
+
+        # ⚠️ 修复：不要立即简单 pop，而是交给 cleanup 函数去处理撤单
+        # self.active_orders.pop(symbol, None)
+
         asyncio.create_task(self._cleanup_after_fill(symbol))
 
     async def _cleanup_after_fill(self, symbol: str):
-        """成交后清理：虽然丢失了ID，但我们暂停策略2秒让系统稳定"""
+        """成交后清理：撤销所有剩余挂单并重置状态"""
         try:
-            logger.info(f"🧹 [Cleanup] Fill detected. Pausing quotes for {symbol}...")
-            # 如果 Adapter 支持 cancel_all 这里调用最好
-            # 由于没有，我们只能依赖本地状态清空，并让旧单自然保留或在下次启动时手动处理
-            # 实际上，如果知道之前的 IDs 应该在这里撤销。
-            # 简化起见，我们暂停策略挂单，避免立即反向操作
+            logger.info(f"🧹 [Cleanup] Fill detected for {symbol}. Cancelling remaining orders...")
+
+            # 1. 强制撤销该币种所有本地记录的订单
+            if symbol in self.active_orders and self.active_orders[symbol]:
+                await self._cancel_orders(symbol, list(self.active_orders[symbol].keys()))
+
+            # 2. 清空本地状态
+            self.active_orders[symbol] = {}
+
+        except Exception as e:
+            logger.error(f"❌ Cleanup Error: {e}")
         finally:
+            # 3. 暂停一会再恢复挂单
             await asyncio.sleep(2.0)
             self.resetting_symbols.discard(symbol)
+            logger.info(f"▶️ [Resume] Resuming quotes for {symbol}")
 
     async def _manage_maker_orders(self, symbol: str):
         lighter_tick = self.tickers[symbol]['Lighter']
@@ -129,6 +140,7 @@ class GrvtLighterFarmStrategy:
             should_cancel = True
         else:
             current_prices = list(current_orders.values())
+            # 简单的价格对比逻辑
             for _, target_p in target_orders:
                 # 检查是否存在价格接近的订单
                 if not any(abs(cp - target_p) / target_p < self.requote_threshold for cp in current_prices):
@@ -137,12 +149,27 @@ class GrvtLighterFarmStrategy:
 
         if should_cancel:
             ids = list(current_orders.keys())
-            self.active_orders[symbol] = {}  # 先清空
             if ids:
-                tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in ids]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                logger.info(f"♻️ [Requote] Deviation detected. Cancelling {len(ids)} orders...")
+                # ⚠️ 修复：先执行撤单，再清空状态，再挂新单
+                await self._cancel_orders(symbol, ids)
 
+            # 无论撤单成功与否（Adapter可能吞异常），我们都清除本地状态以避免死锁，
+            # 并重新挂单。如果撤单真的失败，这里确实会造成双挂，
+            # 但至少我们现在尝试了显式撤单。
+            self.active_orders[symbol] = {}
             await self._place_orders(symbol, target_orders)
+
+    async def _cancel_orders(self, symbol: str, order_ids: List[str]):
+        """封装撤单逻辑"""
+        if not order_ids: return
+        try:
+            tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in order_ids]
+            # 等待所有撤单请求发送完成
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # logger.info(f"🗑️ Sent cancel for {order_ids}")
+        except Exception as e:
+            logger.error(f"❌ Cancel Failed: {e}")
 
     async def _place_orders(self, symbol, targets):
         adapter = self.adapters['GRVT']
@@ -163,6 +190,8 @@ class GrvtLighterFarmStrategy:
             if isinstance(res, str) and res:
                 self.active_orders[symbol][res] = price
                 success += 1
+            else:
+                logger.warning(f"⚠️ Order placement failed or returned None: {res}")
 
         if success > 0:
             logger.info(f"🌊 [Quote] {symbol} Placed {success} orders near {prices[0]:.2f}")
@@ -182,9 +211,15 @@ class GrvtLighterFarmStrategy:
             try:
                 # 简单市价对冲
                 tick = self.tickers.get(symbol, {}).get('Lighter')
-                if not tick: continue
+                if not tick:
+                    logger.warning(f"⚠️ No Lighter tick for hedge {symbol}")
+                    continue
 
                 ref_p = tick['bid'] if side == 'SELL' else tick['ask']
+                if ref_p <= 0:
+                    logger.warning(f"⚠️ Invalid Lighter price for hedge {symbol}")
+                    continue
+
                 limit_p = ref_p * 0.95 if side == 'SELL' else ref_p * 1.05
 
                 logger.info(f"🛡️ Hedging: {side} {size} on Lighter...")
