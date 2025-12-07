@@ -3,7 +3,6 @@ import time
 import os
 import logging
 import random
-import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Dict, Optional, Any, List
 
@@ -172,7 +171,6 @@ class GrvtAdapter(BaseExchange):
             return None
 
         client_order_id = int(time.time() * 1000) & 0xFFFFFFFF
-
         safe_side = side.lower()
         params = {
             'client_order_id': client_order_id,
@@ -217,24 +215,27 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Create Order Error: {e}")
             return None
 
-    async def cancel_order(self, order_id: str):
+    async def cancel_order(self, order_id: str, symbol: str = None):
+        """
+        修正：通过 params 传递 client_order_id
+        """
         try:
             oid = int(order_id) if str(order_id).isdigit() else order_id
-            await self.ws_client.cancel_order(client_order_id=oid)
-        except Exception as e:
-            logger.warning(f"Cancel failed for {order_id}: {e}")
 
-    async def cancel_all_orders(self, symbol: str):
-        """新增: 撤销某个币种的所有订单，用于重置状态"""
-        info = self._get_contract_info(symbol)
-        if not info: return
-        try:
-            if hasattr(self.ws_client, 'cancel_all_orders'):
-                await self.ws_client.cancel_all_orders(symbol=info['id'])
-            else:
-                pass
+            inst_id = None
+            if symbol:
+                info = self._get_contract_info(symbol)
+                if info:
+                    inst_id = info['id']
+
+            # CCXT 标准：Client ID 放在 params 中
+            params = {'client_order_id': oid}
+
+            await self.ws_client.cancel_order(id=None, symbol=inst_id, params=params)
+
         except Exception as e:
-            logger.error(f"Cancel All Error: {e}")
+            if "not found" not in str(e).lower():
+                logger.warning(f"Cancel failed for {order_id}: {e}")
 
     async def close(self):
         logger.info("🛑 [GRVT] Closing resources...")
@@ -286,10 +287,6 @@ class GrvtAdapter(BaseExchange):
                             }
                             event_queue.put_nowait(event)
                             logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
-
-                    elif status in ["CANCELLED", "EXPIRED", "REJECTED"]:
-                        pass
-
                     return
 
                 if "book" in str(channel):

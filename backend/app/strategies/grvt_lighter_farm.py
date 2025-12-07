@@ -13,7 +13,6 @@ class GrvtLighterFarmStrategy:
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        # 状态管理: symbol -> {client_order_id: price}
         self.active_orders: Dict[str, Dict[str, float]] = {}
         self.last_quote_time: Dict[str, float] = {}
         self.resetting_symbols = set()
@@ -46,12 +45,10 @@ class GrvtLighterFarmStrategy:
         if symbol in self.resetting_symbols: return
 
         if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
-            # 检查数据新鲜度 (5秒内)
             t1 = self.tickers[symbol]['Lighter']['ts']
             t2 = self.tickers[symbol]['GRVT']['ts']
             if abs(t1 - t2) > 5000: return
 
-            # 限制频率 (1秒)
             now = time.time()
             if now - self.last_quote_time.get(symbol, 0) > 1.0:
                 self.last_quote_time[symbol] = now
@@ -75,14 +72,10 @@ class GrvtLighterFarmStrategy:
             'reason': f"Hedge for GRVT {side} @ {price}"
         })
 
-        # 状态重置：触发清理逻辑（必须清理旧单）
         self.resetting_symbols.add(symbol)
-
-        # ⚠️ 修复：不要立即简单 pop，而是交给 cleanup 函数去处理撤单
         asyncio.create_task(self._cleanup_after_fill(symbol))
 
     async def _cleanup_after_fill(self, symbol: str):
-        """成交后清理：撤销所有剩余挂单并重置状态"""
         try:
             logger.info(f"🧹 [Cleanup] Fill detected for {symbol}. Cancelling remaining orders...")
 
@@ -133,20 +126,16 @@ class GrvtLighterFarmStrategy:
             ids = list(current_orders.keys())
             if ids:
                 logger.info(f"♻️ [Requote] Deviation detected. Cancelling {len(ids)} orders...")
-                # ⚠️ 修复：先执行撤单，再清空状态，再挂新单
                 await self._cancel_orders(symbol, ids)
 
-            # 无论撤单成功与否（Adapter可能吞异常），我们都清除本地状态以避免死锁，
-            # 并重新挂单。如果撤单真的失败，这里确实会造成双挂，
-            # 但至少我们现在尝试了显式撤单。
             self.active_orders[symbol] = {}
             await self._place_orders(symbol, target_orders)
 
     async def _cancel_orders(self, symbol: str, order_ids: List[str]):
-        """封装撤单逻辑"""
         if not order_ids: return
         try:
-            tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in order_ids]
+            # 修正：传递 symbol 参数
+            tasks = [self.adapters['GRVT'].cancel_order(oid, symbol=symbol) for oid in order_ids]
             await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             logger.error(f"❌ Cancel Failed: {e}")

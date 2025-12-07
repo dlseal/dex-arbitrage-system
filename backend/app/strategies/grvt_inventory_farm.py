@@ -21,7 +21,6 @@ class GrvtInventoryFarmStrategy:
         self.current_inventory: Dict[str, float] = {}
         self.active_orders: Dict[str, Dict[str, float]] = {}
 
-        # 锁：inventory_lock 保护持仓数据；action_locks 保护下单/撤单原子性
         self.inventory_lock = asyncio.Lock()
         self.action_locks: Dict[str, asyncio.Lock] = {}
 
@@ -39,7 +38,6 @@ class GrvtInventoryFarmStrategy:
         return self.action_locks[symbol]
 
     async def _sync_position_loop(self):
-        """定期校准持仓，修复 WS 推送遗漏导致的偏差"""
         while True:
             try:
                 await asyncio.sleep(20)
@@ -81,14 +79,11 @@ class GrvtInventoryFarmStrategy:
             elif event.get('type') == 'tick':
                 symbol = event.get('symbol')
                 if symbol in Config.TARGET_SYMBOLS:
-                    # 关键优化：不要在 on_tick 里 await 耗时操作
-                    # 使用 create_task 将计算逻辑放入后台，防止阻塞 Engine
                     asyncio.create_task(self._process_tick_logic(event))
         except Exception as e:
             logger.error(f"Strategy Error: {e}")
 
     async def _process_tick_logic(self, tick: dict):
-        """处理行情的后台任务"""
         symbol = tick['symbol']
         exchange = tick['exchange']
 
@@ -97,8 +92,6 @@ class GrvtInventoryFarmStrategy:
 
         if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
             lock = self._get_action_lock(symbol)
-
-            # 如果正在执行下单/撤单（Locked），则跳过本次 Tick，防止逻辑重入冲突
             if not lock.locked():
                 async with lock:
                     await self._update_grid_orders(symbol)
@@ -175,19 +168,14 @@ class GrvtInventoryFarmStrategy:
         return False
 
     async def _cancel_local_orders(self, symbol):
-        """
-        修复 Bug: 只有在撤单请求发出后，才安全地管理 active_orders。
-        """
         orders = self.active_orders.get(symbol, {})
         if not orders: return
 
         order_ids = list(orders.keys())
-        tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in order_ids]
+        # 修正：传递 symbol 参数
+        tasks = [self.adapters['GRVT'].cancel_order(oid, symbol=symbol) for oid in order_ids]
 
         await asyncio.gather(*tasks, return_exceptions=True)
-
-        # 假设撤单指令发出后，订单即失效。
-        # (更严格的做法是等待 'order cancelled' 事件，但这里做简化处理以保证挂单效率)
         self.active_orders[symbol] = {}
 
     async def _place_new_orders(self, symbol, side, prices):
@@ -204,8 +192,6 @@ class GrvtInventoryFarmStrategy:
         for res, p in zip(results, prices):
             if isinstance(res, str) and res:
                 new_active[res] = p
-            else:
-                pass
 
         self.active_orders[symbol] = new_active
         if new_active:
@@ -223,7 +209,6 @@ class GrvtInventoryFarmStrategy:
             new_inv = self.current_inventory[symbol]
 
         logger.info(f"⚡️ [Fill] {symbol} {side} {size} | New Inv: {new_inv:.4f}")
-
         asyncio.create_task(self._check_hedge_trigger(symbol, new_inv))
 
     async def _check_hedge_trigger(self, symbol, inv):
@@ -236,12 +221,6 @@ class GrvtInventoryFarmStrategy:
             await self._execute_batch_hedge(symbol)
 
     async def _execute_batch_hedge(self, symbol):
-        """
-        紧急对冲逻辑：
-        1. 使用 action_lock 暂停挂单
-        2. 撤销所有本地挂单
-        3. 在 Lighter 市场吃单平仓
-        """
         lock = self._get_action_lock(symbol)
 
         if lock.locked():
