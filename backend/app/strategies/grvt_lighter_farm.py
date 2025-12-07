@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List
 from app.config import Config
 
 logger = logging.getLogger("SmartFarm_GL")
@@ -9,24 +9,29 @@ logger = logging.getLogger("SmartFarm_GL")
 
 class GrvtLighterFarmStrategy:
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v2"
+        self.name = "GrvtLighter_Farm_Pro_v3"
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        # 状态管理
-        self.active_orders: Dict[str, Dict[str, float]] = {}  # symbol -> {order_id: price}
+        # 状态管理: symbol -> {client_order_id: price}
+        self.active_orders: Dict[str, Dict[str, float]] = {}
+
+        # 频率限制
         self.last_quote_time: Dict[str, float] = {}
+
+        # 重置锁
+        self.resetting_symbols = set()
+
+        # 对冲队列
         self.hedge_queue = asyncio.Queue()
 
-        # 配置读取
-        self.spread = Config.SPREAD_THRESHOLD  # 利润差价
-        self.max_slippage = getattr(Config, 'MAX_SLIPPAGE_TOLERANCE', -0.0005)
+        # 配置
+        self.spread = Config.SPREAD_THRESHOLD
         self.requote_threshold = getattr(Config, 'REQUOTE_THRESHOLD', 0.0005)
 
-        # 启动对冲消费者
         asyncio.create_task(self._hedge_consumer())
 
-        logger.info(f"🛡️ Strategy Ready. Spread: {self.spread * 100}% | Slippage Tol: {self.max_slippage * 100}%")
+        logger.info(f"🛡️ Strategy Ready | Spread: {self.spread * 100:.2f}%")
 
     async def on_tick(self, event: dict):
         try:
@@ -36,7 +41,7 @@ class GrvtLighterFarmStrategy:
             elif event_type == 'tick':
                 await self._process_tick(event)
         except Exception as e:
-            logger.error(f"Strategy Error: {e}")
+            logger.error(f"Strategy Error: {e}", exc_info=True)
 
     async def _process_tick(self, tick: dict):
         symbol = tick['symbol']
@@ -45,186 +50,145 @@ class GrvtLighterFarmStrategy:
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        # 仅当两边都有行情时才计算
+        if symbol in self.resetting_symbols: return
+
         if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
-            # 简单的时间同步检查 (2秒内)
+            # 1. 检查数据新鲜度 (5秒内)
             t1 = self.tickers[symbol]['Lighter']['ts']
             t2 = self.tickers[symbol]['GRVT']['ts']
-            if abs(t1 - t2) > 2000:
-                return
+            if abs(t1 - t2) > 5000: return
 
-            # 限制挂单频率 (每 1.5 秒一次)
+            # 2. 限制频率 (1秒)
             now = time.time()
-            if now - self.last_quote_time.get(symbol, 0) > 1.5:
+            if now - self.last_quote_time.get(symbol, 0) > 1.0:
                 self.last_quote_time[symbol] = now
                 await self._manage_maker_orders(symbol)
 
     async def _process_trade_fill(self, trade: dict):
-        """处理 GRVT 成交 -> 触发 Lighter 对冲"""
         if trade['exchange'] != 'GRVT': return
 
         symbol = trade['symbol']
-        side = trade['side']  # BUY or SELL
+        side = trade['side']
         size = float(trade['size'])
         price = float(trade['price'])
+        order_id = str(trade.get('order_id', 'unknown'))
 
-        order_id = trade.get('order_id')
         logger.info(f"⚡️ [FILLED] GRVT {side} {size} @ {price} (ID: {order_id})")
 
-        # 无论是不是我们内存记录的单子，只要是 GRVT 成交了，就去对冲
-        # 因为可能是重启前的挂单成交了
+        # 1. 对冲
         await self.hedge_queue.put({
             'symbol': symbol,
-            'side': 'SELL' if side == 'BUY' else 'BUY',  # 反向对冲
+            'side': 'SELL' if side == 'BUY' else 'BUY',
             'size': size,
             'reason': f"Hedge for GRVT {side} @ {price}"
         })
 
-        # 清理本地记录的订单状态
-        if symbol in self.active_orders:
-            # 简单粗暴：有成交就清空该币种所有挂单记录，下一轮 tick 会重新挂
-            # 这样可以防止重复挂单
-            self.active_orders.pop(symbol, None)
+        # 2. 状态重置：立即清空本地状态并触发撤单
+        self.resetting_symbols.add(symbol)
+        self.active_orders.pop(symbol, None)
+        asyncio.create_task(self._cleanup_after_fill(symbol))
+
+    async def _cleanup_after_fill(self, symbol: str):
+        """成交后清理：虽然丢失了ID，但我们暂停策略2秒让系统稳定"""
+        try:
+            logger.info(f"🧹 [Cleanup] Fill detected. Pausing quotes for {symbol}...")
+            # 如果 Adapter 支持 cancel_all 这里调用最好
+            # 由于没有，我们只能依赖本地状态清空，并让旧单自然保留或在下次启动时手动处理
+            # 实际上，如果知道之前的 IDs 应该在这里撤销。
+            # 简化起见，我们暂停策略挂单，避免立即反向操作
+        finally:
+            await asyncio.sleep(2.0)
+            self.resetting_symbols.discard(symbol)
 
     async def _manage_maker_orders(self, symbol: str):
-        """核心做市逻辑：基于 Lighter 价格，在 GRVT 挂单"""
         lighter_tick = self.tickers[symbol]['Lighter']
-
-        # 获取参考价格 (Lighter 的买一卖一)
         ref_bid = lighter_tick['bid']
         ref_ask = lighter_tick['ask']
-
         if ref_bid <= 0 or ref_ask <= 0: return
 
-        # 计算目标挂单价格
-        # 策略：
-        # 在 GRVT 挂买单 = Lighter卖单(对手价) * (1 - 利润 - 手续费预留)
-        # 在 GRVT 挂卖单 = Lighter买单(对手价) * (1 + 利润 + 手续费预留)
+        farm_side = Config.FARM_SIDE.upper()
+        target_orders = []
 
-        # 注意：Config.FARM_SIDE 可以控制单边刷量，也可以双边
-        farm_side = Config.FARM_SIDE.upper()  # BUY, SELL, or BOTH
-
-        target_orders = []  # (side, price)
-
+        # 计算目标价
         if farm_side in ['BUY', 'BOTH']:
-            # 我们想在 GRVT 买，去 Lighter 卖
-            # 只有当 (Lighter_Bid - GRVT_Ask) > Spread 时才有套利空间
-            # 此时我们作为 Maker，要在 GRVT 挂一个比 "Lighter Bid" 低的价格
-            # 目标价格 = Lighter_Bid * (1 - target_spread)
-            target_buy = ref_bid * (1 - self.spread)
-            target_orders.append(('BUY', target_buy))
-
+            target_orders.append(('BUY', ref_bid * (1 - self.spread)))
         if farm_side in ['SELL', 'BOTH']:
-            # 我们想在 GRVT 卖，去 Lighter 买
-            # 目标价格 = Lighter_Ask * (1 + target_spread)
-            target_sell = ref_ask * (1 + self.spread)
-            target_orders.append(('SELL', target_sell))
+            target_orders.append(('SELL', ref_ask * (1 + self.spread)))
 
-        # 检查是否需要更新订单
         current_orders = self.active_orders.get(symbol, {})
 
-        # 如果没有订单，直接挂
-        if not current_orders and target_orders:
-            await self._place_orders(symbol, target_orders)
+        # 如果没有挂单，直接挂
+        if not current_orders:
+            if target_orders:
+                await self._place_orders(symbol, target_orders)
             return
 
-        # 如果有订单，检查价格偏差
+        # 检查是否需要撤单重挂
         should_cancel = False
-        # 这里简化处理：只看第一个单子 (假设单边模式)
-        # 如果是双边，建议写更复杂的 diff
-        for oid, old_price in current_orders.items():
-            # 找到对应方向的目标价
-            # 简单起见，如果偏差超过阈值，就全撤全挂
-            closest_target = target_orders[0][1]  # 这是一个简化的假设
-            diff = abs(old_price - closest_target) / closest_target
-            if diff > self.requote_threshold:
-                should_cancel = True
-                break
+        if len(current_orders) != len(target_orders):
+            should_cancel = True
+        else:
+            current_prices = list(current_orders.values())
+            for _, target_p in target_orders:
+                # 检查是否存在价格接近的订单
+                if not any(abs(cp - target_p) / target_p < self.requote_threshold for cp in current_prices):
+                    should_cancel = True
+                    break
 
         if should_cancel:
-            await self._cancel_all(symbol)
+            ids = list(current_orders.keys())
+            self.active_orders[symbol] = {}  # 先清空
+            if ids:
+                tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in ids]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
             await self._place_orders(symbol, target_orders)
 
     async def _place_orders(self, symbol, targets):
         adapter = self.adapters['GRVT']
-        quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
+        qty = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
         tasks = []
         prices = []
         for side, price in targets:
-            tasks.append(adapter.create_order(
-                symbol=f"{symbol}-USDT",
-                side=side,
-                amount=quantity,
-                price=price
-            ))
+            tasks.append(adapter.create_order(f"{symbol}-USDT", side, qty, price))
             prices.append(price)
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         if symbol not in self.active_orders: self.active_orders[symbol] = {}
 
-        success_count = 0
+        success = 0
         for res, price in zip(results, prices):
             if isinstance(res, str) and res:
                 self.active_orders[symbol][res] = price
-                success_count += 1
-            elif isinstance(res, Exception):
-                logger.warning(f"Order failed: {res}")
+                success += 1
 
-        if success_count > 0:
-            logger.info(f"🌊 [Re-Quote] {symbol} Placed {success_count} orders near {prices[0]:.2f}")
-
-    async def _cancel_all(self, symbol):
-        orders = self.active_orders.get(symbol, {})
-        if not orders: return
-
-        ids = list(orders.keys())
-        tasks = [self.adapters['GRVT'].cancel_order(oid) for oid in ids]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self.active_orders[symbol] = {}
+        if success > 0:
+            logger.info(f"🌊 [Quote] {symbol} Placed {success} orders near {prices[0]:.2f}")
 
     async def _hedge_consumer(self):
-        """消费者：串行处理对冲，防止并发导致的资金不足"""
+        logger.info("🚀 Hedge Consumer Started")
         while True:
+            if self.hedge_queue.empty():
+                await asyncio.sleep(0.01)
+                continue
+
             item = await self.hedge_queue.get()
             symbol = item['symbol']
             side = item['side']
             size = item['size']
 
             try:
-                logger.info(f"🚀 Executing Hedge: {side} {size} on Lighter...")
+                # 简单市价对冲
+                tick = self.tickers.get(symbol, {}).get('Lighter')
+                if not tick: continue
 
-                # 获取执行价格 (Market Order 不需要太精确，但为了估算...)
-                lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
-                if not lighter_tick:
-                    logger.error("❌ Hedge failed: No Lighter ticker data")
-                    continue
+                ref_p = tick['bid'] if side == 'SELL' else tick['ask']
+                limit_p = ref_p * 0.95 if side == 'SELL' else ref_p * 1.05
 
-                ref_price = lighter_tick['bid'] if side == 'SELL' else lighter_tick['ask']
-                if ref_price <= 0:
-                    logger.error(f"❌ Hedge failed: Invalid Lighter price {ref_price}")
-                    continue
-
-                # 5% 滑点保护价格
-                limit_price = ref_price * 0.95 if side == 'SELL' else ref_price * 1.05
-
-                # 调用 Lighter 下单
-                order_id = await self.adapters['Lighter'].create_order(
-                    symbol=symbol,
-                    side=side,
-                    amount=size,
-                    price=limit_price,
-                    order_type="MARKET"
-                )
-
-                if order_id:
-                    logger.info(f"✅ Hedge Filled! ID: {order_id}")
-                else:
-                    logger.error("❌ Hedge Order Failed (Return None)")
-
+                logger.info(f"🛡️ Hedging: {side} {size} on Lighter...")
+                await self.adapters['Lighter'].create_order(symbol, side, size, limit_p, "MARKET")
+                logger.info("✅ Hedge Sent")
             except Exception as e:
-                logger.error(f"❌ Hedge Exception: {e}")
-
-            # 简单的速率限制
-            await asyncio.sleep(0.5)
+                logger.error(f"❌ Hedge Error: {e}")

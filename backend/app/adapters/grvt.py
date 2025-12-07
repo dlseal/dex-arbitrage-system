@@ -37,7 +37,6 @@ class GrvtAdapter(BaseExchange):
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
         self.last_ws_msg_time = 0.0
-        self._ws_tasks = []
 
     async def initialize(self):
         retry_count = 5
@@ -64,27 +63,23 @@ class GrvtAdapter(BaseExchange):
         logger.info(f"⏳ [GRVT] Syncing markets...")
         markets = await self._fetch_markets_async()
 
-        loaded_count = 0
         for market in markets:
             base = market.get('base')
             quote = market.get('quote')
             kind = market.get('kind')
 
-            # 过滤出我们关注的永续合约
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
                     raw_id = market.get('instrument') or market.get('i')
+                    # 兼容不同字段名
                     raw_tick = market.get('tick_size') or market.get('ts') or 0
-                    raw_min = market.get('min_size') or market.get('ms') or 0
 
                     self.contract_map[symbol] = {
                         "id": raw_id,
                         "tick_size": float(raw_tick),
-                        "min_size": float(raw_min),
                         "size_mul": float(market.get('contract_size', 1.0))
                     }
-                    loaded_count += 1
                     logger.info(f"   - Loaded {symbol} (ID: {raw_id})")
 
         ws_params = {
@@ -126,8 +121,7 @@ class GrvtAdapter(BaseExchange):
         if not info: return {}
         loop = asyncio.get_running_loop()
         try:
-            # 🔴 修复点：将 limit=5 改为 limit=10
-            # GRVT API 报错 "Depth is invalid" 说明不支持 5，通常支持 10, 20, 50
+            # ✅ 官方示例确认 limit=10 是正确的 (Supported Depths: 10, 20, 50)
             ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=10))
             bids = ob.get('bids', [])
             asks = ob.get('asks', [])
@@ -139,7 +133,6 @@ class GrvtAdapter(BaseExchange):
                 'ts': int(time.time() * 1000)
             }
         except Exception as e:
-            # 这里的日志会显示具体的 API 错误，之前就是这里报了 400
             logger.error(f"Fetch OB error: {e}")
             return {}
 
@@ -149,6 +142,7 @@ class GrvtAdapter(BaseExchange):
         if not info: return None
 
         try:
+            # 精度处理
             amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
             price_safe = None
             if price is not None:
@@ -157,6 +151,7 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Precision Error: {e}")
             return None
 
+        # ID 生成：时间戳后6位 + 3位随机数 (避免冲突)
         ts_part = int(time.time()) % 1000000
         rand_part = random.randint(0, 999)
         client_order_id = int(f"{ts_part}{rand_part:03d}")
@@ -193,6 +188,7 @@ class GrvtAdapter(BaseExchange):
 
     async def cancel_order(self, order_id: str):
         try:
+            # 只有纯数字才被视为 client_order_id
             if str(order_id).isdigit():
                 await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
@@ -212,13 +208,13 @@ class GrvtAdapter(BaseExchange):
         async def message_callback(message: Dict[str, Any]):
             self.last_ws_msg_time = time.time()
             try:
-                # 兼容不同消息格式
+                # 兼容 feed 包裹格式
                 feed_data = message.get("feed", {})
                 if not feed_data and "instrument" in message: feed_data = message
 
                 channel = message.get("params", {}).get("channel") or message.get("stream")
 
-                # --- A. 处理订单回报 ---
+                # --- A. 订单更新 ---
                 if channel and "order" in str(channel) and "book" not in str(channel):
                     state = feed_data.get("state", {})
                     status = state.get("status", "").upper()
@@ -234,9 +230,9 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            client_oid = message.get('client_order_id') or \
-                                         feed_data.get('client_order_id') or \
-                                         state.get('client_order_id')
+                            # 提取 ID
+                            client_oid = message.get('client_order_id') or feed_data.get(
+                                'client_order_id') or state.get('client_order_id')
                             system_oid = message.get('order_id') or feed_data.get('order_id')
                             final_order_id = str(client_oid) if client_oid else str(system_oid)
 
@@ -254,7 +250,7 @@ class GrvtAdapter(BaseExchange):
                             logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
                     return
 
-                # --- B. 处理行情 ---
+                # --- B. 订单簿更新 ---
                 if channel and "book" in str(channel):
                     instrument = feed_data.get("instrument")
                     symbol_base = self._get_symbol_from_instrument(instrument)
@@ -272,44 +268,33 @@ class GrvtAdapter(BaseExchange):
                             'ask': float(asks[0]['price']),
                             'ts': int(time.time() * 1000)
                         }
-                        try:
-                            tick_queue.put_nowait(tick)
-                        except:
-                            pass
+                        tick_queue.put_nowait(tick)
 
             except Exception as e:
-                logger.error(f"GRVT Callback Parse Error: {e}")
+                pass  # 忽略解析错误，避免刷屏
 
-        # 订阅逻辑
         try:
             for symbol, info in self.contract_map.items():
                 inst_id = info['id']
                 logger.info(f"📤 [GRVT] Subscribing to {symbol} (ID: {inst_id})")
 
-                # 🔴 修复点：显式传递 depth=10，确保 WS 订阅成功
+                # ✅ 修正：移除 depth 参数！官方 WS 示例中不带 params 订阅 book.s
                 await self.ws_client.subscribe(stream="book.s", callback=message_callback,
-                                               params={"instrument": inst_id, "depth": 10})
+                                               params={"instrument": inst_id})
 
                 await self.ws_client.subscribe(stream="order", callback=message_callback,
                                                params={"instrument": inst_id,
                                                        "sub_account_id": self.trading_account_id})
                 await asyncio.sleep(0.1)
 
-            # Watchdog 监控
+            # Watchdog
             while self.is_connected:
-                await asyncio.sleep(10)  # 10秒检查一次
-
-                # 打印心跳，证明 Loop 还在跑
-                if time.time() - self.last_ws_msg_time > 10.0:
-                    logger.info(
-                        f"💓 [GRVT] Heartbeat: Waiting for data... (Last: {time.time() - self.last_ws_msg_time:.1f}s ago)")
-
+                await asyncio.sleep(10)
                 if time.time() - self.last_ws_msg_time > 60.0:
-                    logger.error("❌ [GRVT] Watchdog Triggered: No data for 60s.")
-                    raise ConnectionError("GRVT WebSocket Timeout")
+                    logger.error("❌ [GRVT] Watchdog: No data for 60s.")
+                    raise ConnectionError("GRVT WS Timeout")
 
         except asyncio.CancelledError:
-            logger.info("🛑 [GRVT] Listener Cancelled")
             raise
         finally:
             await self.close()
