@@ -135,7 +135,6 @@ class GrvtLighterFarmStrategy:
         Tuple[float, bool]]:
         """
         返回: (target_price, is_post_only)
-        如果利润极高，返回 False (允许 Taker)；否则返回 True (强制 Maker)
         """
         adapter = self.adapters['GRVT']
         info = adapter.contract_map.get(f"{symbol}-USDT")
@@ -152,17 +151,23 @@ class GrvtLighterFarmStrategy:
 
         is_post_only = True  # 默认 Maker
 
+        # 定义一个仅用于判断是否"真正"套利的阈值（例如必须有 0.05% 正利润才吃单）
+        # 防止因为负滑点配置导致频繁 Taker
+        TAKER_PROFIT_THRESHOLD = 0.0005
+
         if side == 'BUY':
             raw_target = hedge_price * (1 - self.target_margin)
 
-            # --- 利润判定 ---
-            if raw_target >= market_ask:
-                # 出现套利机会 (买价 > 卖一价)，解除封印，直接吃单
-                # logger.info(f"💰 Opportunity: Target {raw_target} >= Ask {market_ask}")
+            # 计算是否有"真实"的套利利润（不包含您的负滑点意愿）
+            real_arb_target = hedge_price * (1 - TAKER_PROFIT_THRESHOLD)
+
+            # 只有当 真实套利目标 都能吃掉 卖一价 时，才做 Taker
+            if real_arb_target >= market_ask:
+                # 真正的暴利机会，Taker 吃单
                 target_price = raw_target
                 is_post_only = False
             else:
-                # 正常 Maker，必须钳制在 Best Bid 附近，防止 PostOnly 拒单
+                # 否则，即使 raw_target 很高，也强制作为 Maker 挂在卖一价下面
                 limit_price = market_ask - tick_size
                 target_price = min(raw_target, limit_price)
                 is_post_only = True
@@ -170,12 +175,15 @@ class GrvtLighterFarmStrategy:
         else:  # SELL
             raw_target = hedge_price * (1 + self.target_margin)
 
-            if raw_target <= market_bid:
-                # 套利机会 (卖价 < 买一价)
+            # 计算是否有"真实"的套利利润
+            real_arb_target = hedge_price * (1 + TAKER_PROFIT_THRESHOLD)
+
+            if real_arb_target <= market_bid:
+                # 真正的暴利机会，Taker 吃单
                 target_price = raw_target
                 is_post_only = False
             else:
-                # 正常 Maker
+                # 否则，强制 Maker 挂在买一价上面
                 limit_price = market_bid + tick_size
                 target_price = max(raw_target, limit_price)
                 is_post_only = True
