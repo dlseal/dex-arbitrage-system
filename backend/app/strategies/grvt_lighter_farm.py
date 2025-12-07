@@ -186,58 +186,36 @@ class GrvtLighterFarmStrategy:
         symbol = trade['symbol']
         lock = self._get_lock(symbol)
 
-        # 立即锁定，防止其他 Tick 触发逻辑
+        # 获取订单 ID (由 Adapter 传递)
+        order_id = trade.get('order_id')
+
         if lock.locked():
             logger.warning(f"⚠️ {symbol} 正在对冲中，收到额外成交 (可能并发)，排队处理...")
 
         async with lock:
-            logger.info(f"🚨 [成交触发] GRVT {trade['side']} {trade['size']} -> 执行对冲逻辑")
+            logger.info(f"🚨 [成交触发] GRVT {trade['side']} {trade['size']} -> 执行对冲")
 
-            # 清理挂单状态
+            # 1. 立即清理本地挂单状态，防止主循环重复改单
             if symbol in self.active_orders:
-                del self.active_orders[symbol]
-                del self.active_order_prices[symbol]
+                # 只有当成交 ID 与记录 ID 一致，或者我们无法确定 ID 时才删除
+                if not order_id or str(self.active_orders[symbol]) == str(order_id):
+                    del self.active_orders[symbol]
+                    if symbol in self.active_order_prices:
+                        del self.active_order_prices[symbol]
 
-            # 评估是否需要对冲 (低损耗模式)
-            # 这里需要引入 Position Tracking (仓位管理)，暂时简化为：总是对冲
-            # 如果要低损耗：在此处检查 self.current_position[symbol]，如果 < MAX_SKEW，则不执行 Lighter 对冲，而是反向挂 GRVT Maker
+            # 2. 🔴 关键修复：如果是部分成交 (或状态未知)，立即撤销剩余订单
+            # 防止"幽灵订单"继续留在 Orderbook 上造成后续多余成交
+            if order_id:
+                # 异步发撤单指令，不等待结果，确保对冲速度优先
+                asyncio.create_task(self._safe_cancel(symbol, order_id))
 
+            # 3. 执行对冲 (使用修复后的 Delta Size)
             await self._execute_hedge_loop(symbol, trade['side'], trade['size'])
 
-    async def _execute_hedge_loop(self, symbol, grvt_side, size):
-        hedge_side = 'SELL' if grvt_side.upper() == 'BUY' else 'BUY'
-
-        # [低损耗优化] 延迟对冲逻辑示例
-        # if abs(current_pos) < self.MAX_SKEW_USD:
-        #     logger.info("💰 仓位未超限，尝试 Maker 平仓 (暂未实现完整逻辑，回退到 Taker 对冲)")
-
-        # Taker 对冲逻辑 (保持原有力度的同时增加错误处理)
-        retry = 0
-        while retry < 5:
-            try:
-                # 获取最新的深度价格，而不是 Tick 价格，增加滑点容忍
-                lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
-                if not lighter_tick:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # 市价单预估价 (aggressive)
-                base_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
-                exec_price = base_price * 1.05 if hedge_side == 'BUY' else base_price * 0.95
-
-                logger.info(f"🌊 [Lighter对冲] {hedge_side} {size} @ {exec_price:.2f}")
-                order_id = await self.adapters['Lighter'].create_order(
-                    symbol=symbol, side=hedge_side, amount=size, price=exec_price, order_type="MARKET"
-                )
-
-                if order_id:
-                    logger.info(f"✅ 对冲成功 ID: {order_id}")
-                    self._flip_side(symbol)
-                    return
-            except Exception as e:
-                logger.error(f"❌ 对冲失败: {e}")
-
-            retry += 1
-            await asyncio.sleep(0.5)
-
-        logger.critical(f"💀💀💀 {symbol} 对冲彻底失败，请人工介入！")
+    async def _safe_cancel(self, symbol, order_id):
+        """辅助方法：静默撤单"""
+        try:
+            await self.adapters['GRVT'].cancel_order(order_id)
+            # logger.info(f"🧹 [清理] 已发送撤单指令: {order_id}")
+        except Exception:
+            pass

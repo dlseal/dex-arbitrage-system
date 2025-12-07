@@ -174,14 +174,16 @@ class GrvtAdapter(BaseExchange):
                            order_type: str = "LIMIT") -> str:
         info = self._get_contract_info(symbol)
 
-        # 1. 获取市场精度配置 (Decimal类型)
+        # 1. 获取市场精度配置
         tick_size = info.get('tick_size')
         min_size = info.get('min_size')
 
-        # 2. 数量精度修正
+        # 2. 数量精度修正 (修复：增加 1e-9 偏移量防止 0.005 变成 0.0049999 被截断为 0.004)
         d_amount = Decimal(str(amount))
         if min_size and min_size > 0:
-            d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
+            # 关键修改：先加上一个极小值 epsilon 再取整
+            epsilon = Decimal("1e-9")
+            d_amount = ((d_amount + epsilon) / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
         qty = float(d_amount)
 
         # 3. 价格精度修正
@@ -189,13 +191,11 @@ class GrvtAdapter(BaseExchange):
         if price:
             d_price = Decimal(str(price))
             if tick_size and tick_size > 0:
-                # 🔴 核心修复：确保价格符合 Tick 精度 (例如 89444.56 -> 89444.6 如果tick=0.1)
                 d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
             px = float(d_price)
 
         side = side.lower()
-
-        # 默认 Post Only
+        # ... (后续代码保持不变)
         params = {'post_only': True, 'order_duration_secs': 2591999}
         if order_type == "MARKET":
             params = {}
@@ -210,23 +210,13 @@ class GrvtAdapter(BaseExchange):
                 res = await loop.run_in_executor(None, lambda: self.rest_client.create_limit_order(
                     symbol=info['id'], side=side, amount=qty, price=px, params=params
                 ))
-            # 兼容不同格式的返回值
+
             if isinstance(res, dict):
-                # 优先获取系统 ID
                 oid = res.get('id') or res.get('order_id')
-
-                # 获取客户端 ID (尝试从根目录或 metadata 中获取)
-                cid = str(res.get('client_order_id', ''))
-                if not cid and 'metadata' in res:
-                    cid = str(res.get('metadata', {}).get('client_order_id', ''))
-
-                # 修复：如果系统 ID 为 0x00 或空，则必须使用 client_order_id
+                # 增强兼容性
                 if not oid or oid == "0x00":
-                    if cid:
-                        return cid
-                    else:
-                        logging.error(f"❌ [GRVT] 下单返回无效 ID: {res}")
-                        return None
+                    cid = str(res.get('client_order_id', '') or res.get('metadata', {}).get('client_order_id', ''))
+                    return cid if cid else None
                 return oid
             return str(res)
 
@@ -274,7 +264,7 @@ class GrvtAdapter(BaseExchange):
         :param tick_queue: 行情队列 (允许丢包)
         :param event_queue: 事件队列 (严禁丢包，用于成交回报)
         """
-        logging.info(f"📡 [GRVT] Starting WS subscriptions...")
+        logging.info(f"📡 [GRVT] Starting WS subscriptions (Fixed Logic)...")
         loop = asyncio.get_running_loop()
 
         async def message_callback(message: Dict[str, Any]):
@@ -288,59 +278,52 @@ class GrvtAdapter(BaseExchange):
                 if not channel:
                     channel = message.get("stream")
 
-                # ------------------- 核心分流逻辑 -------------------
+                # ------------------- 核心分流逻辑 (已修复) -------------------
 
                 # 2. 处理订单更新 (Order Update) -> 推送至 event_queue
-                # 排除掉可能包含 'orderbook' 字样的频道，只保留真正的订单流
                 if channel and "order" in str(channel) and "book" not in str(channel):
-                    # 获取状态字典
                     state = feed_data.get("state", {})
-                    # 提取状态字符串 (兼容大小写)
                     status = state.get("status", "").upper()
 
-                    # 我们主要关注成交事件来触发对冲
+                    # 只要有成交发生 (无论完全成交还是部分成交)
                     if status in ["FILLED", "PARTIALLY_FILLED"]:
-                        # 提取订单信息 (通常在 legs 列表的第一个元素中)
                         legs = feed_data.get("legs", [])
-                        if legs:
-                            leg = legs[0]
+
+                        # 🔴 核心修复：严禁使用 state['traded_size'] (这是累计值)
+                        # 必须遍历 legs 计算当次事件的真实增量成交量 (Delta)
+                        filled_size = sum(float(l.get("size", 0)) for l in legs)
+
+                        if filled_size > 0 and legs:
+                            leg = legs[0]  # 取第一个 leg 获取元数据
                             instrument = leg.get("instrument")
                             symbol_base = self._get_symbol_from_instrument(instrument)
 
-                            # 提取方向 (is_buying_asset=True 为 BUY)
+                            # 确定方向
                             is_buy = leg.get("is_buying_asset", False)
                             side = "BUY" if is_buy else "SELL"
-
-                            # 提取成交量
-                            # 优先使用 state 中的 traded_size (累积成交量)，如果没有则使用 leg size
-                            filled_size = 0.0
-                            if "traded_size" in state and state["traded_size"]:
-                                filled_size = float(state["traded_size"][0])
-                            else:
-                                filled_size = float(leg.get("size", 0))
-
                             price = float(leg.get("limit_price", 0))
 
-                            # 构造标准化的 Trade 事件
+                            # 尝试获取 order_id，用于后续策略清理残余订单
+                            # 优先顺序：message根层级 -> feed数据 -> state数据
+                            order_id = message.get('order_id') or feed_data.get('order_id') or state.get('order_id')
+
                             event = {
                                 'type': 'trade',
                                 'exchange': self.name,
                                 'symbol': symbol_base,
                                 'side': side,
                                 'price': price,
-                                'size': filled_size,
-                                'order_id': message.get('order_id', ''),  # 尝试获取 ID 用于日志
+                                'size': filled_size,  # 这里的 size 已经是正确的增量了
+                                'order_id': order_id,  # 传递 ID 给策略
+                                'status': status,  # 传递状态
                                 'ts': int(time.time() * 1000)
                             }
-
                             # ⚠️ 关键：推送到事件队列 (Event Queue)
-                            # 使用 put_nowait，因为 event_queue 是无限容量的，不会阻塞
                             loop.call_soon_threadsafe(event_queue.put_nowait, event)
-                            logging.info(f"⚡️ [WS推送] GRVT 成交: {symbol_base} {side} {filled_size} @ {price}")
+                            logging.info(f"⚡️ [WS推送] GRVT 成交(Delta): {symbol_base} {side} {filled_size} @ {price}")
                     return
 
                 # 3. 处理 Orderbook -> 推送至 tick_queue
-                # --------------------------------------------------
                 instrument = feed_data.get("instrument")
                 symbol_base = self._get_symbol_from_instrument(instrument)
 
@@ -363,15 +346,13 @@ class GrvtAdapter(BaseExchange):
                             'ask': best_ask,
                             'ts': int(time.time() * 1000)
                         }
-
-                        # ⚠️ 关键：推送到行情队列 (Tick Queue)
-                        # 如果是 RingQueue，满了会自动丢弃旧数据
+                        # 推送到行情队列
                         loop.call_soon_threadsafe(tick_queue.put_nowait, tick)
 
             except Exception as e:
                 logging.warning(f"❌ [GRVT Callback Error] {e}")
 
-        # 4. 执行订阅
+        # 4. 执行订阅 (这部分逻辑保持原样，但需要放在新的 message_callback 下方)
         for symbol, info in self.contract_map.items():
             instrument_id = info['id']
             # 订阅行情 (L1 Orderbook)

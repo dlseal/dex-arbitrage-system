@@ -24,15 +24,62 @@ class GrvtInventoryFarmStrategy:
         self.locks: Dict[str, asyncio.Lock] = {}
         self.last_quote_time: Dict[str, float] = {}
 
+        # 安全状态
+        self.is_ready = False
+
         logger.info(f"🚜 InventoryFarm 启动 | 目标持仓上限: ${self.max_inventory_usd} | 层数: {self.layers}")
         logger.info(f"   - 监听币种: {Config.TARGET_SYMBOLS}")
+
+        # 启动持仓同步守护任务
+        asyncio.create_task(self._sync_position_loop())
 
     def _get_lock(self, symbol: str):
         if symbol not in self.locks: self.locks[symbol] = asyncio.Lock()
         return self.locks[symbol]
 
+    async def _sync_position_loop(self):
+        """定期从交易所获取真实持仓，修正本地状态"""
+        while True:
+            try:
+                # 首次启动等待 5 秒，后续每 15 秒同步一次
+                await asyncio.sleep(15 if self.is_ready else 5)
+
+                adapter = self.adapters.get('GRVT')
+                if adapter and adapter.rest_client:
+                    # 调用 SDK 获取持仓
+                    positions = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: adapter.rest_client.fetch_positions(
+                            params={'sub_account_id': adapter.trading_account_id})
+                    )
+
+                    for symbol in Config.TARGET_SYMBOLS:
+                        real_pos = 0.0
+                        # 解析返回的持仓数据
+                        for p in positions:
+                            # 兼容 symbol 格式 (如 BTC-USDT-Perpetual)
+                            if symbol in p.get('symbol', ''):
+                                real_pos = float(p.get('contracts', 0) or p.get('size', 0))
+                                break
+
+                        # 差异较大时修正本地数据
+                        local_pos = self.current_inventory.get(symbol, 0.0)
+                        if abs(real_pos - local_pos) > 0.0001:
+                            logger.warning(f"⚠️ [持仓校准] {symbol} 本地:{local_pos} -> 真实:{real_pos}")
+                            self.current_inventory[symbol] = real_pos
+
+                if not self.is_ready:
+                    self.is_ready = True
+                    logger.info("✅ 初始持仓同步完成，策略开始挂单")
+
+            except Exception as e:
+                logger.error(f"❌ 持仓同步失败: {e}")
+
     async def on_tick(self, event: dict):
-        # 过滤不在目标列表中的币种
+        # 未完成初始同步前，不执行任何操作
+        if not self.is_ready:
+            return
+
         if event.get('symbol') not in Config.TARGET_SYMBOLS:
             return
 
@@ -48,16 +95,13 @@ class GrvtInventoryFarmStrategy:
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        # 只有当两个交易所都有行情时才工作
         if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
             lock = self._get_lock(symbol)
             if not lock.locked():
                 await self._update_grid_orders(symbol)
 
     async def _update_grid_orders(self, symbol):
-        """核心挂单逻辑：维护网格单"""
         now = time.time()
-        # 频率控制: 1秒一次
         if now - self.last_quote_time.get(symbol, 0) < 1.0: return
         self.last_quote_time[symbol] = now
 
@@ -65,14 +109,12 @@ class GrvtInventoryFarmStrategy:
         grvt_tick = self.tickers[symbol]['GRVT']
         lighter_tick = self.tickers[symbol]['Lighter']
 
-        # 计算当前持仓价值
         market_price = grvt_tick['bid']
         if market_price <= 0: return
         pos_value = current_pos * market_price
 
-        target_side = Config.FARM_SIDE.upper()  # BUY or SELL
+        target_side = Config.FARM_SIDE.upper()
 
-        # 检查是否满仓 (使用配置的 USD 价值)
         is_full = False
         if target_side == 'BUY' and pos_value >= self.max_inventory_usd: is_full = True
         if target_side == 'SELL' and pos_value <= -self.max_inventory_usd: is_full = True
@@ -83,11 +125,9 @@ class GrvtInventoryFarmStrategy:
                 asyncio.create_task(self._execute_batch_hedge(symbol))
             return
 
-        # 未满仓，继续挂单吸筹
         await self._place_layered_orders(symbol, target_side, grvt_tick, lighter_tick)
 
     async def _place_layered_orders(self, symbol, side, grvt_tick, lighter_tick):
-        """阶梯挂单逻辑"""
         adapter = self.adapters['GRVT']
         info = adapter.contract_map.get(f"{symbol}-USDT")
         tick_size = float(info['tick_size']) if info else 0.01
@@ -95,7 +135,6 @@ class GrvtInventoryFarmStrategy:
         base_price = grvt_tick['ask'] if side == 'BUY' else grvt_tick['bid']
         if base_price <= 0: return
 
-        # 生成目标价格列表
         target_prices = []
         for i in range(self.layers):
             spread_ticks = 1 + i * self.layer_spread
@@ -105,12 +144,9 @@ class GrvtInventoryFarmStrategy:
                 p = base_price + (tick_size * spread_ticks)
             target_prices.append(p)
 
-        # Lighter 深度风控检查
         hedge_price = lighter_tick['bid'] if side == 'BUY' else lighter_tick['ask']
         if hedge_price <= 0: return
 
-        # 估算 PnL: 如果现在就去 Lighter 平仓，亏损多少？
-        # 如果亏损超过 MAX_SLIPPAGE_TOLERANCE，说明 Lighter 价格极差，停止挂单
         if side == 'BUY':
             est_pnl = (hedge_price - target_prices[0]) / target_prices[0]
         else:
@@ -121,11 +157,9 @@ class GrvtInventoryFarmStrategy:
                 await self._cancel_all(symbol)
             return
 
-        # 简单全撤全挂逻辑
         if self.active_orders.get(symbol):
             await self._cancel_all(symbol)
 
-        # 🌟 获取该币种的特定下单量配置 🌟
         quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
         tasks = []
@@ -163,9 +197,8 @@ class GrvtInventoryFarmStrategy:
         new_pos = self.current_inventory[symbol]
         logger.info(f"⚡️ {symbol} 成交 {side} {size} | 库存: {old_pos:.4f} -> {new_pos:.4f}")
 
-        # 突发满仓检查
         market_price = trade['price']
-        if abs(new_pos * market_price) >= self.max_inventory_usd * 1.1:  # 留10%缓冲
+        if abs(new_pos * market_price) >= self.max_inventory_usd * 1.1:
             if not self._get_lock(symbol).locked():
                 logger.warning(f"🔥 [突发满仓] 库存激增，立即对冲！")
                 asyncio.create_task(self._execute_batch_hedge(symbol))
@@ -175,8 +208,12 @@ class GrvtInventoryFarmStrategy:
         async with lock:
             await self._cancel_all(symbol)
 
+            # 使用当前内存中的持仓 (会被 _sync_position_loop 定期校准)
             pos = self.current_inventory.get(symbol, 0.0)
-            if abs(pos) == 0: return
+
+            # 过滤微小尘埃仓位，避免触发无效对冲
+            if abs(pos) < 0.001:
+                return
 
             hedge_side = 'SELL' if pos > 0 else 'BUY'
             hedge_size = abs(pos)
