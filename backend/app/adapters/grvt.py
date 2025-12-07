@@ -139,46 +139,83 @@ class GrvtAdapter(BaseExchange):
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
         info = self._get_contract_info(symbol)
-        if not info: return None
-
-        try:
-            # 精度处理
-            amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
-            price_safe = None
-            if price is not None:
-                price_safe = float(Decimal(str(price)).quantize(Decimal("0.000001")))
-        except Exception as e:
-            logger.error(f"❌ [GRVT] Precision Error: {e}")
+        if not info:
+            logger.error(f"❌ [GRVT] Contract info not found for {symbol}")
             return None
 
-        # ID 生成：时间戳后6位 + 3位随机数 (避免冲突)
+        # --- 1. 精度与数据类型处理 ---
+        try:
+            tick_size = Decimal(str(info.get('tick_size', 0)))
+            min_size = Decimal(str(info.get('min_size', 0)))
+
+            # 数量精度修正
+            d_amount = Decimal(str(amount))
+            if min_size > 0:
+                d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
+            else:
+                d_amount = d_amount.quantize(Decimal("0.000001"))
+            qty = float(d_amount)
+
+            # 价格精度修正
+            px = None
+            if price is not None:
+                d_price = Decimal(str(price))
+                if tick_size > 0:
+                    d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
+                px = float(d_price)
+
+        except Exception as e:
+            logger.error(f"❌ [GRVT] Precision Math Error: {e}")
+            return None
+
+        # --- 2. ID 生成与参数准备 ---
         ts_part = int(time.time()) % 1000000
         rand_part = random.randint(0, 999)
         client_order_id = int(f"{ts_part}{rand_part:03d}")
 
-        is_ask = True if side.lower() == 'sell' else False
+        safe_side = side.lower()
+
+        # 构造 params
+        params = {
+            'client_order_id': client_order_id,
+        }
+
+        if order_type == "LIMIT":
+            params.update({
+                'post_only': False,
+                'order_duration_secs': 2591999,
+                'timeInForce': 'GTT'
+            })
 
         try:
+            # 目标 Symbol ID
+            target_symbol_id = info['id']
+
+            # --- 3. 调用 SDK (修正参数名) ---
             if order_type == "MARKET":
+                # ✅ 修正：将 type='market' 改为 order_type='market'
                 await asyncio.wait_for(
-                    self.ws_client.create_market_order(
-                        instrument=info['id'],
-                        size=amount_safe,
-                        side='sell' if is_ask else 'buy',
-                        client_order_id=client_order_id
+                    self.ws_client.create_order(
+                        symbol=target_symbol_id,
+                        order_type='market',  # <--- 修正点
+                        side=safe_side,
+                        amount=qty,
+                        price=None,
+                        params=params
                     ), timeout=5.0)
             else:
+                # create_limit_order 不需要 order_type 参数
                 await asyncio.wait_for(
                     self.ws_client.create_limit_order(
-                        instrument=info['id'],
-                        size=amount_safe,
-                        price=price_safe,
-                        side='sell' if is_ask else 'buy',
-                        time_in_force="GTT",
-                        client_order_id=client_order_id,
-                        post_only=False
+                        symbol=target_symbol_id,
+                        side=safe_side,
+                        amount=qty,
+                        price=px,
+                        params=params
                     ), timeout=5.0)
+
             return str(client_order_id)
+
         except asyncio.TimeoutError:
             logger.error(f"❌ [GRVT] Order Timeout (5s)")
             return None
