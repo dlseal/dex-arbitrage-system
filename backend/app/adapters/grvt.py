@@ -139,11 +139,14 @@ class GrvtAdapter(BaseExchange):
             return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                           order_type: str = "LIMIT") -> Optional[str]:
+                           order_type: str = "LIMIT", params: Dict = None) -> Optional[str]:
         info = self._get_contract_info(symbol)
         if not info:
             logger.error(f"❌ [GRVT] Contract info not found for {symbol}")
             return None
+
+        if params is None:
+            params = {}
 
         try:
             tick_size = info['tick_size']
@@ -172,13 +175,24 @@ class GrvtAdapter(BaseExchange):
 
         client_order_id = int(time.time() * 1000) & 0xFFFFFFFF
         safe_side = side.lower()
-        params = {
+
+        # 基础参数
+        req_params = {
             'client_order_id': client_order_id,
         }
 
+        # 合并传入的 params (如 post_only)
+        if params:
+            req_params.update(params)
+
+        # 默认 LIMIT 单开启 Post-Only，除非 params 里明确指定了 False
         if order_type == "LIMIT":
-            params.update({
-                'post_only': True,
+            # 如果 strategy 没传 post_only，默认设为 True（安全模式）
+            # 如果 strategy 传了 False，这里就用 False（套利模式）
+            final_post_only = req_params.get('post_only', True)
+
+            req_params.update({
+                'post_only': final_post_only,
                 'timeInForce': 'GTT',
                 'order_duration_secs': 2591999,
             })
@@ -194,7 +208,7 @@ class GrvtAdapter(BaseExchange):
                         side=safe_side,
                         amount=qty_float,
                         price=None,
-                        params=params
+                        params=req_params
                     ), timeout=5.0)
             else:
                 await asyncio.wait_for(
@@ -203,7 +217,7 @@ class GrvtAdapter(BaseExchange):
                         side=safe_side,
                         amount=qty_float,
                         price=px_float,
-                        params=params
+                        params=req_params
                     ), timeout=5.0)
 
             return str(client_order_id)
@@ -212,13 +226,15 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Order Timeout (5s) - Possible Ghost Order! ID: {client_order_id}")
             return None
         except Exception as e:
-            logger.error(f"❌ [GRVT] Create Order Error: {e}")
+            # 记录详细错误，方便调试 Post-Only 拒绝原因
+            err_msg = str(e).lower()
+            if "post-only" in err_msg or "maker" in err_msg:
+                logger.warning(f"⚠️ [GRVT] Order Rejected (Post-Only): {e}")
+            else:
+                logger.error(f"❌ [GRVT] Create Order Error: {e}")
             return None
 
     async def cancel_order(self, order_id: str, symbol: str = None):
-        """
-        修正：通过 params 传递 client_order_id
-        """
         try:
             oid = int(order_id) if str(order_id).isdigit() else order_id
 
