@@ -3,7 +3,8 @@ import time
 import os
 import logging
 import random
-from decimal import Decimal
+import uuid
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Dict, Optional, Any, List
 
 from pysdk.grvt_ccxt import GrvtCcxt
@@ -63,6 +64,7 @@ class GrvtAdapter(BaseExchange):
         logger.info(f"⏳ [GRVT] Syncing markets...")
         markets = await self._fetch_markets_async()
 
+        self.contract_map = {}
         for market in markets:
             base = market.get('base')
             quote = market.get('quote')
@@ -72,14 +74,17 @@ class GrvtAdapter(BaseExchange):
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
                     raw_id = market.get('instrument') or market.get('i')
-                    raw_tick = market.get('tick_size') or market.get('ts') or 0
+                    raw_tick = market.get('tick_size') or market.get('ts') or "0.01"
+                    min_size = market.get('min_size') or "0.0001"
+                    contract_size = market.get('contract_size') or "1.0"
 
                     self.contract_map[symbol] = {
                         "id": raw_id,
-                        "tick_size": float(raw_tick),
-                        "size_mul": float(market.get('contract_size', 1.0))
+                        "tick_size": Decimal(str(raw_tick)),
+                        "min_size": Decimal(str(min_size)),
+                        "size_mul": Decimal(str(contract_size))
                     }
-                    logger.info(f"   - Loaded {symbol} (ID: {raw_id})")
+                    logger.info(f"   - Loaded {symbol} (ID: {raw_id}) | Tick: {raw_tick} | MinSize: {min_size}")
 
         ws_params = {
             'api_key': self.api_key,
@@ -120,7 +125,6 @@ class GrvtAdapter(BaseExchange):
         if not info: return {}
         loop = asyncio.get_running_loop()
         try:
-            # ✅ 官方示例确认 limit=10 是正确的 (Supported Depths: 10, 20, 50)
             ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=10))
             bids = ob.get('bids', [])
             asks = ob.get('asks', [])
@@ -136,42 +140,40 @@ class GrvtAdapter(BaseExchange):
             return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                           order_type: str = "LIMIT") -> str:
+                           order_type: str = "LIMIT") -> Optional[str]:
         info = self._get_contract_info(symbol)
         if not info:
             logger.error(f"❌ [GRVT] Contract info not found for {symbol}")
             return None
 
-        # --- 1. 精度与数据类型处理 ---
         try:
-            tick_size = Decimal(str(info.get('tick_size', 0)))
-            min_size = Decimal(str(info.get('min_size', 0)))
+            tick_size = info['tick_size']
+            min_size = info['min_size']
 
             d_amount = Decimal(str(amount))
             if min_size > 0:
-                d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
-            else:
-                d_amount = d_amount.quantize(Decimal("0.000001"))
-            qty = float(d_amount)
+                d_amount = (d_amount / min_size).to_integral_value(rounding=ROUND_DOWN) * min_size
 
-            px = None
+            d_price = Decimal("0")
             if price is not None:
                 d_price = Decimal(str(price))
                 if tick_size > 0:
-                    d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
-                px = float(d_price)
+                    d_price = (d_price / tick_size).to_integral_value(rounding=ROUND_HALF_UP) * tick_size
+
+            qty_float = float(d_amount)
+            px_float = float(d_price) if price is not None else None
+
+            if qty_float <= 0:
+                logger.warning(f"⚠️ Order size too small: {qty_float}")
+                return None
 
         except Exception as e:
             logger.error(f"❌ [GRVT] Precision Math Error: {e}")
             return None
 
-        # --- 2. ID 生成与参数准备 ---
-        ts_part = int(time.time()) % 1000000
-        rand_part = random.randint(0, 999)
-        client_order_id = int(f"{ts_part}{rand_part:03d}")
+        client_order_id = int(time.time() * 1000) & 0xFFFFFFFF
 
         safe_side = side.lower()
-
         params = {
             'client_order_id': client_order_id,
         }
@@ -179,40 +181,37 @@ class GrvtAdapter(BaseExchange):
         if order_type == "LIMIT":
             params.update({
                 'post_only': False,
+                'timeInForce': 'GTT',
                 'order_duration_secs': 2591999,
-                'timeInForce': 'GTT'
             })
 
         try:
             target_symbol_id = info['id']
 
-            # --- 3. 调用 SDK (修正参数名) ---
             if order_type == "MARKET":
-                # ✅ 修正：将 type='market' 改为 order_type='market'
                 await asyncio.wait_for(
                     self.ws_client.create_order(
                         symbol=target_symbol_id,
-                        order_type='market',  # <--- 修正点
+                        order_type='market',
                         side=safe_side,
-                        amount=qty,
+                        amount=qty_float,
                         price=None,
                         params=params
                     ), timeout=5.0)
             else:
-                # create_limit_order 不需要 order_type 参数
                 await asyncio.wait_for(
                     self.ws_client.create_limit_order(
                         symbol=target_symbol_id,
                         side=safe_side,
-                        amount=qty,
-                        price=px,
+                        amount=qty_float,
+                        price=px_float,
                         params=params
                     ), timeout=5.0)
 
             return str(client_order_id)
 
         except asyncio.TimeoutError:
-            logger.error(f"❌ [GRVT] Order Timeout (5s)")
+            logger.error(f"❌ [GRVT] Order Timeout (5s) - Possible Ghost Order! ID: {client_order_id}")
             return None
         except Exception as e:
             logger.error(f"❌ [GRVT] Create Order Error: {e}")
@@ -220,12 +219,22 @@ class GrvtAdapter(BaseExchange):
 
     async def cancel_order(self, order_id: str):
         try:
-            if str(order_id).isdigit():
-                await self.ws_client.cancel_order(client_order_id=int(order_id))
+            oid = int(order_id) if str(order_id).isdigit() else order_id
+            await self.ws_client.cancel_order(client_order_id=oid)
+        except Exception as e:
+            logger.warning(f"Cancel failed for {order_id}: {e}")
+
+    async def cancel_all_orders(self, symbol: str):
+        """新增: 撤销某个币种的所有订单，用于重置状态"""
+        info = self._get_contract_info(symbol)
+        if not info: return
+        try:
+            if hasattr(self.ws_client, 'cancel_all_orders'):
+                await self.ws_client.cancel_all_orders(symbol=info['id'])
             else:
-                await self.ws_client.cancel_order(order_id=order_id)
-        except Exception:
-            pass
+                pass
+        except Exception as e:
+            logger.error(f"Cancel All Error: {e}")
 
     async def close(self):
         logger.info("🛑 [GRVT] Closing resources...")
@@ -242,11 +251,16 @@ class GrvtAdapter(BaseExchange):
                 feed_data = message.get("feed", {})
                 if not feed_data and "instrument" in message: feed_data = message
 
-                channel = message.get("params", {}).get("channel") or message.get("stream")
+                channel = message.get("params", {}).get("channel") or message.get("stream") or ""
 
-                if channel and "order" in str(channel) and "book" not in str(channel):
+                if "order" in str(channel) and "book" not in str(channel):
                     state = feed_data.get("state", {})
                     status = state.get("status", "").upper()
+
+                    client_oid = message.get('client_order_id') or feed_data.get('client_order_id') or state.get(
+                        'client_order_id')
+                    system_oid = message.get('order_id') or feed_data.get('order_id')
+                    final_order_id = str(client_oid) if client_oid else str(system_oid)
 
                     if status in ["FILLED", "PARTIALLY_FILLED"]:
                         legs = feed_data.get("legs", [])
@@ -259,11 +273,6 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            client_oid = message.get('client_order_id') or feed_data.get(
-                                'client_order_id') or state.get('client_order_id')
-                            system_oid = message.get('order_id') or feed_data.get('order_id')
-                            final_order_id = str(client_oid) if client_oid else str(system_oid)
-
                             event = {
                                 'type': 'trade',
                                 'exchange': self.name,
@@ -272,13 +281,18 @@ class GrvtAdapter(BaseExchange):
                                 'price': price,
                                 'size': filled_size,
                                 'order_id': final_order_id,
+                                'status': status,
                                 'ts': int(time.time() * 1000)
                             }
                             event_queue.put_nowait(event)
                             logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
+
+                    elif status in ["CANCELLED", "EXPIRED", "REJECTED"]:
+                        pass
+
                     return
 
-                if channel and "book" in str(channel):
+                if "book" in str(channel):
                     instrument = feed_data.get("instrument")
                     symbol_base = self._get_symbol_from_instrument(instrument)
                     if symbol_base == "UNKNOWN": return
@@ -298,14 +312,13 @@ class GrvtAdapter(BaseExchange):
                         tick_queue.put_nowait(tick)
 
             except Exception as e:
-                pass
+                logger.error(f"WS Parse Error: {e}")
 
         try:
             for symbol, info in self.contract_map.items():
                 inst_id = info['id']
                 logger.info(f"📤 [GRVT] Subscribing to {symbol} (ID: {inst_id})")
 
-                # ✅ 修正：移除 depth 参数！官方 WS 示例中不带 params 订阅 book.s
                 await self.ws_client.subscribe(stream="book.s", callback=message_callback,
                                                params={"instrument": inst_id})
 
@@ -315,9 +328,10 @@ class GrvtAdapter(BaseExchange):
                 await asyncio.sleep(0.1)
 
             while self.is_connected:
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
                 if time.time() - self.last_ws_msg_time > 60.0:
                     logger.error("❌ [GRVT] Watchdog: No data for 60s.")
+                    self.is_connected = False
                     raise ConnectionError("GRVT WS Timeout")
 
         except asyncio.CancelledError:
