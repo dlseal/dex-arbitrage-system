@@ -178,7 +178,7 @@ class GrvtAdapter(BaseExchange):
 
         if order_type == "LIMIT":
             params.update({
-                'post_only': False,
+                'post_only': True,
                 'timeInForce': 'GTT',
                 'order_duration_secs': 2591999,
             })
@@ -228,9 +228,7 @@ class GrvtAdapter(BaseExchange):
                 if info:
                     inst_id = info['id']
 
-            # CCXT 标准：Client ID 放在 params 中
             params = {'client_order_id': oid}
-
             await self.ws_client.cancel_order(id=None, symbol=inst_id, params=params)
 
         except Exception as e:
