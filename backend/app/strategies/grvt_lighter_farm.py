@@ -219,3 +219,41 @@ class GrvtLighterFarmStrategy:
             # logger.info(f"🧹 [清理] 已发送撤单指令: {order_id}")
         except Exception:
             pass
+
+    async def _execute_hedge_loop(self, symbol, grvt_side, size):
+        hedge_side = 'SELL' if grvt_side.upper() == 'BUY' else 'BUY'
+
+        # [低损耗优化] 延迟对冲逻辑示例
+        # if abs(current_pos) < self.MAX_SKEW_USD:
+        #     logger.info("💰 仓位未超限，尝试 Maker 平仓 (暂未实现完整逻辑，回退到 Taker 对冲)")
+
+        # Taker 对冲逻辑 (保持原有力度的同时增加错误处理)
+        retry = 0
+        while retry < 5:
+            try:
+                # 获取最新的深度价格，而不是 Tick 价格，增加滑点容忍
+                lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
+                if not lighter_tick:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # 市价单预估价 (aggressive)
+                base_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
+                exec_price = base_price * 1.05 if hedge_side == 'BUY' else base_price * 0.95
+
+                logger.info(f"🌊 [Lighter对冲] {hedge_side} {size} @ {exec_price:.2f}")
+                order_id = await self.adapters['Lighter'].create_order(
+                    symbol=symbol, side=hedge_side, amount=size, price=exec_price, order_type="MARKET"
+                )
+
+                if order_id:
+                    logger.info(f"✅ 对冲成功 ID: {order_id}")
+                    self._flip_side(symbol)
+                    return
+            except Exception as e:
+                logger.error(f"❌ 对冲失败: {e}")
+
+            retry += 1
+            await asyncio.sleep(0.5)
+
+        logger.critical(f"💀💀💀 {symbol} 对冲彻底失败，请人工介入！")
