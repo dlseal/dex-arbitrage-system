@@ -9,7 +9,7 @@ logger = logging.getLogger("InventoryFarm")
 
 class GrvtInventoryFarmStrategy:
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "Grvt_Inventory_Grid_v2"
+        self.name = "Grvt_Inventory_Grid_v1"
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 

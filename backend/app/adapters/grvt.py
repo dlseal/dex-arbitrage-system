@@ -8,29 +8,25 @@ from typing import Dict, Optional, Any, List
 # 引入 GRVT SDK
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
-from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+from pysdk.grvt_ccxt_env import GrvtEnv
 from pysdk.grvt_ccxt_logging_selector import logger as sdk_logger
 
 from .base import BaseExchange
 
+logger = logging.getLogger("GRVT_Adapter")
+
 
 class GrvtAdapter(BaseExchange):
     """
-    GRVT 交易所适配器 (增强版：支持成交推送)
+    GRVT 交易所适配器 (实盘修复版)
+    核心修复：精度处理、ClientOrderID匹配、心跳看门狗
     """
 
-    def __init__(self,
-                 api_key: str,
-                 private_key: str,
-                 trading_account_id: str,
-                 symbols: List[str] = None):
-
+    def __init__(self, api_key: str, private_key: str, trading_account_id: str, symbols: List[str] = None):
         super().__init__("GRVT")
-
         self.api_key = api_key
         self.private_key = private_key
         self.trading_account_id = trading_account_id
-
         self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
 
         env_str = os.getenv('GRVT_ENVIRONMENT', 'prod').lower()
@@ -42,30 +38,27 @@ class GrvtAdapter(BaseExchange):
         }
         self.env = env_map.get(env_str, GrvtEnv.PROD)
 
-        # rest_client 是同步的，ws_client 是异步的
         self.rest_client: Optional[GrvtCcxt] = None
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
+        self.last_ws_msg_time = 0.0  # 看门狗计时器
 
     async def initialize(self):
-        """初始化：带重试机制"""
         retry_count = 5
         for attempt in range(retry_count):
             try:
-                logging.info(f"⏳ [GRVT] 正在连接 WS (第 {attempt + 1} 次尝试)...")
+                logger.info(f"⏳ [GRVT] Connecting (Attempt {attempt + 1})...")
                 await self._initialize_logic()
-                logging.info("✅ [GRVT] 连接成功！")
+                logger.info("✅ [GRVT] Connection Established!")
                 return
             except Exception as e:
-                logging.warning(f"⚠️ [GRVT] 连接失败: {e}")
-                wait_time = (attempt + 1) * 3
-                logging.info(f"   -> 等待 {wait_time} 秒后重试...")
-                await asyncio.sleep(wait_time)
+                logger.warning(f"⚠️ [GRVT] Connection failed: {e}")
+                await asyncio.sleep((attempt + 1) * 3)
 
-        logging.error("❌ [GRVT] 无法建立连接，请检查网络/VPN！")
+        raise ConnectionError("❌ [GRVT] Failed to connect after multiple attempts.")
 
     async def _initialize_logic(self):
-        # 1. 初始化 REST (同步)
+        # 1. Init REST
         params = {
             'trading_account_id': self.trading_account_id,
             'private_key': self.private_key,
@@ -73,8 +66,8 @@ class GrvtAdapter(BaseExchange):
         }
         self.rest_client = GrvtCcxt(env=self.env, parameters=params)
 
-        # 2. 动态加载市场
-        logging.info(f"⏳ [GRVT] Fetching markets from {self.env.name}...")
+        # 2. Fetch Markets
+        logger.info(f"⏳ [GRVT] Syncing markets...")
         markets = await self._fetch_markets_async()
 
         loaded_count = 0
@@ -86,216 +79,184 @@ class GrvtAdapter(BaseExchange):
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
-
-                    # 🔴 修复：兼容 Full模式(tick_size) 和 Lite模式(ts)
+                    # 兼容不同字段名
                     raw_id = market.get('instrument') or market.get('i')
                     raw_tick = market.get('tick_size') or market.get('ts') or 0
                     raw_min = market.get('min_size') or market.get('ms') or 0
 
+                    # 补充：获取价格和数量的精度倍数
+                    # GRVT通常直接传真实价格，但为了保险，获取 multiplier
+                    size_mul = 1.0  # GRVT SDK 内部处理了精度，这里主要用于 create_order 预处理
+                    price_mul = 1.0
+
                     self.contract_map[symbol] = {
                         "id": raw_id,
-                        "tick_size": Decimal(str(raw_tick)),
-                        "min_size": Decimal(str(raw_min))
+                        "tick_size": float(raw_tick),
+                        "min_size": float(raw_min),
+                        "size_mul": float(market.get('contract_size', 1.0))  # 假设
                     }
                     loaded_count += 1
-                    logging.info(f"   - Loaded {symbol}: Tick={raw_tick}, Min={raw_min}")
+                    logger.info(f"   - Loaded {symbol} (ID: {raw_id})")
 
         if loaded_count == 0:
-            logging.info(f"⚠️ [GRVT] Warning: No target markets found for {self.target_symbols}")
+            logger.warning(f"⚠️ [GRVT] No target markets found!")
 
-        # 3. 初始化 WS
-        loop = asyncio.get_running_loop()
+        # 3. Init WS
         ws_params = {
             'api_key': self.api_key,
             'trading_account_id': self.trading_account_id,
             'api_ws_version': 'v1',
             'private_key': self.private_key
         }
-
         self.ws_client = GrvtCcxtWS(
             env=self.env,
-            loop=loop,
+            loop=asyncio.get_running_loop(),
             logger=sdk_logger,
             parameters=ws_params
         )
-
         await self.ws_client.initialize()
-        await asyncio.sleep(1)
-
         self.is_connected = True
-        logging.info(f"✅ [GRVT] Initialized. Monitoring: {self.target_symbols}")
+        self.last_ws_msg_time = time.time()
 
     async def _fetch_markets_async(self):
         loop = asyncio.get_running_loop()
-        # 传入 params 确保尽可能获取完整信息
         return await loop.run_in_executor(None, lambda: self.rest_client.fetch_markets(params={}))
 
     def _get_contract_info(self, symbol: str):
         if "-" not in symbol: symbol = f"{symbol}-USDT"
         info = self.contract_map.get(symbol)
         if not info:
-            raise ValueError(f"Market {symbol} not found (Targets: {self.target_symbols})")
+            logger.error(f"Symbol {symbol} not found in map {list(self.contract_map.keys())}")
+            return None
         return info
 
     def _get_symbol_from_instrument(self, instrument_id):
-        """辅助方法：通过 ID 反查 Symbol"""
         for s, info in self.contract_map.items():
             if info['id'] == instrument_id:
                 return s.split('-')[0]
         return "UNKNOWN"
 
-    async def close(self):
-        """安全清理资源"""
-        if self.ws_client:
-            try:
-                if hasattr(self.ws_client, '_session') and self.ws_client._session:
-                    if not self.ws_client._session.closed:
-                        await self.ws_client._session.close()
-            except Exception as e:
-                logging.info(f"⚠️ [GRVT] WS Close Error: {e}")
-
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
         info = self._get_contract_info(symbol)
+        if not info: return {}
         loop = asyncio.get_running_loop()
-        ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=10))
-        bids = ob.get('bids', [])
-        asks = ob.get('asks', [])
-        best_bid = float(bids[0]['price']) if bids else 0.0
-        best_ask = float(asks[0]['price']) if asks else 0.0
-        return {
-            'exchange': self.name,
-            'symbol': symbol.split('-')[0],
-            'bid': best_bid,
-            'ask': best_ask,
-            'ts': int(time.time() * 1000)
-        }
+        try:
+            ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=5))
+            bids = ob.get('bids', [])
+            asks = ob.get('asks', [])
+            return {
+                'exchange': self.name,
+                'symbol': symbol.split('-')[0],
+                'bid': float(bids[0]['price']) if bids else 0.0,
+                'ask': float(asks[0]['price']) if asks else 0.0,
+                'ts': int(time.time() * 1000)
+            }
+        except Exception as e:
+            logger.error(f"Fetch OB error: {e}")
+            return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
-        info = self.market_config.get(symbol)
-        if not info:
-            logging.error(
-                f"❌ [Lighter] Symbol '{symbol}' not found in market config. Available: {list(self.market_config.keys())}")
-            return None
-        amount_int = int(amount * info['size_mul'])
-        price_int = int(price * info['price_mul']) if price else 0
+        info = self._get_contract_info(symbol)
+        if not info: return None
+
+        # ✅ 修复点1：精度处理
+        # GRVT SDK 接收 float，但为了避免 0.0099999 < 0.01 导致后端拒绝，
+        # 我们在这里做一次标准的 round 处理，保留合适的小数位 (例如 6位)
+        amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
+        price_safe = float(Decimal(str(price)).quantize(Decimal("0.000001"))) if price else None
+
+        # 生成 Client Order ID (作为整数传递)
+        client_order_id = int(time.time() * 1000000) % 2147483647
+
         is_ask = True if side.lower() == 'sell' else False
-        client_order_index = int(time.time() * 1000) % 2147483647
 
         try:
-            # 🔴 核心修复：增加 5 秒超时控制，防止网络请求卡死主线程
+            # 使用 wait_for 防止死锁
             if order_type == "MARKET":
-                res, tx_hash, err = await asyncio.wait_for(
-                    self.client.create_market_order(
-                        market_index=info['id'], client_order_index=client_order_index,
-                        base_amount=amount_int, avg_execution_price=price_int, is_ask=is_ask
+                res = await asyncio.wait_for(
+                    self.ws_client.create_market_order(
+                        instrument=info['id'],
+                        size=amount_safe,
+                        side='sell' if is_ask else 'buy',
+                        client_order_id=client_order_id
                     ),
                     timeout=5.0
                 )
             else:
-                res, tx_hash, err = await asyncio.wait_for(
-                    self.client.create_limit_order(
-                        market_index=info['id'], client_order_index=client_order_index,
-                        base_amount=amount_int, price=price_int, is_ask=is_ask,
-                        time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                res = await asyncio.wait_for(
+                    self.ws_client.create_limit_order(
+                        instrument=info['id'],
+                        size=amount_safe,
+                        price=price_safe,
+                        side='sell' if is_ask else 'buy',
+                        time_in_force="GTT",
+                        client_order_id=client_order_id,
+                        post_only=False
                     ),
                     timeout=5.0
                 )
 
-            if err:
-                logging.error(f"❌ [Lighter] Order Error: {err}")
-                return None
-            return str(client_order_index)
+            # 返回 client_order_id 以便策略追踪
+            return str(client_order_id)
 
         except asyncio.TimeoutError:
-            logging.error(f"❌ [Lighter] Order Timeout (5s) - API 未响应，跳过等待")
+            logger.error(f"❌ [GRVT] Order Timeout (5s)")
             return None
         except Exception as e:
-            logging.error(f"❌ [Lighter] Create Exception: {e}")
+            logger.error(f"❌ [GRVT] Create Order Error: {e}")
             return None
 
     async def cancel_order(self, order_id: str):
-        """智能撤单：自动识别 order_id 或 client_order_id"""
-        loop = asyncio.get_running_loop()
-        try:
-            # 如果 ID 是纯数字，视为 client_order_id
-            if str(order_id).isdigit():
-                return await loop.run_in_executor(None, lambda: self.rest_client.cancel_order(
-                    id=None,
-                    symbol=None,
-                    params={'client_order_id': int(order_id)}
-                ))
-            else:
-                # 否则视为系统 order_id
-                return await loop.run_in_executor(None, lambda: self.rest_client.cancel_order(id=order_id))
-        except Exception as e:
-            logging.error(f"❌ [GRVT] Cancel Error: {e}")
-            raise e
-
-    async def fetch_order(self, order_id: str):
-        """智能查单：自动识别 order_id 或 client_order_id"""
-        loop = asyncio.get_running_loop()
+        # 简化版：尝试撤单
         try:
             if str(order_id).isdigit():
-                return await loop.run_in_executor(None, lambda: self.rest_client.fetch_order(
-                    id=None,
-                    symbol=None,
-                    params={'client_order_id': int(order_id)}
-                ))
+                # 假设是 client_order_id
+                await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
-                return await loop.run_in_executor(None, lambda: self.rest_client.fetch_order(id=order_id))
-        except Exception as e:
-            # logging.warning(f"⚠️ [GRVT] Fetch Error: {e}")
-            raise e
+                await self.ws_client.cancel_order(order_id=order_id)
+        except Exception:
+            pass  # 忽略撤单失败（可能是已成交）
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
-        """
-        监听 WebSocket 数据流，并将数据分流到不同的队列
-        :param tick_queue: 行情队列 (允许丢包)
-        :param event_queue: 事件队列 (严禁丢包，用于成交回报)
-        """
-        logging.info(f"📡 [GRVT] Starting WS subscriptions (Fixed Logic)...")
+        logger.info(f"📡 [GRVT] Starting Stream Listener...")
         loop = asyncio.get_running_loop()
 
         async def message_callback(message: Dict[str, Any]):
+            self.last_ws_msg_time = time.time()
+
             try:
-                # 1. 提取 Feed 数据
                 feed_data = message.get("feed", {})
-                if not feed_data and "instrument" in message:
-                    feed_data = message
+                if not feed_data and "instrument" in message: feed_data = message
 
-                channel = message.get("params", {}).get("channel")
-                if not channel:
-                    channel = message.get("stream")
+                channel = message.get("params", {}).get("channel") or message.get("stream")
 
-                # ------------------- 核心分流逻辑 (已修复) -------------------
-
-                # 2. 处理订单更新 (Order Update) -> 推送至 event_queue
+                # --- A. 处理订单回报 ---
                 if channel and "order" in str(channel) and "book" not in str(channel):
                     state = feed_data.get("state", {})
                     status = state.get("status", "").upper()
 
-                    # 只要有成交发生 (无论完全成交还是部分成交)
                     if status in ["FILLED", "PARTIALLY_FILLED"]:
                         legs = feed_data.get("legs", [])
-
-                        # 🔴 核心修复：严禁使用 state['traded_size'] (这是累计值)
-                        # 必须遍历 legs 计算当次事件的真实增量成交量 (Delta)
                         filled_size = sum(float(l.get("size", 0)) for l in legs)
 
                         if filled_size > 0 and legs:
-                            leg = legs[0]  # 取第一个 leg 获取元数据
-                            instrument = leg.get("instrument")
-                            symbol_base = self._get_symbol_from_instrument(instrument)
-
-                            # 确定方向
+                            leg = legs[0]
+                            symbol_base = self._get_symbol_from_instrument(leg.get("instrument"))
                             is_buy = leg.get("is_buying_asset", False)
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            # 尝试获取 order_id，用于后续策略清理残余订单
-                            # 优先顺序：message根层级 -> feed数据 -> state数据
-                            order_id = message.get('order_id') or feed_data.get('order_id') or state.get('order_id')
+                            # ✅ 修复点2：优先匹配 client_order_id
+                            # 策略层使用的是 client_order_id，必须提取并传回
+                            client_oid = message.get('client_order_id') or \
+                                         feed_data.get('client_order_id') or \
+                                         state.get('client_order_id')
+
+                            system_oid = message.get('order_id') or feed_data.get('order_id')
+
+                            # 优先使用 Client ID，如果没有则回退到 System ID
+                            final_order_id = str(client_oid) if client_oid else str(system_oid)
 
                             event = {
                                 'type': 'trade',
@@ -303,62 +264,53 @@ class GrvtAdapter(BaseExchange):
                                 'symbol': symbol_base,
                                 'side': side,
                                 'price': price,
-                                'size': filled_size,  # 这里的 size 已经是正确的增量了
-                                'order_id': order_id,  # 传递 ID 给策略
-                                'status': status,  # 传递状态
+                                'size': filled_size,
+                                'order_id': final_order_id,  # 关键修复
                                 'ts': int(time.time() * 1000)
                             }
-                            # ⚠️ 关键：推送到事件队列 (Event Queue)
-                            loop.call_soon_threadsafe(event_queue.put_nowait, event)
-                            logging.info(f"⚡️ [WS推送] GRVT 成交(Delta): {symbol_base} {side} {filled_size} @ {price}")
+                            event_queue.put_nowait(event)
+                            logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
                     return
 
-                # 3. 处理 Orderbook -> 推送至 tick_queue
-                instrument = feed_data.get("instrument")
-                symbol_base = self._get_symbol_from_instrument(instrument)
-
-                if symbol_base == "UNKNOWN":
-                    return
-
+                # --- B. 处理行情 ---
                 if channel and "book" in str(channel):
+                    instrument = feed_data.get("instrument")
+                    symbol_base = self._get_symbol_from_instrument(instrument)
+                    if symbol_base == "UNKNOWN": return
+
                     bids = feed_data.get("bids", [])
                     asks = feed_data.get("asks", [])
 
                     if bids and asks:
-                        best_bid = float(bids[0]['price'])
-                        best_ask = float(asks[0]['price'])
-
                         tick = {
                             'type': 'tick',
                             'exchange': self.name,
                             'symbol': symbol_base,
-                            'bid': best_bid,
-                            'ask': best_ask,
+                            'bid': float(bids[0]['price']),
+                            'ask': float(asks[0]['price']),
                             'ts': int(time.time() * 1000)
                         }
-                        # 推送到行情队列
-                        loop.call_soon_threadsafe(tick_queue.put_nowait, tick)
+                        # RingQueue会自动丢弃旧数据，直接put
+                        try:
+                            tick_queue.put_nowait(tick)
+                        except:
+                            pass
 
             except Exception as e:
-                logging.warning(f"❌ [GRVT Callback Error] {e}")
+                logger.error(f"GRVT Callback Parse Error: {e}")
 
-        # 4. 执行订阅 (这部分逻辑保持原样，但需要放在新的 message_callback 下方)
+        # 订阅
         for symbol, info in self.contract_map.items():
-            instrument_id = info['id']
-            # 订阅行情 (L1 Orderbook)
-            await self.ws_client.subscribe(
-                stream="book.s",
-                callback=message_callback,
-                params={"instrument": instrument_id}
-            )
-            # 订阅私有订单流
-            await self.ws_client.subscribe(
-                stream="order",
-                callback=message_callback,
-                params={"instrument": instrument_id, "sub_account_id": self.trading_account_id}
-            )
-            await asyncio.sleep(0.1)  # 避免瞬间请求过多
+            inst_id = info['id']
+            await self.ws_client.subscribe(stream="book.s", callback=message_callback, params={"instrument": inst_id})
+            await self.ws_client.subscribe(stream="order", callback=message_callback,
+                                           params={"instrument": inst_id, "sub_account_id": self.trading_account_id})
+            await asyncio.sleep(0.1)
 
-        # 5. 保持连接活跃
+        # ✅ 修复点3：连接看门狗 (Watchdog)
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
+            if time.time() - self.last_ws_msg_time > 30.0:
+                logger.error("❌ [GRVT] Watchdog Triggered: No data for 30s. Restarting...")
+                # 这里抛出异常，让上层 Engine 捕获并重启 adapter 或整个程序
+                raise ConnectionError("GRVT WebSocket Timeout")
