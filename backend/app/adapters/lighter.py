@@ -306,27 +306,42 @@ class LighterAdapter(BaseExchange):
             logging.error(
                 f"❌ [Lighter] Symbol '{symbol}' not found in market config. Available: {list(self.market_config.keys())}")
             return None
-        amount_int = int(amount * info['size_mul'])
-        price_int = int(price * info['price_mul']) if price else 0
+
+        # ✅ 优化：使用 round 四舍五入，解决 Python 浮点数精度丢失导致的金额截断问题
+        amount_int = int(round(amount * info['size_mul']))
+        price_int = int(round(price * info['price_mul'])) if price else 0
+
         is_ask = True if side.lower() == 'sell' else False
         client_order_index = int(time.time() * 1000) % 2147483647
 
         try:
+            # ✅ 优化：增加 5秒 超时控制，防止 Lighter API 无响应导致死锁
             if order_type == "MARKET":
-                res, tx_hash, err = await self.client.create_market_order(
-                    market_index=info['id'], client_order_index=client_order_index,
-                    base_amount=amount_int, avg_execution_price=price_int, is_ask=is_ask
+                res, tx_hash, err = await asyncio.wait_for(
+                    self.client.create_market_order(
+                        market_index=info['id'], client_order_index=client_order_index,
+                        base_amount=amount_int, avg_execution_price=price_int, is_ask=is_ask
+                    ),
+                    timeout=5.0
                 )
             else:
-                res, tx_hash, err = await self.client.create_limit_order(
-                    market_index=info['id'], client_order_index=client_order_index,
-                    base_amount=amount_int, price=price_int, is_ask=is_ask,
-                    time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                res, tx_hash, err = await asyncio.wait_for(
+                    self.client.create_limit_order(
+                        market_index=info['id'], client_order_index=client_order_index,
+                        base_amount=amount_int, price=price_int, is_ask=is_ask,
+                        time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                    ),
+                    timeout=5.0
                 )
+
             if err:
                 logging.error(f"❌ [Lighter] Order Error: {err}")
                 return None
             return str(client_order_index)
+
+        except asyncio.TimeoutError:
+            logging.error(f"❌ [Lighter] Order Timeout (5s) - 网络请求超时，跳过等待")
+            return None
         except Exception as e:
             logging.error(f"❌ [Lighter] Create Exception: {e}")
             return None
