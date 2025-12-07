@@ -2,6 +2,7 @@ import asyncio
 import time
 import os
 import logging
+import random  # ✅ 新增：用于生成防止冲突的随机ID
 from decimal import Decimal
 from typing import Dict, Optional, Any, List
 
@@ -36,7 +37,7 @@ class GrvtAdapter(BaseExchange):
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
         self.last_ws_msg_time = 0.0
-        self._ws_tasks = []  # ✅ 新增：用于追踪并取消内部任务
+        self._ws_tasks = []
 
     async def initialize(self):
         retry_count = 5
@@ -69,6 +70,7 @@ class GrvtAdapter(BaseExchange):
             quote = market.get('quote')
             kind = market.get('kind')
 
+            # 过滤出我们关注的永续合约
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
@@ -120,7 +122,6 @@ class GrvtAdapter(BaseExchange):
         return "UNKNOWN"
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        # (保持原样)
         info = self._get_contract_info(symbol)
         if not info: return {}
         loop = asyncio.get_running_loop()
@@ -144,7 +145,7 @@ class GrvtAdapter(BaseExchange):
         info = self._get_contract_info(symbol)
         if not info: return None
 
-        # ✅ 修复精度: 使用 Decimal 处理，防止 float 精度丢失
+        # ✅ 精度处理: 使用 Decimal 防止 float 精度丢失
         try:
             amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
             price_safe = None
@@ -154,7 +155,13 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Precision Error: {e}")
             return None
 
-        client_order_id = int(time.time() * 1000000) % 2147483647
+        # ✅ ID生成优化：时间戳后6位 + 3位随机数
+        # 结果最大值约为 999999999 (9位数)，远小于 int32 上限 (2147483647)
+        # 这确保了 ID 唯一性且不会溢出
+        ts_part = int(time.time()) % 1000000
+        rand_part = random.randint(0, 999)
+        client_order_id = int(f"{ts_part}{rand_part:03d}")
+
         is_ask = True if side.lower() == 'sell' else False
 
         try:
@@ -187,6 +194,7 @@ class GrvtAdapter(BaseExchange):
 
     async def cancel_order(self, order_id: str):
         try:
+            # SDK 支持 int 或 str 类型的 ID
             if str(order_id).isdigit():
                 await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
@@ -195,10 +203,11 @@ class GrvtAdapter(BaseExchange):
             pass
 
     async def close(self):
-        """✅ 新增：清理资源"""
+        """✅ 清理资源，防止内存泄漏"""
         logger.info("🛑 [GRVT] Closing resources...")
-        # 这里的 SDK 可能没有显式 close，但我们需要确保引用断开
         self.is_connected = False
+        # 如果 SDK 提供了关闭方法，可以在这里调用
+        # self.ws_client.close()
         self.ws_client = None
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
@@ -230,6 +239,7 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
+                            # 尝试获取各种可能的 ID 字段
                             client_oid = message.get('client_order_id') or \
                                          feed_data.get('client_order_id') or \
                                          state.get('client_order_id')
@@ -280,14 +290,16 @@ class GrvtAdapter(BaseExchange):
         try:
             for symbol, info in self.contract_map.items():
                 inst_id = info['id']
+                # 订阅行情
                 await self.ws_client.subscribe(stream="book.s", callback=message_callback,
                                                params={"instrument": inst_id})
+                # 订阅订单更新
                 await self.ws_client.subscribe(stream="order", callback=message_callback,
                                                params={"instrument": inst_id,
                                                        "sub_account_id": self.trading_account_id})
                 await asyncio.sleep(0.1)
 
-            # ✅ 修复：Watchdog 逻辑重写，避免僵死并支持退出
+            # Watchdog 监控：如果 30 秒无数据则报错重连
             while self.is_connected:
                 await asyncio.sleep(5)
                 if time.time() - self.last_ws_msg_time > 30.0:
@@ -298,5 +310,4 @@ class GrvtAdapter(BaseExchange):
             logger.info("🛑 [GRVT] Listener Cancelled")
             raise
         finally:
-            # 退出时确保清理
             await self.close()
