@@ -5,7 +5,6 @@ import logging
 from decimal import Decimal
 from typing import Dict, Optional, Any, List
 
-# 引入 GRVT SDK
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
 from pysdk.grvt_ccxt_env import GrvtEnv
@@ -17,11 +16,6 @@ logger = logging.getLogger("GRVT_Adapter")
 
 
 class GrvtAdapter(BaseExchange):
-    """
-    GRVT 交易所适配器 (实盘修复版)
-    核心修复：精度处理、ClientOrderID匹配、心跳看门狗
-    """
-
     def __init__(self, api_key: str, private_key: str, trading_account_id: str, symbols: List[str] = None):
         super().__init__("GRVT")
         self.api_key = api_key
@@ -41,7 +35,8 @@ class GrvtAdapter(BaseExchange):
         self.rest_client: Optional[GrvtCcxt] = None
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
-        self.last_ws_msg_time = 0.0  # 看门狗计时器
+        self.last_ws_msg_time = 0.0
+        self._ws_tasks = []  # ✅ 新增：用于追踪并取消内部任务
 
     async def initialize(self):
         retry_count = 5
@@ -58,7 +53,6 @@ class GrvtAdapter(BaseExchange):
         raise ConnectionError("❌ [GRVT] Failed to connect after multiple attempts.")
 
     async def _initialize_logic(self):
-        # 1. Init REST
         params = {
             'trading_account_id': self.trading_account_id,
             'private_key': self.private_key,
@@ -66,7 +60,6 @@ class GrvtAdapter(BaseExchange):
         }
         self.rest_client = GrvtCcxt(env=self.env, parameters=params)
 
-        # 2. Fetch Markets
         logger.info(f"⏳ [GRVT] Syncing markets...")
         markets = await self._fetch_markets_async()
 
@@ -79,29 +72,19 @@ class GrvtAdapter(BaseExchange):
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
-                    # 兼容不同字段名
                     raw_id = market.get('instrument') or market.get('i')
                     raw_tick = market.get('tick_size') or market.get('ts') or 0
                     raw_min = market.get('min_size') or market.get('ms') or 0
-
-                    # 补充：获取价格和数量的精度倍数
-                    # GRVT通常直接传真实价格，但为了保险，获取 multiplier
-                    size_mul = 1.0  # GRVT SDK 内部处理了精度，这里主要用于 create_order 预处理
-                    price_mul = 1.0
 
                     self.contract_map[symbol] = {
                         "id": raw_id,
                         "tick_size": float(raw_tick),
                         "min_size": float(raw_min),
-                        "size_mul": float(market.get('contract_size', 1.0))  # 假设
+                        "size_mul": float(market.get('contract_size', 1.0))
                     }
                     loaded_count += 1
                     logger.info(f"   - Loaded {symbol} (ID: {raw_id})")
 
-        if loaded_count == 0:
-            logger.warning(f"⚠️ [GRVT] No target markets found!")
-
-        # 3. Init WS
         ws_params = {
             'api_key': self.api_key,
             'trading_account_id': self.trading_account_id,
@@ -126,7 +109,7 @@ class GrvtAdapter(BaseExchange):
         if "-" not in symbol: symbol = f"{symbol}-USDT"
         info = self.contract_map.get(symbol)
         if not info:
-            logger.error(f"Symbol {symbol} not found in map {list(self.contract_map.keys())}")
+            logger.error(f"Symbol {symbol} not found in map")
             return None
         return info
 
@@ -137,6 +120,7 @@ class GrvtAdapter(BaseExchange):
         return "UNKNOWN"
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
+        # (保持原样)
         info = self._get_contract_info(symbol)
         if not info: return {}
         loop = asyncio.get_running_loop()
@@ -160,31 +144,30 @@ class GrvtAdapter(BaseExchange):
         info = self._get_contract_info(symbol)
         if not info: return None
 
-        # ✅ 修复点1：精度处理
-        # GRVT SDK 接收 float，但为了避免 0.0099999 < 0.01 导致后端拒绝，
-        # 我们在这里做一次标准的 round 处理，保留合适的小数位 (例如 6位)
-        amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
-        price_safe = float(Decimal(str(price)).quantize(Decimal("0.000001"))) if price else None
+        # ✅ 修复精度: 使用 Decimal 处理，防止 float 精度丢失
+        try:
+            amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
+            price_safe = None
+            if price is not None:
+                price_safe = float(Decimal(str(price)).quantize(Decimal("0.000001")))
+        except Exception as e:
+            logger.error(f"❌ [GRVT] Precision Error: {e}")
+            return None
 
-        # 生成 Client Order ID (作为整数传递)
         client_order_id = int(time.time() * 1000000) % 2147483647
-
         is_ask = True if side.lower() == 'sell' else False
 
         try:
-            # 使用 wait_for 防止死锁
             if order_type == "MARKET":
-                res = await asyncio.wait_for(
+                await asyncio.wait_for(
                     self.ws_client.create_market_order(
                         instrument=info['id'],
                         size=amount_safe,
                         side='sell' if is_ask else 'buy',
                         client_order_id=client_order_id
-                    ),
-                    timeout=5.0
-                )
+                    ), timeout=5.0)
             else:
-                res = await asyncio.wait_for(
+                await asyncio.wait_for(
                     self.ws_client.create_limit_order(
                         instrument=info['id'],
                         size=amount_safe,
@@ -193,13 +176,8 @@ class GrvtAdapter(BaseExchange):
                         time_in_force="GTT",
                         client_order_id=client_order_id,
                         post_only=False
-                    ),
-                    timeout=5.0
-                )
-
-            # 返回 client_order_id 以便策略追踪
+                    ), timeout=5.0)
             return str(client_order_id)
-
         except asyncio.TimeoutError:
             logger.error(f"❌ [GRVT] Order Timeout (5s)")
             return None
@@ -208,24 +186,29 @@ class GrvtAdapter(BaseExchange):
             return None
 
     async def cancel_order(self, order_id: str):
-        # 简化版：尝试撤单
         try:
             if str(order_id).isdigit():
-                # 假设是 client_order_id
                 await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
                 await self.ws_client.cancel_order(order_id=order_id)
         except Exception:
-            pass  # 忽略撤单失败（可能是已成交）
+            pass
+
+    async def close(self):
+        """✅ 新增：清理资源"""
+        logger.info("🛑 [GRVT] Closing resources...")
+        # 这里的 SDK 可能没有显式 close，但我们需要确保引用断开
+        self.is_connected = False
+        self.ws_client = None
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
         logger.info(f"📡 [GRVT] Starting Stream Listener...")
-        loop = asyncio.get_running_loop()
+        self.last_ws_msg_time = time.time()
 
         async def message_callback(message: Dict[str, Any]):
             self.last_ws_msg_time = time.time()
-
             try:
+                # 兼容不同消息格式
                 feed_data = message.get("feed", {})
                 if not feed_data and "instrument" in message: feed_data = message
 
@@ -247,15 +230,10 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            # ✅ 修复点2：优先匹配 client_order_id
-                            # 策略层使用的是 client_order_id，必须提取并传回
                             client_oid = message.get('client_order_id') or \
                                          feed_data.get('client_order_id') or \
                                          state.get('client_order_id')
-
                             system_oid = message.get('order_id') or feed_data.get('order_id')
-
-                            # 优先使用 Client ID，如果没有则回退到 System ID
                             final_order_id = str(client_oid) if client_oid else str(system_oid)
 
                             event = {
@@ -265,7 +243,7 @@ class GrvtAdapter(BaseExchange):
                                 'side': side,
                                 'price': price,
                                 'size': filled_size,
-                                'order_id': final_order_id,  # 关键修复
+                                'order_id': final_order_id,
                                 'ts': int(time.time() * 1000)
                             }
                             event_queue.put_nowait(event)
@@ -290,7 +268,6 @@ class GrvtAdapter(BaseExchange):
                             'ask': float(asks[0]['price']),
                             'ts': int(time.time() * 1000)
                         }
-                        # RingQueue会自动丢弃旧数据，直接put
                         try:
                             tick_queue.put_nowait(tick)
                         except:
@@ -299,18 +276,27 @@ class GrvtAdapter(BaseExchange):
             except Exception as e:
                 logger.error(f"GRVT Callback Parse Error: {e}")
 
-        # 订阅
-        for symbol, info in self.contract_map.items():
-            inst_id = info['id']
-            await self.ws_client.subscribe(stream="book.s", callback=message_callback, params={"instrument": inst_id})
-            await self.ws_client.subscribe(stream="order", callback=message_callback,
-                                           params={"instrument": inst_id, "sub_account_id": self.trading_account_id})
-            await asyncio.sleep(0.1)
+        # 订阅逻辑
+        try:
+            for symbol, info in self.contract_map.items():
+                inst_id = info['id']
+                await self.ws_client.subscribe(stream="book.s", callback=message_callback,
+                                               params={"instrument": inst_id})
+                await self.ws_client.subscribe(stream="order", callback=message_callback,
+                                               params={"instrument": inst_id,
+                                                       "sub_account_id": self.trading_account_id})
+                await asyncio.sleep(0.1)
 
-        # ✅ 修复点3：连接看门狗 (Watchdog)
-        while True:
-            await asyncio.sleep(5)
-            if time.time() - self.last_ws_msg_time > 30.0:
-                logger.error("❌ [GRVT] Watchdog Triggered: No data for 30s. Restarting...")
-                # 这里抛出异常，让上层 Engine 捕获并重启 adapter 或整个程序
-                raise ConnectionError("GRVT WebSocket Timeout")
+            # ✅ 修复：Watchdog 逻辑重写，避免僵死并支持退出
+            while self.is_connected:
+                await asyncio.sleep(5)
+                if time.time() - self.last_ws_msg_time > 30.0:
+                    logger.error("❌ [GRVT] Watchdog Triggered: No data for 30s.")
+                    raise ConnectionError("GRVT WebSocket Timeout")
+
+        except asyncio.CancelledError:
+            logger.info("🛑 [GRVT] Listener Cancelled")
+            raise
+        finally:
+            # 退出时确保清理
+            await self.close()
