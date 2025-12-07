@@ -2,7 +2,7 @@ import asyncio
 import time
 import os
 import logging
-import random  # ✅ 新增：用于生成防止冲突的随机ID
+import random
 from decimal import Decimal
 from typing import Dict, Optional, Any, List
 
@@ -126,7 +126,9 @@ class GrvtAdapter(BaseExchange):
         if not info: return {}
         loop = asyncio.get_running_loop()
         try:
-            ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=5))
+            # 🔴 修复点：将 limit=5 改为 limit=10
+            # GRVT API 报错 "Depth is invalid" 说明不支持 5，通常支持 10, 20, 50
+            ob = await loop.run_in_executor(None, lambda: self.rest_client.fetch_order_book(info['id'], limit=10))
             bids = ob.get('bids', [])
             asks = ob.get('asks', [])
             return {
@@ -137,6 +139,7 @@ class GrvtAdapter(BaseExchange):
                 'ts': int(time.time() * 1000)
             }
         except Exception as e:
+            # 这里的日志会显示具体的 API 错误，之前就是这里报了 400
             logger.error(f"Fetch OB error: {e}")
             return {}
 
@@ -145,7 +148,6 @@ class GrvtAdapter(BaseExchange):
         info = self._get_contract_info(symbol)
         if not info: return None
 
-        # ✅ 精度处理: 使用 Decimal 防止 float 精度丢失
         try:
             amount_safe = float(Decimal(str(amount)).quantize(Decimal("0.000001")))
             price_safe = None
@@ -155,9 +157,6 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Precision Error: {e}")
             return None
 
-        # ✅ ID生成优化：时间戳后6位 + 3位随机数
-        # 结果最大值约为 999999999 (9位数)，远小于 int32 上限 (2147483647)
-        # 这确保了 ID 唯一性且不会溢出
         ts_part = int(time.time()) % 1000000
         rand_part = random.randint(0, 999)
         client_order_id = int(f"{ts_part}{rand_part:03d}")
@@ -194,7 +193,6 @@ class GrvtAdapter(BaseExchange):
 
     async def cancel_order(self, order_id: str):
         try:
-            # SDK 支持 int 或 str 类型的 ID
             if str(order_id).isdigit():
                 await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
@@ -203,11 +201,8 @@ class GrvtAdapter(BaseExchange):
             pass
 
     async def close(self):
-        """✅ 清理资源，防止内存泄漏"""
         logger.info("🛑 [GRVT] Closing resources...")
         self.is_connected = False
-        # 如果 SDK 提供了关闭方法，可以在这里调用
-        # self.ws_client.close()
         self.ws_client = None
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
@@ -239,7 +234,6 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            # 尝试获取各种可能的 ID 字段
                             client_oid = message.get('client_order_id') or \
                                          feed_data.get('client_order_id') or \
                                          state.get('client_order_id')
@@ -290,20 +284,28 @@ class GrvtAdapter(BaseExchange):
         try:
             for symbol, info in self.contract_map.items():
                 inst_id = info['id']
-                # 订阅行情
+                logger.info(f"📤 [GRVT] Subscribing to {symbol} (ID: {inst_id})")
+
+                # 🔴 修复点：显式传递 depth=10，确保 WS 订阅成功
                 await self.ws_client.subscribe(stream="book.s", callback=message_callback,
-                                               params={"instrument": inst_id})
-                # 订阅订单更新
+                                               params={"instrument": inst_id, "depth": 10})
+
                 await self.ws_client.subscribe(stream="order", callback=message_callback,
                                                params={"instrument": inst_id,
                                                        "sub_account_id": self.trading_account_id})
                 await asyncio.sleep(0.1)
 
-            # Watchdog 监控：如果 30 秒无数据则报错重连
+            # Watchdog 监控
             while self.is_connected:
-                await asyncio.sleep(5)
-                if time.time() - self.last_ws_msg_time > 30.0:
-                    logger.error("❌ [GRVT] Watchdog Triggered: No data for 30s.")
+                await asyncio.sleep(10)  # 10秒检查一次
+
+                # 打印心跳，证明 Loop 还在跑
+                if time.time() - self.last_ws_msg_time > 10.0:
+                    logger.info(
+                        f"💓 [GRVT] Heartbeat: Waiting for data... (Last: {time.time() - self.last_ws_msg_time:.1f}s ago)")
+
+                if time.time() - self.last_ws_msg_time > 60.0:
+                    logger.error("❌ [GRVT] Watchdog Triggered: No data for 60s.")
                     raise ConnectionError("GRVT WebSocket Timeout")
 
         except asyncio.CancelledError:
