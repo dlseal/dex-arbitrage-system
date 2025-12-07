@@ -172,56 +172,46 @@ class GrvtAdapter(BaseExchange):
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:
-        info = self._get_contract_info(symbol)
+        info = self.market_config.get(symbol)
+        if not info:
+            logging.error(
+                f"❌ [Lighter] Symbol '{symbol}' not found in market config. Available: {list(self.market_config.keys())}")
+            return None
+        amount_int = int(amount * info['size_mul'])
+        price_int = int(price * info['price_mul']) if price else 0
+        is_ask = True if side.lower() == 'sell' else False
+        client_order_index = int(time.time() * 1000) % 2147483647
 
-        # 1. 获取市场精度配置
-        tick_size = info.get('tick_size')
-        min_size = info.get('min_size')
-
-        # 2. 数量精度修正 (修复：增加 1e-9 偏移量防止 0.005 变成 0.0049999 被截断为 0.004)
-        d_amount = Decimal(str(amount))
-        if min_size and min_size > 0:
-            # 关键修改：先加上一个极小值 epsilon 再取整
-            epsilon = Decimal("1e-9")
-            d_amount = ((d_amount + epsilon) / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
-        qty = float(d_amount)
-
-        # 3. 价格精度修正
-        px = 0.0
-        if price:
-            d_price = Decimal(str(price))
-            if tick_size and tick_size > 0:
-                d_price = (d_price / tick_size).to_integral_value(rounding='ROUND_HALF_UP') * tick_size
-            px = float(d_price)
-
-        side = side.lower()
-        # ... (后续代码保持不变)
-        params = {'post_only': True, 'order_duration_secs': 2591999}
-        if order_type == "MARKET":
-            params = {}
-
-        loop = asyncio.get_running_loop()
         try:
+            # 🔴 核心修复：增加 5 秒超时控制，防止网络请求卡死主线程
             if order_type == "MARKET":
-                res = await loop.run_in_executor(None, lambda: self.rest_client.create_order(
-                    symbol=info['id'], type='market', side=side, amount=qty, params=params
-                ))
+                res, tx_hash, err = await asyncio.wait_for(
+                    self.client.create_market_order(
+                        market_index=info['id'], client_order_index=client_order_index,
+                        base_amount=amount_int, avg_execution_price=price_int, is_ask=is_ask
+                    ),
+                    timeout=5.0
+                )
             else:
-                res = await loop.run_in_executor(None, lambda: self.rest_client.create_limit_order(
-                    symbol=info['id'], side=side, amount=qty, price=px, params=params
-                ))
+                res, tx_hash, err = await asyncio.wait_for(
+                    self.client.create_limit_order(
+                        market_index=info['id'], client_order_index=client_order_index,
+                        base_amount=amount_int, price=price_int, is_ask=is_ask,
+                        time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                    ),
+                    timeout=5.0
+                )
 
-            if isinstance(res, dict):
-                oid = res.get('id') or res.get('order_id')
-                # 增强兼容性
-                if not oid or oid == "0x00":
-                    cid = str(res.get('client_order_id', '') or res.get('metadata', {}).get('client_order_id', ''))
-                    return cid if cid else None
-                return oid
-            return str(res)
+            if err:
+                logging.error(f"❌ [Lighter] Order Error: {err}")
+                return None
+            return str(client_order_index)
 
+        except asyncio.TimeoutError:
+            logging.error(f"❌ [Lighter] Order Timeout (5s) - API 未响应，跳过等待")
+            return None
         except Exception as e:
-            logging.error(f"❌ [GRVT] Order Error: {e} | Side:{side} Qty:{qty} Price:{px}")
+            logging.error(f"❌ [Lighter] Create Exception: {e}")
             return None
 
     async def cancel_order(self, order_id: str):

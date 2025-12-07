@@ -181,21 +181,31 @@ class GrvtLighterFarmStrategy:
         return cost / collected
 
     async def _process_trade_fill(self, trade: dict):
+        """
+        处理成交回报 (入口)
+        核心修改：将耗时的对冲逻辑扔到后台任务，防止阻塞主循环接收后续行情/成交
+        """
         if trade['exchange'] != 'GRVT': return
 
         symbol = trade['symbol']
+
+        # 🚀 异步启动对冲任务，主线程立即返回去处理下一个 Event
+        asyncio.create_task(self._background_hedge_task(symbol, trade))
+
+    async def _background_hedge_task(self, symbol: str, trade: dict):
+        """
+        [新增] 后台对冲任务
+        """
         lock = self._get_lock(symbol)
 
         # 获取订单 ID (由 Adapter 传递)
         order_id = trade.get('order_id')
 
-        if lock.locked():
-            logger.warning(f"⚠️ {symbol} 正在对冲中，收到额外成交 (可能并发)，排队处理...")
-
+        # 在后台任务中竞争锁，确保同一个 Symbol 的对冲逻辑依然是有序的
         async with lock:
-            logger.info(f"🚨 [成交触发] GRVT {trade['side']} {trade['size']} -> 执行对冲")
+            logger.info(f"🚨 [成交触发] GRVT {trade['side']} {trade['size']} -> 执行后台对冲")
 
-            # 1. 立即清理本地挂单状态，防止主循环重复改单
+            # 1. 立即清理本地挂单状态
             if symbol in self.active_orders:
                 # 只有当成交 ID 与记录 ID 一致，或者我们无法确定 ID 时才删除
                 if not order_id or str(self.active_orders[symbol]) == str(order_id):
@@ -203,13 +213,11 @@ class GrvtLighterFarmStrategy:
                     if symbol in self.active_order_prices:
                         del self.active_order_prices[symbol]
 
-            # 2. 🔴 关键修复：如果是部分成交 (或状态未知)，立即撤销剩余订单
-            # 防止"幽灵订单"继续留在 Orderbook 上造成后续多余成交
+            # 2. 如果是部分成交，立即撤销剩余订单
             if order_id:
-                # 异步发撤单指令，不等待结果，确保对冲速度优先
                 asyncio.create_task(self._safe_cancel(symbol, order_id))
 
-            # 3. 执行对冲 (使用修复后的 Delta Size)
+            # 3. 执行对冲 (逻辑保持不变，但现在是在后台运行)
             await self._execute_hedge_loop(symbol, trade['side'], trade['size'])
 
     async def _safe_cancel(self, symbol, order_id):
