@@ -72,7 +72,6 @@ class GrvtAdapter(BaseExchange):
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
                     raw_id = market.get('instrument') or market.get('i')
-                    # 兼容不同字段名
                     raw_tick = market.get('tick_size') or market.get('ts') or 0
 
                     self.contract_map[symbol] = {
@@ -148,7 +147,6 @@ class GrvtAdapter(BaseExchange):
             tick_size = Decimal(str(info.get('tick_size', 0)))
             min_size = Decimal(str(info.get('min_size', 0)))
 
-            # 数量精度修正
             d_amount = Decimal(str(amount))
             if min_size > 0:
                 d_amount = (d_amount / min_size).to_integral_value(rounding='ROUND_DOWN') * min_size
@@ -156,7 +154,6 @@ class GrvtAdapter(BaseExchange):
                 d_amount = d_amount.quantize(Decimal("0.000001"))
             qty = float(d_amount)
 
-            # 价格精度修正
             px = None
             if price is not None:
                 d_price = Decimal(str(price))
@@ -175,7 +172,6 @@ class GrvtAdapter(BaseExchange):
 
         safe_side = side.lower()
 
-        # 构造 params
         params = {
             'client_order_id': client_order_id,
         }
@@ -188,7 +184,6 @@ class GrvtAdapter(BaseExchange):
             })
 
         try:
-            # 目标 Symbol ID
             target_symbol_id = info['id']
 
             # --- 3. 调用 SDK (修正参数名) ---
@@ -225,7 +220,6 @@ class GrvtAdapter(BaseExchange):
 
     async def cancel_order(self, order_id: str):
         try:
-            # 只有纯数字才被视为 client_order_id
             if str(order_id).isdigit():
                 await self.ws_client.cancel_order(client_order_id=int(order_id))
             else:
@@ -245,13 +239,11 @@ class GrvtAdapter(BaseExchange):
         async def message_callback(message: Dict[str, Any]):
             self.last_ws_msg_time = time.time()
             try:
-                # 兼容 feed 包裹格式
                 feed_data = message.get("feed", {})
                 if not feed_data and "instrument" in message: feed_data = message
 
                 channel = message.get("params", {}).get("channel") or message.get("stream")
 
-                # --- A. 订单更新 ---
                 if channel and "order" in str(channel) and "book" not in str(channel):
                     state = feed_data.get("state", {})
                     status = state.get("status", "").upper()
@@ -267,7 +259,6 @@ class GrvtAdapter(BaseExchange):
                             side = "BUY" if is_buy else "SELL"
                             price = float(leg.get("limit_price", 0))
 
-                            # 提取 ID
                             client_oid = message.get('client_order_id') or feed_data.get(
                                 'client_order_id') or state.get('client_order_id')
                             system_oid = message.get('order_id') or feed_data.get('order_id')
@@ -287,7 +278,6 @@ class GrvtAdapter(BaseExchange):
                             logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
                     return
 
-                # --- B. 订单簿更新 ---
                 if channel and "book" in str(channel):
                     instrument = feed_data.get("instrument")
                     symbol_base = self._get_symbol_from_instrument(instrument)
@@ -308,7 +298,7 @@ class GrvtAdapter(BaseExchange):
                         tick_queue.put_nowait(tick)
 
             except Exception as e:
-                pass  # 忽略解析错误，避免刷屏
+                pass
 
         try:
             for symbol, info in self.contract_map.items():
@@ -324,7 +314,6 @@ class GrvtAdapter(BaseExchange):
                                                        "sub_account_id": self.trading_account_id})
                 await asyncio.sleep(0.1)
 
-            # Watchdog
             while self.is_connected:
                 await asyncio.sleep(10)
                 if time.time() - self.last_ws_msg_time > 60.0:

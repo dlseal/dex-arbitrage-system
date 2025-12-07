@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import websockets
-from decimal import Decimal, ROUND_HALF_UP  # ✅ 新增
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional, List, Any
 from .base import BaseExchange
 
@@ -30,7 +30,6 @@ class LighterOrderBookManager:
         self.running = True
         while self.running:
             try:
-                # 每次重连前重置状态
                 self.snapshot_loaded = False
                 self.bids.clear()
                 self.asks.clear()
@@ -83,14 +82,13 @@ class LighterOrderBookManager:
 
                     while self.running:
                         try:
-                            # 10s 超时看门狗
                             message = await asyncio.wait_for(ws.recv(), timeout=10.0)
                             data = json.loads(message)
                             await self._handle_message(data, ws)
 
                             if time.time() > expire_at - 60:
                                 logger.info(f"🔄 [Lighter] Token expiring, reconnecting...")
-                                break  # 跳出 inner loop, 触发 outer loop 重连
+                                break
 
                         except asyncio.TimeoutError:
                             logger.warning(f"⏰ [Lighter-{self.symbol}] No data for 10s, reconnecting...")
@@ -216,11 +214,9 @@ class LighterAdapter(BaseExchange):
             raise e
 
     async def close(self):
-        """✅ 新增：清理资源"""
         logger.info("🛑 [Lighter] Stopping managers...")
         for manager in self.managers:
             manager.running = False
-        # api_client.close 是同步的还是异步的取决于实现，通常不需要显式 await
         if self.api_client:
             await self.api_client.close()
 
@@ -258,9 +254,8 @@ class LighterAdapter(BaseExchange):
                 raise
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        # (保持原样，略)
         empty_ret = {'exchange': self.name, 'symbol': symbol, 'bid': 0.0, 'ask': 0.0, 'ts': int(time.time() * 1000)}
-        return empty_ret  # 省略实现以节省空间，逻辑未变
+        return empty_ret
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT") -> str:

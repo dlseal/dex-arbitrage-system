@@ -19,8 +19,6 @@ class SpreadArbitrageStrategy:
         self.name = "SpreadArb_v1"
         self.adapters = adapters
         self.books: Dict[str, Dict[str, Dict]] = {}
-
-        # 2. 从配置读取阈值
         self.spread_threshold = Config.SPREAD_THRESHOLD
 
         logger.info(f"策略配置加载: 阈值={self.spread_threshold}, 冷却={Config.TRADE_COOLDOWN}s")
@@ -33,23 +31,19 @@ class SpreadArbitrageStrategy:
         exchange = tick_data['exchange']
         symbol = tick_data['symbol']
 
-        # 1. 初始化该币种的存储结构
         if symbol not in self.books:
             self.books[symbol] = {}
 
-        # 2. 更新该币种、该交易所的报价
         self.books[symbol][exchange] = {
             'bid': tick_data['bid'],
             'ask': tick_data['ask'],
             'ts': time.time()
         }
 
-        # 3. 只有当该币种在两个交易所都有数据时，才计算价差
         if 'Lighter' in self.books[symbol] and 'GRVT' in self.books[symbol]:
             await self._calculate_spread(symbol)
 
     async def _calculate_spread(self, symbol: str):
-        # 获取该币种在两边的报价
         lighter = self.books[symbol]['Lighter']
         grvt = self.books[symbol]['GRVT']
 
@@ -65,7 +59,6 @@ class SpreadArbitrageStrategy:
         diff_b = grvt['bid'] - lighter['ask']
         spread_b = diff_b / lighter['ask']
 
-        # --- 机会检测 (带 Symbol 标识) ---
         if spread_a > self.spread_threshold:
             self._log_opportunity(symbol, "A", "Sell Lighter / Buy GRVT", spread_a, lighter['bid'], grvt['ask'])
             await self.execute_trade(symbol, "Lighter", "GRVT", "SELL", "BUY", lighter['bid'], grvt['ask'])
@@ -88,12 +81,9 @@ class SpreadArbitrageStrategy:
         self.is_trading = True
 
         try:
-            # 构造完整的交易对名称
             symbol_pair = f"{symbol}-USDT"
-
             logger.info(f"⚡️ [EXECUTE] {symbol} | {ex_sell} Sell / {ex_buy} Buy")
 
-            # 3. 动态获取下单数量 (配置化)
             # 优先读取指定币种的配置，如果没有则读取 DEFAULT
             quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
 
@@ -110,6 +100,5 @@ class SpreadArbitrageStrategy:
         except Exception as e:
             logger.error(f"❌ 交易失败: {e}")
         finally:
-            # 4. 使用配置的冷却时间
             await asyncio.sleep(Config.TRADE_COOLDOWN)
             self.is_trading = False
