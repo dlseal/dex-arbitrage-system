@@ -18,9 +18,8 @@ class Config:
     STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "GL_FARM")
 
     # ==========================
-    # 策略参数配置 (Strategy Config)
+    # 差价对冲策略 (Strategy Config)
     # ==========================
-
     # 1. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
     SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.002"))
 
@@ -37,9 +36,8 @@ class Config:
         TRADE_QUANTITIES = _default_quantities
 
     # ==========================
-    # 刷量策略专用参数 (Volume Farming Config)
+    # 刷量策略参数 (Volume Farming Config)
     # ==========================
-
     # 允许的最大价差亏损 (滑点容忍度)
     # 例如 -0.0005 代表允许亏损 0.05% 去换取成交 (前提是 Rebate > 0.05%)
     # 正数表示必须要盈利才开单，负数表示愿意支付的成本
@@ -52,6 +50,18 @@ class Config:
     #连续失败熔断阈值
     # 如果连续 3 次对冲失败（Lighter下单报错），则触发熔断停止策略
     MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "3"))
+
+    # ==========================
+    # 🆕 库存刷量策略专用配置 (Inventory Farm Config)
+    # ==========================
+    # 最大持仓价值 (USD)，超过此值触发平仓
+    MAX_INVENTORY_USD = float(os.getenv("MAX_INVENTORY_USD", "800.0"))
+
+    # 挂单层数 (例如 3 表示同时挂买1, 买2, 买3)
+    INVENTORY_LAYERS = int(os.getenv("INVENTORY_LAYERS", "3"))
+
+    # 层间距 (Tick倍数)
+    INVENTORY_LAYER_SPREAD = int(os.getenv("INVENTORY_LAYER_SPREAD", "1"))
 
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")

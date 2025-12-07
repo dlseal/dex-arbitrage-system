@@ -22,6 +22,7 @@ from app.core.engine import EventEngine
 # 导入所有策略
 from app.strategies.spread_arb import SpreadArbitrageStrategy
 from app.strategies.grvt_lighter_farm import GrvtLighterFarmStrategy
+from app.strategies.grvt_inventory_farm import GrvtInventoryFarmStrategy
 
 # 配置日志格式
 logging.basicConfig(
@@ -91,6 +92,9 @@ async def main():
     if Config.STRATEGY_TYPE == "GL_FARM":
         logger.info("🚜 启动模式: GRVT(Maker) + Lighter(Taker) 刷量策略")
         strategy = GrvtLighterFarmStrategy(adapters_map)
+    elif Config.STRATEGY_TYPE == "GL_INVENTORY":
+        logger.info("🏭 启动模式: GRVT 库存累积刷量 (小资金专用)")
+        strategy = GrvtInventoryFarmStrategy(adapters_map)
     else:
         logger.info("⚖️ 启动模式: 价差套利 (Spread Arb)")
         strategy = SpreadArbitrageStrategy(adapters_map)
