@@ -21,6 +21,10 @@ class GrvtLighterFarmStrategy:
         self.order_create_time: Dict[str, float] = {}
         self.last_heartbeat = time.time()
 
+        # --- 仓位 ---
+        self.pos_cache: Dict[str, float] = {}
+        self.pos_cache_time: Dict[str, float] = {}
+
         # --- 并发 ---
         self.locks: Dict[str, asyncio.Lock] = {}
         self.last_quote_time: Dict[str, float] = {}
@@ -206,52 +210,55 @@ class GrvtLighterFarmStrategy:
         return cost / collected
 
     async def _place_order_task(self, symbol, side, qty, price, post_only):
-        """
-        [修改版] 下单前增加“实盘仓位检查”，防止重复开仓
-        """
-        # 1. 核心安全检查：已有持仓时，严禁开新仓！
+        # 1. 安全检查：已有持仓时禁止开新仓
         current_pos = await self._check_actual_position(symbol)
 
-        # 设定一个极小的容差，忽略极其微小的尘埃仓位
+        # 忽略微小尘埃仓位
         if abs(current_pos) > (qty * 0.1):
-            logger.warning(f"🛑 [安全拦截] 检测到已有持仓 {current_pos}，禁止重复下单 {side}！")
+            logger.warning(f"🛑 [Interceptor] {symbol} found existing pos: {current_pos}, triggering hedge.")
 
-            # 如果持仓方向与当前策略方向相反（例如持有多单，策略想买），这更是大忌
-            # 此时应该触发平仓逻辑，而不是开仓。
-            # 这里简单处理：直接放弃本次开仓，依靠 _process_trade_fill 或 心跳检测去处理现有仓位
+            # 释放锁，防止后续逻辑阻塞
             self.pending_orders.discard(symbol)
+
+            # 触发对冲逻辑清理意外仓位
+            # GRVT 持仓 > 0 代表当前是 Buy 方向，需要在 Lighter Sell，反之亦然
+            grvt_side = 'BUY' if current_pos > 0 else 'SELL'
+            asyncio.create_task(self._execute_hedge_loop(symbol, grvt_side, abs(current_pos)))
             return
 
         try:
-            # 2. 正常下单逻辑
+            # 2. 执行下单
             new_id = await self.adapters['GRVT'].create_order(
-                symbol=f"{symbol}-USDT", side=side, amount=qty, price=price, params={'post_only': post_only}
+                symbol=f"{symbol}-USDT",
+                side=side,
+                amount=qty,
+                price=price,
+                params={'post_only': post_only}
             )
 
             if new_id:
                 self.active_orders[symbol] = new_id
                 self.active_order_prices[symbol] = price
-                logger.info(f"✅ 挂单成功: {symbol} {side} {qty} @ {price} (ID: {new_id})")
+                logger.info(f"✅ Placed: {symbol} {side} {qty} @ {price} (ID: {new_id})")
             else:
-                logger.warning(f"⚠️ 下单未返回 ID: {symbol}")
+                logger.warning(f"⚠️ No ID returned for {symbol}")
 
         except Exception as e:
-            logger.error(f"❌ 下单异常: {e}")
+            logger.error(f"❌ Order failed: {e}")
         finally:
-            # 无论成功失败，必须释放 pending 锁
             self.pending_orders.discard(symbol)
 
     async def _check_actual_position(self, symbol: str) -> float:
-        """
-        [新增安全方法] 强制查询交易所实际持仓
-        返回: 当前持仓数量 (正数为多，负数为空)
-        """
+        """带缓存的持仓查询"""
+        now = time.time()
+        # 缓存有效期 2 秒
+        if symbol in self.pos_cache and (now - self.pos_cache_time.get(symbol, 0) < 2.0):
+            return self.pos_cache[symbol]
+
         try:
             adapter = self.adapters.get('GRVT')
             if not adapter: return 0.0
 
-            # 强制调用 REST API 获取最新持仓 (不要依赖 WebSocket 推送，防止丢包)
-            # 注意：这里需要确保 run_in_executor 避免阻塞主线程
             loop = asyncio.get_running_loop()
             positions = await loop.run_in_executor(
                 None,
@@ -259,23 +266,25 @@ class GrvtLighterFarmStrategy:
                     params={'sub_account_id': adapter.trading_account_id}
                 )
             )
-
+            found_size = 0.0
             for p in positions:
-                # 兼容不同的字段名 (instrument 或 symbol)
                 inst_id = p.get('instrument') or p.get('symbol') or ""
                 if symbol in inst_id:
                     size = float(p.get('size', 0) or p.get('contracts', 0))
-                    # GRVT 的 size 通常是正数，需要结合 side 判断，或者直接看 signed size
-                    # 如果 SDK 返回的是绝对值，需要额外判断方向，这里假设 size 带符号
-                    # 如果不带符号，需要根据 'side' 字段修正：
-                    if size > 0 and p.get('side') == 'SHORT':
+                    # 修正空单符号（如果 API 返回绝对值）
+                    if size > 0 and p.get('side', '').upper() == 'SHORT':
                         size = -size
-                    return size
-            return 0.0
+                    found_size = size
+                    break
+
+            self.pos_cache[symbol] = found_size
+            self.pos_cache_time[symbol] = now
+            return found_size
+
         except Exception as e:
-            logger.error(f"🔥 [CRITICAL] 查询持仓失败: {e}")
-            # 如果查不到持仓，为了安全，假设已有持仓，阻止开单
-            return 9999.0
+            logger.error(f"Position check failed: {e}")
+            # API 失败时返回缓存值，避免返回 0 误导逻辑
+            return self.pos_cache.get(symbol, 0.0)
 
     async def _cancel_order_task(self, symbol, order_id):
         """
