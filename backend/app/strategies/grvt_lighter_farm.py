@@ -206,8 +206,24 @@ class GrvtLighterFarmStrategy:
         return cost / collected
 
     async def _place_order_task(self, symbol, side, qty, price, post_only):
+        """
+        [修改版] 下单前增加“实盘仓位检查”，防止重复开仓
+        """
+        # 1. 核心安全检查：已有持仓时，严禁开新仓！
+        current_pos = await self._check_actual_position(symbol)
+
+        # 设定一个极小的容差，忽略极其微小的尘埃仓位
+        if abs(current_pos) > (qty * 0.1):
+            logger.warning(f"🛑 [安全拦截] 检测到已有持仓 {current_pos}，禁止重复下单 {side}！")
+
+            # 如果持仓方向与当前策略方向相反（例如持有多单，策略想买），这更是大忌
+            # 此时应该触发平仓逻辑，而不是开仓。
+            # 这里简单处理：直接放弃本次开仓，依靠 _process_trade_fill 或 心跳检测去处理现有仓位
+            self.pending_orders.discard(symbol)
+            return
+
         try:
-            # 传递 post_only 参数给 Adapter
+            # 2. 正常下单逻辑
             new_id = await self.adapters['GRVT'].create_order(
                 symbol=f"{symbol}-USDT", side=side, amount=qty, price=price, params={'post_only': post_only}
             )
@@ -215,24 +231,85 @@ class GrvtLighterFarmStrategy:
             if new_id:
                 self.active_orders[symbol] = new_id
                 self.active_order_prices[symbol] = price
+                logger.info(f"✅ 挂单成功: {symbol} {side} {qty} @ {price} (ID: {new_id})")
             else:
-                # 下单失败 (可能被拒)，不记录 active
-                pass
+                logger.warning(f"⚠️ 下单未返回 ID: {symbol}")
+
         except Exception as e:
-            logger.error(f"Place Order Error: {e}")
+            logger.error(f"❌ 下单异常: {e}")
         finally:
+            # 无论成功失败，必须释放 pending 锁
             self.pending_orders.discard(symbol)
 
-    async def _cancel_order_task(self, symbol, order_id):
+    async def _check_actual_position(self, symbol: str) -> float:
+        """
+        [新增安全方法] 强制查询交易所实际持仓
+        返回: 当前持仓数量 (正数为多，负数为空)
+        """
         try:
+            adapter = self.adapters.get('GRVT')
+            if not adapter: return 0.0
+
+            # 强制调用 REST API 获取最新持仓 (不要依赖 WebSocket 推送，防止丢包)
+            # 注意：这里需要确保 run_in_executor 避免阻塞主线程
+            loop = asyncio.get_running_loop()
+            positions = await loop.run_in_executor(
+                None,
+                lambda: adapter.rest_client.fetch_positions(
+                    params={'sub_account_id': adapter.trading_account_id}
+                )
+            )
+
+            for p in positions:
+                # 兼容不同的字段名 (instrument 或 symbol)
+                inst_id = p.get('instrument') or p.get('symbol') or ""
+                if symbol in inst_id:
+                    size = float(p.get('size', 0) or p.get('contracts', 0))
+                    # GRVT 的 size 通常是正数，需要结合 side 判断，或者直接看 signed size
+                    # 如果 SDK 返回的是绝对值，需要额外判断方向，这里假设 size 带符号
+                    # 如果不带符号，需要根据 'side' 字段修正：
+                    if size > 0 and p.get('side') == 'SHORT':
+                        size = -size
+                    return size
+            return 0.0
+        except Exception as e:
+            logger.error(f"🔥 [CRITICAL] 查询持仓失败: {e}")
+            # 如果查不到持仓，为了安全，假设已有持仓，阻止开单
+            return 9999.0
+
+    async def _cancel_order_task(self, symbol, order_id):
+        """
+        [修改版] 必须等待撤单确认，才清理内存状态
+        """
+        cancel_success = False
+        try:
+            # 1. 发起撤单
             await self.adapters['GRVT'].cancel_order(order_id, symbol=symbol)
-        except Exception:
-            pass
 
-        if symbol in self.active_orders and self.active_orders[symbol] == order_id:
-            del self.active_orders[symbol]
-            if symbol in self.active_order_prices: del self.active_order_prices[symbol]
+            # 2. 如果代码能走到这里，说明 API 调用没有抛出异常，视为成功
+            cancel_success = True
+            logger.info(f"🗑️ 撤单请求已发送: {symbol} (ID: {order_id})")
 
+        except Exception as e:
+            err_msg = str(e).lower()
+            # 3. 特殊处理：如果报错是“订单不存在”或“已完成”，也视为撤单成功（目的是清理内存）
+            if "not found" in err_msg or "filled" in err_msg or "cancelled" in err_msg:
+                cancel_success = True
+                logger.warning(f"⚠️ 订单已失效，清理内存: {e}")
+            else:
+                logger.error(f"❌ 撤单失败 (保留内存状态): {e}")
+                # 撤单失败了，意味着订单可能还在挂着。
+                # 此时绝对不能 del self.active_orders[symbol]，否则主循环会以为没单子了，又去挂一个新的
+                pass
+
+        # 4. 只有在确认撤单成功（或订单消失）时，才清理内存
+        if cancel_success:
+            if symbol in self.active_orders and self.active_orders[symbol] == order_id:
+                del self.active_orders[symbol]
+                if symbol in self.active_order_prices:
+                    del self.active_order_prices[symbol]
+
+        # 释放锁
         self.pending_orders.discard(symbol)
 
     async def _process_trade_fill(self, trade: dict):
