@@ -210,24 +210,40 @@ class GrvtLighterFarmStrategy:
         return cost / collected
 
     async def _place_order_task(self, symbol, side, qty, price, post_only):
-        # 1. 安全检查：已有持仓时禁止开新仓
+        """
+        [紧急修复版]
+        1. 允许平仓单通过 (Allow Closing Orders)
+        2. 移除拦截器中的自动对冲 (防止无限对冲)
+        """
+        # 1. 获取当前持仓 (使用缓存避免 429)
         current_pos = await self._check_actual_position(symbol)
 
-        # 忽略微小尘埃仓位
+        # 2. 智能拦截逻辑
+        # 如果有持仓，我们需要判断：这是"加仓"还是"平仓"？
         if abs(current_pos) > (qty * 0.1):
-            logger.warning(f"🛑 [Interceptor] {symbol} found existing pos: {current_pos}, triggering hedge.")
+            is_closing = False
 
-            # 释放锁，防止后续逻辑阻塞
-            self.pending_orders.discard(symbol)
+            # 逻辑：持多单(>0)且卖出(SELL) = 平仓 -> 允许
+            if current_pos > 0 and side.upper() == 'SELL':
+                is_closing = True
+            # 逻辑：持空单(<0)且买入(BUY) = 平仓 -> 允许
+            elif current_pos < 0 and side.upper() == 'BUY':
+                is_closing = True
 
-            # 触发对冲逻辑清理意外仓位
-            # GRVT 持仓 > 0 代表当前是 Buy 方向，需要在 Lighter Sell，反之亦然
-            grvt_side = 'BUY' if current_pos > 0 else 'SELL'
-            asyncio.create_task(self._execute_hedge_loop(symbol, grvt_side, abs(current_pos)))
-            return
+            if is_closing:
+                logger.info(f"✅ [Interceptor] 放行平仓单: {side} {qty} (当前持仓: {current_pos})")
+            else:
+                # 如果是同方向加仓（例如持多还在买），则必须拦截！
+                # 警告：这里绝对不能触发自动对冲，否则会死循环！
+                logger.warning(f"🛑 [Interceptor] 拦截加仓单: {side} (当前持仓: {current_pos}) - 等待 Flip 逻辑修正")
+                self.pending_orders.discard(symbol)
+                return
 
         try:
-            # 2. 执行下单
+            # 3. 正常下单
+            # 增加打印，确认正在下单
+            # logger.info(f"🚀 发送下单请求: {symbol} {side} {price}")
+
             new_id = await self.adapters['GRVT'].create_order(
                 symbol=f"{symbol}-USDT",
                 side=side,
