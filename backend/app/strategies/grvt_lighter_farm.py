@@ -211,39 +211,35 @@ class GrvtLighterFarmStrategy:
 
     async def _place_order_task(self, symbol, side, qty, price, post_only):
         """
-        [紧急修复版]
-        1. 允许平仓单通过 (Allow Closing Orders)
-        2. 移除拦截器中的自动对冲 (防止无限对冲)
+        [增强版] 包含自动纠错功能的下单逻辑
         """
-        # 1. 获取当前持仓 (使用缓存避免 429)
+        # 1. 获取当前持仓
         current_pos = await self._check_actual_position(symbol)
 
-        # 2. 智能拦截逻辑
-        # 如果有持仓，我们需要判断：这是"加仓"还是"平仓"？
+        # 2. 智能拦截与状态纠错
         if abs(current_pos) > (qty * 0.1):
             is_closing = False
-
-            # 逻辑：持多单(>0)且卖出(SELL) = 平仓 -> 允许
-            if current_pos > 0 and side.upper() == 'SELL':
-                is_closing = True
-            # 逻辑：持空单(<0)且买入(BUY) = 平仓 -> 允许
-            elif current_pos < 0 and side.upper() == 'BUY':
-                is_closing = True
+            # 判断是否为平仓单
+            if current_pos > 0 and side.upper() == 'SELL': is_closing = True
+            if current_pos < 0 and side.upper() == 'BUY': is_closing = True
 
             if is_closing:
-                logger.info(f"✅ [Interceptor] 放行平仓单: {side} {qty} (当前持仓: {current_pos})")
+                logger.info(f"✅ [Interceptor] 放行平仓单: {side} {qty} (持仓: {current_pos})")
             else:
-                # 如果是同方向加仓（例如持多还在买），则必须拦截！
-                # 警告：这里绝对不能触发自动对冲，否则会死循环！
-                logger.warning(f"🛑 [Interceptor] 拦截加仓单: {side} (当前持仓: {current_pos}) - 等待 Flip 逻辑修正")
+                # === 关键修复：自动纠错 ===
+                # 如果检测到同方向加仓（例如持空单还在卖），说明状态不同步
+                logger.warning(f"⚠️ [State Mismatch] 持仓 {current_pos} 与意图 {side} 冲突，触发自动反转！")
+
+                # 强制修正策略方向：持空则买，持多则卖
+                correct_side = 'BUY' if current_pos < 0 else 'SELL'
+                self.symbol_sides[symbol] = correct_side
+
+                # 释放锁，直接返回。让下一轮 Tick 使用正确的方向去下单平仓
                 self.pending_orders.discard(symbol)
                 return
 
         try:
             # 3. 正常下单
-            # 增加打印，确认正在下单
-            # logger.info(f"🚀 发送下单请求: {symbol} {side} {price}")
-
             new_id = await self.adapters['GRVT'].create_order(
                 symbol=f"{symbol}-USDT",
                 side=side,
