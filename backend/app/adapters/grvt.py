@@ -317,7 +317,9 @@ class GrvtAdapter(BaseExchange):
                             'exchange': self.name,
                             'symbol': symbol_base,
                             'bid': float(bids[0]['price']),
+                            'bid_volume': float(bids[0]['size']),
                             'ask': float(asks[0]['price']),
+                            'ask_volume': float(asks[0]['size']),
                             'ts': int(time.time() * 1000)
                         }
                         tick_queue.put_nowait(tick)
