@@ -20,13 +20,18 @@ class Config:
     # ==========================
     # 差价对冲策略 (Strategy Config)
     # ==========================
-    # 1. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
+    # 1. 定义参与套利的两个交易所名称 (对应 Adapter 的 name) [NEW]
+    # 允许通过环境变量动态切换，例如 A=Binance, B=GRVT
+    SPREAD_EXCHANGE_A = os.getenv("SPREAD_EXCHANGE_A", "Lighter")
+    SPREAD_EXCHANGE_B = os.getenv("SPREAD_EXCHANGE_B", "GRVT")
+
+    # 2. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
     SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.002"))
 
-    # 2. 交易冷却时间 (秒)，防止频繁开单
+    # 3. 交易冷却时间 (秒)，防止频繁开单
     TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "2.0"))
 
-    # 3. 单次下单数量配置 (JSON格式)
+    # 4. 单次下单数量配置 (JSON格式)
     _default_quantities = {"SOL": 0.01, "DEFAULT": 0.0001}
     try:
         _env_qty = os.getenv("TRADE_QUANTITIES")
@@ -39,35 +44,26 @@ class Config:
     # 刷量策略参数 (Volume Farming Config)
     # ==========================
     # 允许的最大价差亏损 (滑点容忍度)
-    # 例如 -0.0005 代表允许亏损 0.05% 去换取成交 (前提是 Rebate > 0.05%)
-    # 正数表示必须要盈利才开单，负数表示愿意支付的成本
     MAX_SLIPPAGE_TOLERANCE = float(os.getenv("MAX_SLIPPAGE_TOLERANCE", "-0.0005"))
 
-    # 重挂单阈值: 当目标价格与当前挂单价格偏差超过此比例时，撤单重挂
+    # 重挂单阈值
     REQUOTE_THRESHOLD = float(os.getenv("REQUOTE_THRESHOLD", "0.0005"))
 
     FARM_SIDE = os.getenv("FARM_SIDE", "BUY").upper()
-    #连续失败熔断阈值
-    # 如果连续 3 次对冲失败（Lighter下单报错），则触发熔断停止策略
     MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "3"))
 
     # ==========================
-    # 🆕 库存刷量策略专用配置 (Inventory Farm Config)
+    # 库存刷量策略专用配置 (Inventory Farm Config)
     # ==========================
-    # 最大持仓价值 (USD)，超过此值触发平仓
     MAX_INVENTORY_USD = float(os.getenv("MAX_INVENTORY_USD", "800.0"))
-
-    # 挂单层数 (例如 3 表示同时挂买1, 买2, 买3)
     INVENTORY_LAYERS = int(os.getenv("INVENTORY_LAYERS", "3"))
-
-    # 层间距 (Tick倍数)
     INVENTORY_LAYER_SPREAD = int(os.getenv("INVENTORY_LAYER_SPREAD", "1"))
 
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
     GRVT_TRADING_ACCOUNT_ID = os.getenv("GRVT_TRADING_ACCOUNT_ID")
-    GRVT_ENV = os.getenv("GRVT_ENVIRONMENT", "prod")  # prod / testnet
+    GRVT_ENV = os.getenv("GRVT_ENVIRONMENT", "prod")
 
     # --- Lighter 配置 ---
     LIGHTER_API_KEY = os.getenv("LIGHTER_API_KEY")

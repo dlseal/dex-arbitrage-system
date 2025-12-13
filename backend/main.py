@@ -87,6 +87,7 @@ async def main():
 
     # 3. 初始化策略 & 启动引擎
     adapters_map = {ex.name: ex for ex in adapters}
+    strategy = None
 
     # 根据配置选择策略
     if Config.STRATEGY_TYPE == "GL_FARM":
@@ -96,8 +97,21 @@ async def main():
         logger.info("🏭 启动模式: GRVT 库存累积刷量 (小资金专用)")
         strategy = GrvtInventoryFarmStrategy(adapters_map)
     else:
-        logger.info("⚖️ 启动模式: 价差套利 (Spread Arb)")
-        strategy = SpreadArbitrageStrategy(adapters_map)
+        # === 优化点：注入配置的交易所名称 ===
+        logger.info(f"⚖️ 启动模式: 通用价差套利 (Spread Arb)")
+        logger.info(f"   👉 交易所 A: {Config.SPREAD_EXCHANGE_A}")
+        logger.info(f"   👉 交易所 B: {Config.SPREAD_EXCHANGE_B}")
+
+        strategy = SpreadArbitrageStrategy(
+            adapters=adapters_map,
+            exchange_a=Config.SPREAD_EXCHANGE_A,
+            exchange_b=Config.SPREAD_EXCHANGE_B
+        )
+
+    # 确保策略初始化成功
+    if hasattr(strategy, 'is_active') and not strategy.is_active:
+        logger.error("❌ 策略初始化失败，正在退出...")
+        return
 
     # 将策略注入引擎
     engine = EventEngine(exchanges=adapters, strategy=strategy)
@@ -126,8 +140,14 @@ async def main():
         for ex in adapters:
             try:
                 # 简单测试获取 BTC 价格
-                ticker = await ex.fetch_orderbook("BTC-USDT")
-                logging.info(f"{ex.name:<15} | {ticker['symbol']:<15} | {ticker['bid']:<15} | {ticker['ask']:<15}")
+                # 注意：这里保持简单，因为不同 Adapter 可能对 Symbol 要求不同，但通常 BTC 都是支持的
+                ticker = await ex.fetch_orderbook("BTC")
+                # 若 Adapter 返回空，可能是 Symbol 格式问题，但在初始化连接测试中仅做展示
+                if not ticker:
+                    logging.info(f"{ex.name:<15} | {'BTC(N/A)':<15} | {'-':<15} | {'-':<15}")
+                else:
+                    logging.info(
+                        f"{ex.name:<15} | {ticker.get('symbol', '?'):<15} | {ticker.get('bid', 0):<15} | {ticker.get('ask', 0):<15}")
             except Exception as e:
                 logging.info(f"{ex.name:<15} | {'ERROR':<15} | {str(e):<30}")
         logging.info("=" * 50 + "\n")
