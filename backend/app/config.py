@@ -59,6 +59,36 @@ class Config:
     INVENTORY_LAYERS = int(os.getenv("INVENTORY_LAYERS", "3"))
     INVENTORY_LAYER_SPREAD = int(os.getenv("INVENTORY_LAYER_SPREAD", "1"))
 
+    # ==========================
+    # HFT 做市策略配置 (AS + OFI)
+    # ==========================
+    # 目标交易所 (填写 Adapter 的 name，如 "GRVT" 或 "Lighter")
+    HFT_EXCHANGE = os.getenv("HFT_EXCHANGE", "GRVT")
+
+    # AS模型参数: 风险厌恶系数 (Gamma)
+    # 值越大，持仓时对价格的偏移越激进（越急于平仓）
+    HFT_RISK_AVERSION = float(os.getenv("HFT_RISK_AVERSION", "0.1"))
+
+    # 信号参数: OFI 敏感度 (Alpha)
+    # OFI 每增加 1 单位，价格预测偏移多少个 Tick
+    HFT_OFI_SENSITIVITY = float(os.getenv("HFT_OFI_SENSITIVITY", "0.5"))
+
+    # 波动率因子 (k的替代方案)
+    # Spread = MinSpread + VolFactor * Sigma
+    HFT_VOLATILITY_FACTOR = float(os.getenv("HFT_VOLATILITY_FACTOR", "0.8"))
+
+    # 统计窗口大小 (用于计算 OFI 均值和波动率)
+    HFT_WINDOW_SIZE = int(os.getenv("HFT_WINDOW_SIZE", "100"))
+
+    # 最小做市价差 (以 Tick 为单位，例如 2 ticks)
+    HFT_MIN_SPREAD_TICKS = int(os.getenv("HFT_MIN_SPREAD_TICKS", "2"))
+
+    # 报价更新阈值 (防抖动：只有新价格偏离当前订单 > N 个 Tick 才改单)
+    HFT_UPDATE_THRESHOLD_TICKS = int(os.getenv("HFT_UPDATE_THRESHOLD_TICKS", "1"))
+
+    # 最大单边持仓限制 (USD)，超过此值触发强制平仓或停止开仓
+    HFT_MAX_POS_USD = float(os.getenv("HFT_MAX_POS_USD", "50000.0"))
+
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")

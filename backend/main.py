@@ -23,6 +23,8 @@ from app.core.engine import EventEngine
 from app.strategies.spread_arb import SpreadArbitrageStrategy
 from app.strategies.grvt_lighter_farm import GrvtLighterFarmStrategy
 from app.strategies.grvt_inventory_farm import GrvtInventoryFarmStrategy
+# [新增] HFT 策略导入
+from app.strategies.hft_market_making import HFTMarketMakingStrategy
 
 # 配置日志格式
 logging.basicConfig(
@@ -49,11 +51,36 @@ async def main():
         logger.error(str(e))
         return
 
-    # 2. 实例化交易所适配器
+    # 2. 确定需要的交易所 (按需加载逻辑)
+    # ==========================================
+    required_exchanges = set()
+
+    if Config.STRATEGY_TYPE == "HFT_MM":
+        # HFT 模式：只加载指定的单一家交易所 (由 .env 中 HFT_EXCHANGE 决定)
+        required_exchanges.add(Config.HFT_EXCHANGE)
+
+    elif Config.STRATEGY_TYPE == "GL_FARM":
+        # GRVT-Lighter 刷量模式：必须加载两者
+        required_exchanges.add("GRVT")
+        required_exchanges.add("Lighter")
+
+    elif Config.STRATEGY_TYPE == "GL_INVENTORY":
+        # GRVT 库存模式：只加载 GRVT
+        required_exchanges.add("GRVT")
+
+    else:
+        # 默认为 Spread Arb 模式：加载配置的 A 和 B
+        required_exchanges.add(Config.SPREAD_EXCHANGE_A)
+        required_exchanges.add(Config.SPREAD_EXCHANGE_B)
+
+    logger.info(f"📋 当前策略 ({Config.STRATEGY_TYPE}) 需要加载的交易所: {required_exchanges}")
+
+    # 3. 实例化交易所适配器
+    # ==========================================
     adapters: List[BaseExchange] = []
 
-    # --- 初始化 GRVT ---
-    if Config.GRVT_API_KEY:
+    # --- 初始化 GRVT (仅当需要时) ---
+    if "GRVT" in required_exchanges and Config.GRVT_API_KEY:
         try:
             grvt = GrvtAdapter(
                 api_key=Config.GRVT_API_KEY,
@@ -66,8 +93,8 @@ async def main():
         except Exception as e:
             logger.error(f"无法加载 GRVT Adapter: {e}")
 
-    # --- 初始化 Lighter ---
-    if Config.LIGHTER_API_KEY:
+    # --- 初始化 Lighter (仅当需要时) ---
+    if "Lighter" in required_exchanges and Config.LIGHTER_API_KEY:
         try:
             lighter = LighterAdapter(
                 api_key=Config.LIGHTER_API_KEY,
@@ -82,22 +109,28 @@ async def main():
             logger.error(f"无法加载 Lighter Adapter: {e}")
 
     if not adapters:
-        logger.error("❌ 没有可用的交易所适配器，系统退出。请检查 .env 配置。")
+        logger.error(f"❌ 没有加载任何适配器！请检查 .env 配置或 STRATEGY_TYPE。")
         return
 
-    # 3. 初始化策略 & 启动引擎
+    # 4. 初始化策略 & 启动引擎
     adapters_map = {ex.name: ex for ex in adapters}
     strategy = None
 
     # 根据配置选择策略
-    if Config.STRATEGY_TYPE == "GL_FARM":
+    if Config.STRATEGY_TYPE == "HFT_MM":
+        logger.info("⚡️ 启动模式: HFT Market Making (AS + OFI)")
+        strategy = HFTMarketMakingStrategy(adapters_map)
+
+    elif Config.STRATEGY_TYPE == "GL_FARM":
         logger.info("🚜 启动模式: GRVT(Maker) + Lighter(Taker) 刷量策略")
         strategy = GrvtLighterFarmStrategy(adapters_map)
+
     elif Config.STRATEGY_TYPE == "GL_INVENTORY":
         logger.info("🏭 启动模式: GRVT 库存累积刷量 (小资金专用)")
         strategy = GrvtInventoryFarmStrategy(adapters_map)
+
     else:
-        # === 优化点：注入配置的交易所名称 ===
+        # 通用价差套利 (Spread Arb)
         logger.info(f"⚖️ 启动模式: 通用价差套利 (Spread Arb)")
         logger.info(f"   👉 交易所 A: {Config.SPREAD_EXCHANGE_A}")
         logger.info(f"   👉 交易所 B: {Config.SPREAD_EXCHANGE_B}")
@@ -125,7 +158,7 @@ async def main():
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # 4. 执行初始化测试 (Connectivity Check)
+    # 5. 执行初始化测试 (Connectivity Check)
     logger.info("🔌 正在连接交易所并同步状态...")
     try:
         # 并发执行所有交易所的 initialize 方法
@@ -139,12 +172,12 @@ async def main():
 
         for ex in adapters:
             try:
-                # 简单测试获取 BTC 价格
-                # 注意：这里保持简单，因为不同 Adapter 可能对 Symbol 要求不同，但通常 BTC 都是支持的
-                ticker = await ex.fetch_orderbook("BTC")
-                # 若 Adapter 返回空，可能是 Symbol 格式问题，但在初始化连接测试中仅做展示
+                # 简单测试获取第一个目标币种的价格
+                target_sym = Config.TARGET_SYMBOLS[0] if Config.TARGET_SYMBOLS else "BTC"
+                ticker = await ex.fetch_orderbook(target_sym)
+
                 if not ticker:
-                    logging.info(f"{ex.name:<15} | {'BTC(N/A)':<15} | {'-':<15} | {'-':<15}")
+                    logging.info(f"{ex.name:<15} | {target_sym + '(N/A)':<15} | {'-':<15} | {'-':<15}")
                 else:
                     logging.info(
                         f"{ex.name:<15} | {ticker.get('symbol', '?'):<15} | {ticker.get('bid', 0):<15} | {ticker.get('ask', 0):<15}")
@@ -156,7 +189,7 @@ async def main():
         logger.error(f"❌ 初始化过程中发生严重错误: {e}")
         return
 
-    # 5. 进入主事件循环
+    # 6. 进入主事件循环
     logger.info("📡 启动 WebSocket 数据流监听...")
     await engine.start()
 
