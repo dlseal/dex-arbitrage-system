@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import logging
+import random
 import websockets
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional, List, Any
@@ -178,6 +179,7 @@ class LighterAdapter(BaseExchange):
         self.api_client = None
         self.market_config = {}
         self.managers = []
+        self._order_seq = 0
 
     async def initialize(self):
         try:
@@ -280,7 +282,10 @@ class LighterAdapter(BaseExchange):
             return None
 
         is_ask = True if side.lower() == 'sell' else False
-        client_order_index = int(time.time() * 1000) % 2147483647
+        self._order_seq = (self._order_seq + 1) % 1000
+        # 组合策略：时间戳(毫秒) + 3位序列号 (避免同1毫秒重复)
+        ts_part = int(time.time() * 1000) & 0xFFFFFF  # 截断一些高位以留空间
+        client_order_index = (ts_part << 10) | self._order_seq
 
         try:
             if order_type == "MARKET":
@@ -288,14 +293,14 @@ class LighterAdapter(BaseExchange):
                     self.client.create_market_order(
                         market_index=info['id'], client_order_index=client_order_index,
                         base_amount=amount_int, avg_execution_price=price_int, is_ask=is_ask
-                    ), timeout=5.0)
+                    ), timeout=1.0)
             else:
                 res, tx_hash, err = await asyncio.wait_for(
                     self.client.create_limit_order(
                         market_index=info['id'], client_order_index=client_order_index,
                         base_amount=amount_int, price=price_int, is_ask=is_ask,
                         time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-                    ), timeout=5.0)
+                    ), timeout=1.0)
 
             if err:
                 logging.error(f"❌ [Lighter] Order Error: {err}")

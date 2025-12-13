@@ -37,6 +37,7 @@ class GrvtAdapter(BaseExchange):
         self.ws_client: Optional[GrvtCcxtWS] = None
         self.contract_map = {}
         self.last_ws_msg_time = 0.0
+        self._order_seq = 0
 
     async def initialize(self):
         retry_count = 5
@@ -173,7 +174,10 @@ class GrvtAdapter(BaseExchange):
             logger.error(f"❌ [GRVT] Precision Math Error: {e}")
             return None
 
-        client_order_id = int(time.time() * 1000) & 0xFFFFFFFF
+        self._order_seq = (self._order_seq + 1) % 1000
+        # 组合策略：时间戳(毫秒) + 3位序列号 (避免同1毫秒重复)
+        ts_part = int(time.time() * 1000) & 0xFFFFFF  # 截断一些高位以留空间
+        client_order_id = (ts_part << 10) | self._order_seq
         safe_side = side.lower()
 
         # 基础参数
@@ -209,7 +213,7 @@ class GrvtAdapter(BaseExchange):
                         amount=qty_float,
                         price=None,
                         params=req_params
-                    ), timeout=5.0)
+                    ), timeout=1.0)
             else:
                 await asyncio.wait_for(
                     self.ws_client.create_limit_order(
@@ -218,7 +222,7 @@ class GrvtAdapter(BaseExchange):
                         amount=qty_float,
                         price=px_float,
                         params=req_params
-                    ), timeout=5.0)
+                    ), timeout=1.0)
 
             return str(client_order_id)
 

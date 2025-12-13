@@ -142,16 +142,21 @@ class HFTMarketMakingStrategy:
                         self.is_active = False
 
     async def _process_tick(self, tick: dict):
+        """
+        处理 Tick 数据的主逻辑
+        包含：延迟检查 -> 数据提取 -> 🚨硬止损检查 -> 信号计算 -> 挂单执行
+        """
         current_ts = time.time()
         tick_ts = tick.get('ts', 0) / 1000.0
 
-        # --- A. 延迟熔断 ---
+        # --- A. 延迟熔断 (Latency Guard) ---
+        # 如果数据延迟超过 800ms，视为不新鲜，存在套利风险
         latency = current_ts - tick_ts
-        if latency > 0.8:  # 放宽一点点以适应网络抖动，但不能太大
+        if latency > 0.8:
             if latency > 3.0: logger.warning(f"⚠️ [High Latency] {latency * 1000:.0f}ms. Skipping.")
             return
 
-        # 初始化 Tick Size (仅一次)
+        # 初始化 Tick Size (仅运行一次)
         if self.tick_size == 0.01:
             await self._update_contract_info()
 
@@ -159,75 +164,119 @@ class HFTMarketMakingStrategy:
         bid_p = tick['bid']
         ask_p = tick['ask']
 
-        # --- B. 增强型 Volume 提取 (针对 Lighter/GRVT) ---
+        # --- B. 增强型 Volume 提取 (兼容不同 Adapter 格式) ---
         bid_v = 1.0
         ask_v = 1.0
 
-        # 优先尝试从深度数据获取真实 Volume (Lighter Adapter 已经支持)
+        # 1. 尝试从深度快照提取 (Lighter Adapter 格式)
         if 'bids_depth' in tick and tick['bids_depth']:
             try:
                 bid_v = float(tick['bids_depth'][0][1])
             except:
                 pass
-
         if 'asks_depth' in tick and tick['asks_depth']:
             try:
                 ask_v = float(tick['asks_depth'][0][1])
             except:
                 pass
 
-        # 如果 Adapter 提供了直接的 volume 字段 (需要修改 GRVT Adapter)
+        # 2. 尝试从字段提取 (GRVT Adapter 修改后格式)
         if 'bid_volume' in tick: bid_v = float(tick['bid_volume'])
         if 'ask_volume' in tick: ask_v = float(tick['ask_volume'])
 
         mid_price = (bid_p + ask_p) / 2.0
         self.mid_price_stats.update(mid_price)
 
-        # --- C. 计算 OFI ---
+        # =========================================================
+        # 🚨 [新增功能] 硬止损 (Hard Bailout / Emergency Stop)
+        # =========================================================
+        # 设定熔断阈值为最大持仓限制的 2 倍
+        # 例如：最大持仓 $1000，如果因单边行情持仓堆积到 $2000，立即市价跑路
+        bailout_threshold = self.max_pos_usd * 2.0
+        current_pos_value = self.inventory * mid_price
+
+        # 情况1: 多头爆仓 (库存积压，价格暴跌，需市价卖出)
+        if current_pos_value > bailout_threshold:
+            logger.critical(
+                f"🚨 [BAILOUT] 多头严重超限! Val:${current_pos_value:.0f} > Lim:${bailout_threshold:.0f} -> 触发市价清仓!")
+
+            # 1. 标记方向锁，防止后续逻辑或其他线程干扰
+            self.pending_actions['SELL'] = True
+
+            # 2. 发送市价卖单 (Market Sell)
+            # 注意：使用 asyncio.create_task 异步发送，确保不阻塞
+            asyncio.create_task(self.adapters[self.exchange_name].create_order(
+                symbol=self.symbol,
+                side='SELL',
+                amount=abs(self.inventory),
+                order_type='MARKET'
+            ))
+
+            # 3. ⛔ 立即返回，跳过后续所有 AS 计算和挂单逻辑
+            return
+
+            # 情况2: 空头爆仓 (持有大量空单，价格暴涨，需市价买回)
+        elif current_pos_value < -bailout_threshold:
+            logger.critical(
+                f"🚨 [BAILOUT] 空头严重超限! Val:${current_pos_value:.0f} < -${bailout_threshold:.0f} -> 触发市价清仓!")
+
+            self.pending_actions['BUY'] = True
+
+            asyncio.create_task(self.adapters[self.exchange_name].create_order(
+                symbol=self.symbol,
+                side='BUY',
+                amount=abs(self.inventory),
+                order_type='MARKET'
+            ))
+            return
+            # =========================================================
+
+        # --- C. 计算 OFI (Order Flow Imbalance) ---
         ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
         self.ofi_window.append(ofi)
         avg_ofi = sum(self.ofi_window) / max(1, len(self.ofi_window))
 
-        # --- D. Avellaneda-Stoikov 模型 ---
+        # --- D. Avellaneda-Stoikov 模型计算 ---
         volatility = self.mid_price_stats.get_std_dev()
-        if volatility <= 0: volatility = mid_price * 0.0001  # 避免除零或零宽
+        # 防止波动率为0导致Spread消失
+        if volatility <= 0: volatility = mid_price * 0.0001
 
-        # 1. 保留价格 (Reservation Price)
-        # r(s, q, t) = s - q * gamma * sigma^2 + alpha * OFI
+        # 1. 计算保留价格 (Reservation Price)
+        # 考虑库存风险 (inv_risk) 和 OFI 信号冲击 (ofi_impact)
         inv_risk = self.inventory * self.risk_aversion * (volatility ** 2)
         ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
 
         reservation_price = mid_price + ofi_impact - inv_risk
 
-        # 2. 报价 Spread
-        # half_spread = (min_spread) + (gamma * sigma)
+        # 2. 计算最优 Spread
         half_spread = (self.min_spread_ticks * self.tick_size) + (self.volatility_factor * volatility)
 
         raw_bid = reservation_price - half_spread
         raw_ask = reservation_price + half_spread
 
-        # --- E. 风控修剪与量化 ---
-        # 1. 价格防倒挂
+        # --- E. 价格修剪与量化 (Sanity Check) ---
+        # 1. 防倒挂：Maker 买价不能高于市场卖一，卖价不能低于市场买一
         raw_bid = min(raw_bid, ask_p - self.tick_size)
         raw_ask = max(raw_ask, bid_p + self.tick_size)
 
-        # 2. 严格量化 (Decimal)
+        # 2. 精度对齐：使用 Decimal 工具类量化价格
         target_bid = self.quantizer.quantize(raw_bid, rounding=ROUND_FLOOR)
         target_ask = self.quantizer.quantize(raw_ask, rounding=ROUND_CEILING)
 
-        # 3. 最小价差保护 (防止自己和自己成交)
+        # 3. 最小价差保护：防止 Ask <= Bid
         if target_ask - target_bid < self.tick_size:
             target_ask = target_bid + self.tick_size
 
-        # 4. 最大持仓保护
+        # 4. 正常持仓限制 (Soft Limit)
+        # 如果未触发硬止损，但超过正常 MaxPos，则只允许平仓方向挂单
         pos_value = self.inventory * mid_price
         allow_buy = pos_value < self.max_pos_usd
         allow_sell = pos_value > -self.max_pos_usd
 
-        # --- F. 执行逻辑 ---
+        # --- F. 执行挂单 ---
         await self._execute_quotes(target_bid, target_ask, allow_buy, allow_sell)
 
-        # 定期同步准确持仓 (15s)
+        # 定期同步持仓 (每15秒)
         if current_ts - self.pos_sync_time > 15.0:
             asyncio.create_task(self._sync_position())
             self.pos_sync_time = current_ts
