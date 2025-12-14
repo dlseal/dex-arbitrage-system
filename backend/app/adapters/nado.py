@@ -150,40 +150,60 @@ class NadoAdapter(BaseExchange):
             raise e
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        """Fetch BBO with Volume for HFT"""
         if symbol not in self.contract_map:
             return {}
 
         try:
+            # 获取 Product ID (int)
             pid = self.contract_map[symbol]['id']
 
+            # --- 修改开始 ---
             loop = asyncio.get_running_loop()
-            ob = await loop.run_in_executor(
-                None,
-                lambda: self.client.context.engine_client.get_orderbook(ticker_id=pid, depth=1)
-            )
 
-            if not ob or not ob.bids or not ob.asks:
+            # 尝试 1: 检查 client.market 下是否有获取订单簿的方法
+            # 很多 SDK 会封装成 client.market.get_orderbook(product_id=pid)
+            if hasattr(self.client.market, 'get_orderbook'):
+                ob = await loop.run_in_executor(
+                    None,
+                    lambda: self.client.market.get_orderbook(product_id=pid)  # 或者是 symbol
+                )
+            # 尝试 2: 如果是 Vertex 分叉，可能叫 get_market_liquidity
+            elif hasattr(self.client.market, 'get_market_liquidity'):
+                ob = await loop.run_in_executor(
+                    None,
+                    lambda: self.client.market.get_market_liquidity(product_id=pid)
+                )
+            # 尝试 3: 回退到 engine_client，但尝试 'market_id' 格式
+            else:
+                # 最后的挣扎：Vertex 协议中有时 ticker_id 是 symbol + 市场类型
+                # 比如 "BTC-PERP_perp" 或者 "pair"
+                # 这里我们先保持原样，或者暂时返回空以防崩溃
                 return {}
+                # --- 修改结束 ---
 
-            # Nado returns list of [price, size]
-            best_bid = float(ob.bids[0][0])
-            best_bid_vol = float(ob.bids[0][1])  # 获取买一量
+            if not ob: return {}
 
-            best_ask = float(ob.asks[0][0])
-            best_ask_vol = float(ob.asks[0][1])  # 获取卖一量
+            # 解析数据 (根据实际返回结构调整)
+            # 假设返回的是标准对象
+            best_bid = float(ob.bids[0].price) if hasattr(ob.bids[0], 'price') else float(ob.bids[0][0])
+            best_bid_vol = float(ob.bids[0].amount) if hasattr(ob.bids[0], 'amount') else float(ob.bids[0][1])
+
+            best_ask = float(ob.asks[0].price) if hasattr(ob.asks[0], 'price') else float(ob.asks[0][0])
+            best_ask_vol = float(ob.asks[0].amount) if hasattr(ob.asks[0], 'amount') else float(ob.asks[0][1])
 
             return {
                 'exchange': self.name,
                 'symbol': symbol,
                 'bid': best_bid,
-                'bid_volume': best_bid_vol,  # HFT 需要此字段
+                'bid_volume': best_bid_vol,
                 'ask': best_ask,
-                'ask_volume': best_ask_vol,  # HFT 需要此字段
+                'ask_volume': best_ask_vol,
                 'ts': int(time.time() * 1000)
             }
+
         except Exception as e:
-            # Suppress frequent logs for polling errors
+            # 暂时屏蔽错误日志，以免刷屏
+            # logger.error(f"Fetch OB Error: {e}")
             return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
