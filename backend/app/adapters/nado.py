@@ -5,6 +5,7 @@ import time
 import traceback
 from decimal import Decimal
 from typing import Dict, Optional, List, Any
+from cryptography.fernet import Fernet
 
 # --- Nado Protocol Imports ---
 try:
@@ -27,10 +28,27 @@ logger = logging.getLogger("NadoAdapter")
 
 
 class NadoAdapter(BaseExchange):
-    def __init__(self, private_key: str, mode: str = "MAINNET", subaccount_name: str = "default",
+    def __init__(self, private_key: str = None, mode: str = "MAINNET", subaccount_name: str = "default",
                  symbols: List[str] = None):
         super().__init__("Nado")
-        self.private_key = private_key
+
+        # 1. 优先尝试解密
+        encrypted_key = os.getenv('ENCRYPTED_NADO_KEY')
+        master_key = os.getenv('MASTER_KEY')
+
+        if encrypted_key and master_key:
+            try:
+                cipher = Fernet(master_key.encode())
+                # 解密得到原始私钥字符串
+                self.private_key = cipher.decrypt(encrypted_key.encode()).decode()
+                logger.info("🔓 私钥解密成功")
+            except Exception as e:
+                logger.error(f"❌ 私钥解密失败: {e} (请检查 Master Key 是否正确)")
+                # 解密失败不仅要报错，还应该阻止程序继续运行，防止用空密钥发单
+                raise ValueError("Invalid Master Key")
+        else:
+            # 2. 回退到明文读取 仅开发使用
+            self.private_key = private_key or os.getenv("NADO_PRIVATE_KEY")
         self.mode_str = mode.upper()
         self.subaccount_name = subaccount_name
         self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
@@ -132,7 +150,7 @@ class NadoAdapter(BaseExchange):
             raise e
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
-        """Fetch BBO using get_orderbook(depth=1)"""
+        """Fetch BBO with Volume for HFT"""
         if symbol not in self.contract_map:
             return {}
 
@@ -150,13 +168,18 @@ class NadoAdapter(BaseExchange):
 
             # Nado returns list of [price, size]
             best_bid = float(ob.bids[0][0])
+            best_bid_vol = float(ob.bids[0][1])  # 获取买一量
+
             best_ask = float(ob.asks[0][0])
+            best_ask_vol = float(ob.asks[0][1])  # 获取卖一量
 
             return {
                 'exchange': self.name,
                 'symbol': symbol,
                 'bid': best_bid,
+                'bid_volume': best_bid_vol,  # HFT 需要此字段
                 'ask': best_ask,
+                'ask_volume': best_ask_vol,  # HFT 需要此字段
                 'ts': int(time.time() * 1000)
             }
         except Exception as e:

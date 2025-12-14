@@ -2,17 +2,22 @@ python-dotenv>=1.0.0
 pytz>=2025.2
 aiohttp>=3.8.0
 websocket-client>=1.6.0
-pydantic>=1.10.0,<2.0.0
+# 升级 Pydantic 到 v2
+pydantic>=2.0.0
 pycryptodome>=3.15.0
 ecdsa>=0.17.0
 requests==2.32.5
 eval_type_backport
 tenacity>=9.1.2
 
-# 强制限制 Web3 相关库以兼容 Pydantic V1
-web3<7.0.0
-eth-account<0.14.0
-eth-utils<5.0.0
+# 升级 Web3 相关库以兼容 Pydantic v2
+web3>=7.0.0
+eth-account>=0.13.4
+# 移除旧的 eth-utils<5.0.0 限制，因为 Web3 v7 需要新版
+eth-utils>=2.0.0
 
 # Nado SDK
-git+https://github.com/your-quantguy/nado-python-sdk.git@7728e97dd030cf744f08afdc0637f7e63b7527e3
+nado-protocol>=0.2.8
+
+# 私钥加密
+cryptography>=46.0.3

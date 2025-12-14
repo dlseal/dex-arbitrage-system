@@ -4,6 +4,7 @@ import signal
 import sys
 import os
 from typing import List
+import getpass
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,6 +44,27 @@ logger = logging.getLogger("Main")
 
 async def main():
     logger.info(f"🚀 正在启动 DEX 对冲套利系统... (运行目录: {current_dir})")
+    if os.getenv("ENCRYPTED_NADO_KEY") and not os.getenv("MASTER_KEY"):
+        print("\n" + "=" * 50)
+        print("🔐 安全启动模式")
+        print("检测到 'ENCRYPTED_NADO_KEY'，请输入解密主密钥。")
+        print("（输入内容将隐藏，完成后按回车）")
+        print("=" * 50)
+
+        try:
+            # getpass 让输入在终端不可见
+            master_input = getpass.getpass("🔑 Master Key > ")
+            if not master_input:
+                logger.error("❌ 未输入密钥，系统退出。")
+                return
+
+            # 将输入的密钥临时写入环境变量（仅当前进程有效，不会存盘）
+            os.environ["MASTER_KEY"] = master_input.strip()
+            logger.info("✅ 主密钥已加载至内存")
+
+        except KeyboardInterrupt:
+            print("\n已取消")
+            return
 
     # 1. 验证配置
     try:
@@ -118,7 +140,6 @@ async def main():
             logger.info("📦 Nado Adapter 已加载")
         except Exception as e:
             logger.error(f"无法加载 Nado Adapter: {e}")
-
 
     if not adapters:
         logger.error(f"❌ 没有加载任何适配器！请检查 .env 配置或 STRATEGY_TYPE。")
