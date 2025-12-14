@@ -44,7 +44,6 @@ class NadoAdapter(BaseExchange):
                 logger.info("🔓 私钥解密成功")
             except Exception as e:
                 logger.error(f"❌ 私钥解密失败: {e} (请检查 Master Key 是否正确)")
-                # 解密失败不仅要报错，还应该阻止程序继续运行，防止用空密钥发单
                 raise ValueError("Invalid Master Key")
         else:
             # 2. 回退到明文读取 仅开发使用
@@ -97,10 +96,7 @@ class NadoAdapter(BaseExchange):
     async def _load_markets(self):
         """Fetch Contract Attributes (IDs, Tick Sizes)"""
         try:
-            # Get all symbols and markets
-            # Note: Assuming SDK methods are synchronous, wrapping them might be needed if they block
             loop = asyncio.get_running_loop()
-
             symbols_map = await loop.run_in_executor(None, self.client.market.get_all_product_symbols)
             all_markets = await loop.run_in_executor(None, self.client.market.get_all_engine_markets)
             perp_products = all_markets.perp_products
@@ -154,42 +150,47 @@ class NadoAdapter(BaseExchange):
             return {}
 
         try:
-            # 获取 Product ID (int)
             pid = self.contract_map[symbol]['id']
-
-            # --- 修改开始 ---
             loop = asyncio.get_running_loop()
 
-            # 尝试 1: 检查 client.market 下是否有获取订单簿的方法
-            # 很多 SDK 会封装成 client.market.get_orderbook(product_id=pid)
+            # --- [修复 1] 添加 depth 参数 ---
             if hasattr(self.client.market, 'get_orderbook'):
                 ob = await loop.run_in_executor(
                     None,
-                    lambda: self.client.market.get_orderbook(product_id=pid)  # 或者是 symbol
+                    lambda: self.client.market.get_orderbook(product_id=pid)
                 )
-            # 尝试 2: 如果是 Vertex 分叉，可能叫 get_market_liquidity
             elif hasattr(self.client.market, 'get_market_liquidity'):
                 ob = await loop.run_in_executor(
                     None,
-                    lambda: self.client.market.get_market_liquidity(product_id=pid)
+                    lambda: self.client.market.get_market_liquidity(product_id=pid, depth=10)
                 )
-            # 尝试 3: 回退到 engine_client，但尝试 'market_id' 格式
             else:
-                # 最后的挣扎：Vertex 协议中有时 ticker_id 是 symbol + 市场类型
-                # 比如 "BTC-PERP_perp" 或者 "pair"
-                # 这里我们先保持原样，或者暂时返回空以防崩溃
                 return {}
-                # --- 修改结束 ---
 
             if not ob: return {}
 
-            # 解析数据 (根据实际返回结构调整)
-            # 假设返回的是标准对象
-            best_bid = float(ob.bids[0].price) if hasattr(ob.bids[0], 'price') else float(ob.bids[0][0])
-            best_bid_vol = float(ob.bids[0].amount) if hasattr(ob.bids[0], 'amount') else float(ob.bids[0][1])
+            # --- [修复 2] 解析时除以 1e18 (x18 -> Float) ---
+            best_bid = 0.0
+            best_bid_vol = 0.0
+            if hasattr(ob, 'bids') and len(ob.bids) > 0:
+                bid_item = ob.bids[0]
+                if hasattr(bid_item, 'price'):
+                    best_bid = float(bid_item.price) / 1e18
+                    best_bid_vol = float(bid_item.amount) / 1e18
+                else:
+                    best_bid = float(bid_item[0]) / 1e18
+                    best_bid_vol = float(bid_item[1]) / 1e18
 
-            best_ask = float(ob.asks[0].price) if hasattr(ob.asks[0], 'price') else float(ob.asks[0][0])
-            best_ask_vol = float(ob.asks[0].amount) if hasattr(ob.asks[0], 'amount') else float(ob.asks[0][1])
+            best_ask = 0.0
+            best_ask_vol = 0.0
+            if hasattr(ob, 'asks') and len(ob.asks) > 0:
+                ask_item = ob.asks[0]
+                if hasattr(ask_item, 'price'):
+                    best_ask = float(ask_item.price) / 1e18
+                    best_ask_vol = float(ask_item.amount) / 1e18
+                else:
+                    best_ask = float(ask_item[0]) / 1e18
+                    best_ask_vol = float(ask_item[1]) / 1e18
 
             return {
                 'exchange': self.name,
@@ -202,15 +203,11 @@ class NadoAdapter(BaseExchange):
             }
 
         except Exception as e:
-            # 暂时屏蔽错误日志，以免刷屏
-            # logger.error(f"Fetch OB Error: {e}")
+            logger.error(f"Fetch OB Error: {e}")
             return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                            order_type: str = "LIMIT", params: Dict = None) -> Optional[str]:
-        """
-        Place Order using Nado SDK OrderParams
-        """
         if symbol not in self.contract_map:
             logger.error(f"❌ [Nado] Unknown symbol: {symbol}")
             return None
@@ -219,34 +216,23 @@ class NadoAdapter(BaseExchange):
         pid = market_info['id']
         tick_size = market_info['tick_size']
 
-        # 1. Price Logic
         final_price = 0.0
         if price:
             d_price = Decimal(str(price))
             d_tick = Decimal(str(tick_size))
             final_price = float((d_price / d_tick).quantize(Decimal("1")) * d_tick)
         else:
-            # If Market order (price=None), we need to fetch BBO to set a marketable limit price
-            # or rely on SDK market order if supported. Here we simulate market with aggressive limit.
             bbo = await self.fetch_orderbook(symbol)
             if not bbo:
                 logger.error("❌ [Nado] Cannot place market order: Orderbook unavailable")
                 return None
+            final_price = bbo['ask'] * 1.05 if side.upper() == 'BUY' else bbo['bid'] * 0.95
 
-            if side.upper() == 'BUY':
-                final_price = bbo['ask'] * 1.05
-            else:
-                final_price = bbo['bid'] * 0.95
-
-            # Re-quantize
             d_price = Decimal(str(final_price))
             d_tick = Decimal(str(tick_size))
             final_price = float((d_price / d_tick).quantize(Decimal("1")) * d_tick)
 
-        # 2. Params Construction
         is_buy = (side.upper() == 'BUY')
-
-        # Handle Post-Only
         is_post_only = True
         if order_type == "MARKET":
             is_post_only = False
@@ -263,9 +249,8 @@ class NadoAdapter(BaseExchange):
                     subaccount_name=self.subaccount_name,
                 ),
                 priceX18=to_x18(final_price),
-                # Nado: Buy is positive, Sell is negative
                 amount=to_x18(amount) if is_buy else -to_x18(amount),
-                expiration=get_expiration_timestamp(60 * 60 * 24),  # 24 Hours
+                expiration=get_expiration_timestamp(60 * 60 * 24),
                 nonce=gen_order_nonce(),
                 appendix=appendix
             )
@@ -288,15 +273,12 @@ class NadoAdapter(BaseExchange):
             return None
 
     async def cancel_order(self, order_id: str, symbol: str = None):
-        """Cancel Order using CancelOrdersParams"""
         try:
             pid = self.contract_map.get(symbol, {}).get('id')
             if not pid:
-                # Fallback: try to find PID if not provided, or use first available
                 if self.contract_map:
                     pid = list(self.contract_map.values())[0]['id']
                 else:
-                    logger.warning("⚠️ [Nado] Cancel: No market ID found")
                     return
 
             sender_hex = subaccount_to_hex(SubaccountParams(
@@ -315,16 +297,11 @@ class NadoAdapter(BaseExchange):
                 None,
                 lambda: self.client.market.cancel_orders(cancel_params)
             )
-            # logger.info(f"🗑️ [Nado] Cancel sent for {order_id}")
 
         except Exception as e:
             logger.warning(f"⚠️ [Nado] Cancel Failed: {e}")
 
     async def fetch_positions(self) -> List[Dict]:
-        """
-        Fetch positions for Inventory Strategy
-        Returns list of dicts: [{'symbol': 'BTC', 'size': 1.5, ...}]
-        """
         try:
             resolved_subaccount = subaccount_to_hex(self.client.context.signer.address, self.subaccount_name)
 
@@ -340,14 +317,11 @@ class NadoAdapter(BaseExchange):
             positions = []
             for pos in account_data.perp_balances:
                 pid = pos.product_id
-
-                # Reverse lookup symbol from pid
                 symbol = None
                 for s, info in self.contract_map.items():
                     if info['id'] == pid:
                         symbol = s
                         break
-
                 if symbol:
                     raw_size = pos.balance.amount
                     size = float(from_x18(raw_size))
@@ -364,12 +338,7 @@ class NadoAdapter(BaseExchange):
             return []
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
-        """
-        Simulate WebSocket by polling Orderbook.
-        Note: Nado SDK might support WS, but for stability we use Polling as per reference fallback.
-        """
         logger.info("📡 [Nado] Starting Polling Stream...")
-
         while self.is_connected:
             try:
                 for symbol in self.target_symbols:
@@ -377,10 +346,7 @@ class NadoAdapter(BaseExchange):
                     if tick:
                         tick['type'] = 'tick'
                         tick_queue.put_nowait(tick)
-
-                # Poll interval (adjust as needed)
                 await asyncio.sleep(1.0)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:

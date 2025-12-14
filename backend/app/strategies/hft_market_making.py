@@ -307,6 +307,8 @@ class HFTMarketMakingStrategy:
             )
 
             if new_id:
+                # --- [修复] 增加成功日志 ---
+                # logger.info(f"✅ [HFT] 挂单成功: {side} {self.quantity} @ {target_price} (ID: {new_id})")
                 self.active_orders[side] = new_id
                 self.active_prices[side] = target_price
             else:
@@ -349,19 +351,15 @@ class HFTMarketMakingStrategy:
             logger.error(f"On Trade Error: {e}")
 
     async def _sync_position(self):
-        """兼容不同 Adapter 的持仓同步逻辑"""
         try:
             adapter = self.adapters[self.exchange_name]
             positions = []
 
-            # 1. 优先尝试标准的 fetch_positions (Nado/Base 标准)
             if hasattr(adapter, 'fetch_positions') and callable(adapter.fetch_positions):
                 if asyncio.iscoroutinefunction(adapter.fetch_positions):
                     positions = await adapter.fetch_positions()
                 else:
                     positions = await asyncio.to_thread(adapter.fetch_positions)
-
-            # 2. 降级尝试 GRVT 特有的 rest_client (旧逻辑)
             elif hasattr(adapter, 'rest_client') and adapter.rest_client:
                 loop = asyncio.get_running_loop()
                 positions = await loop.run_in_executor(
@@ -373,12 +371,9 @@ class HFTMarketMakingStrategy:
 
             found_size = 0.0
             for p in positions:
-                # 兼容不同返回格式: Nado 返回 symbol, GRVT 返回 instrument
                 inst = p.get('instrument') or p.get('symbol') or ""
-                # Nado 的 symbol 可能是 "BTC", GRVT 是 "BTC-USDT"
                 if self.symbol in inst:
                     size = float(p.get('size', 0) or p.get('contracts', 0))
-                    # 兼容 Nado (自带 size 正负) 和 GRVT (需要 side 判断)
                     side = p.get('side', '').upper()
                     if side == 'SHORT' and size > 0:
                         size = -size
@@ -398,7 +393,6 @@ class HFTMarketMakingStrategy:
     async def _update_contract_info(self):
         try:
             adapter = self.adapters[self.exchange_name]
-            # 兼容 Nado (contract_map) 和 Lighter (market_config)
             contract_map = getattr(adapter, 'contract_map', {}) or getattr(adapter, 'market_config', {})
 
             found = None
@@ -411,7 +405,6 @@ class HFTMarketMakingStrategy:
                 if 'tick_size' in found:
                     self.tick_size = float(found['tick_size'])
                 elif 'price_mul' in found:
-                    # Lighter case fallback
                     self.tick_size = 0.01
 
                 if self.tick_size > 0:
