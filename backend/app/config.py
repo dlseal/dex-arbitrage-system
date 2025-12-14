@@ -101,6 +101,11 @@ class Config:
     LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
     LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "0"))
 
+    # --- Nado 配置 ---
+    NADO_PRIVATE_KEY = os.getenv("NADO_PRIVATE_KEY")
+    NADO_MODE = os.getenv("NADO_MODE", "MAINNET")
+    NADO_SUBACCOUNT_NAME = os.getenv("NADO_SUBACCOUNT_NAME", "default")
+
     @classmethod
     def validate(cls):
         """检查核心配置是否存在"""

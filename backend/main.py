@@ -17,13 +17,14 @@ from app.config import Config
 from app.adapters.base import BaseExchange
 from app.adapters.grvt import GrvtAdapter
 from app.adapters.lighter import LighterAdapter
+from app.adapters.nado import NadoAdapter
+
 from app.core.engine import EventEngine
 
 # 导入所有策略
 from app.strategies.spread_arb import SpreadArbitrageStrategy
 from app.strategies.grvt_lighter_farm import GrvtLighterFarmStrategy
 from app.strategies.grvt_inventory_farm import GrvtInventoryFarmStrategy
-# [新增] HFT 策略导入
 from app.strategies.hft_market_making import HFTMarketMakingStrategy
 
 # 配置日志格式
@@ -32,7 +33,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-# 屏蔽一些嘈杂的日志
 logging.getLogger("GrvtCcxtWS").setLevel(logging.WARNING)
 logging.getLogger("pysdk").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -56,20 +56,17 @@ async def main():
     required_exchanges = set()
 
     if Config.STRATEGY_TYPE == "HFT_MM":
-        # HFT 模式：只加载指定的单一家交易所 (由 .env 中 HFT_EXCHANGE 决定)
         required_exchanges.add(Config.HFT_EXCHANGE)
 
     elif Config.STRATEGY_TYPE == "GL_FARM":
-        # GRVT-Lighter 刷量模式：必须加载两者
         required_exchanges.add("GRVT")
         required_exchanges.add("Lighter")
 
     elif Config.STRATEGY_TYPE == "GL_INVENTORY":
-        # GRVT 库存模式：只加载 GRVT
         required_exchanges.add("GRVT")
 
     else:
-        # 默认为 Spread Arb 模式：加载配置的 A 和 B
+        # Spread Arb 模式
         required_exchanges.add(Config.SPREAD_EXCHANGE_A)
         required_exchanges.add(Config.SPREAD_EXCHANGE_B)
 
@@ -79,7 +76,7 @@ async def main():
     # ==========================================
     adapters: List[BaseExchange] = []
 
-    # --- 初始化 GRVT (仅当需要时) ---
+    # --- 初始化 GRVT ---
     if "GRVT" in required_exchanges and Config.GRVT_API_KEY:
         try:
             grvt = GrvtAdapter(
@@ -93,7 +90,7 @@ async def main():
         except Exception as e:
             logger.error(f"无法加载 GRVT Adapter: {e}")
 
-    # --- 初始化 Lighter (仅当需要时) ---
+    # --- 初始化 Lighter ---
     if "Lighter" in required_exchanges and Config.LIGHTER_API_KEY:
         try:
             lighter = LighterAdapter(
@@ -108,6 +105,21 @@ async def main():
         except Exception as e:
             logger.error(f"无法加载 Lighter Adapter: {e}")
 
+    # --- 初始化 Nado ---
+    if "Nado" in required_exchanges and Config.NADO_PRIVATE_KEY:
+        try:
+            nado = NadoAdapter(
+                private_key=Config.NADO_PRIVATE_KEY,
+                mode=Config.NADO_MODE,
+                subaccount_name=Config.NADO_SUBACCOUNT_NAME,
+                symbols=Config.TARGET_SYMBOLS
+            )
+            adapters.append(nado)
+            logger.info("📦 Nado Adapter 已加载")
+        except Exception as e:
+            logger.error(f"无法加载 Nado Adapter: {e}")
+
+
     if not adapters:
         logger.error(f"❌ 没有加载任何适配器！请检查 .env 配置或 STRATEGY_TYPE。")
         return
@@ -116,7 +128,6 @@ async def main():
     adapters_map = {ex.name: ex for ex in adapters}
     strategy = None
 
-    # 根据配置选择策略
     if Config.STRATEGY_TYPE == "HFT_MM":
         logger.info("⚡️ 启动模式: HFT Market Making (AS + OFI)")
         strategy = HFTMarketMakingStrategy(adapters_map)
@@ -126,11 +137,10 @@ async def main():
         strategy = GrvtLighterFarmStrategy(adapters_map)
 
     elif Config.STRATEGY_TYPE == "GL_INVENTORY":
-        logger.info("🏭 启动模式: GRVT 库存累积刷量 (小资金专用)")
+        logger.info("🏭 启动模式: GRVT 库存累积刷量")
         strategy = GrvtInventoryFarmStrategy(adapters_map)
 
     else:
-        # 通用价差套利 (Spread Arb)
         logger.info(f"⚖️ 启动模式: 通用价差套利 (Spread Arb)")
         logger.info(f"   👉 交易所 A: {Config.SPREAD_EXCHANGE_A}")
         logger.info(f"   👉 交易所 B: {Config.SPREAD_EXCHANGE_B}")
@@ -141,38 +151,31 @@ async def main():
             exchange_b=Config.SPREAD_EXCHANGE_B
         )
 
-    # 确保策略初始化成功
     if hasattr(strategy, 'is_active') and not strategy.is_active:
         logger.error("❌ 策略初始化失败，正在退出...")
         return
 
-    # 将策略注入引擎
     engine = EventEngine(exchanges=adapters, strategy=strategy)
 
-    # 注册优雅退出信号 (Ctrl+C)
     def handle_exit(sig, frame):
         logger.info("\n🛑 接收到退出信号，正在关闭系统...")
-        # 这里可以添加清理逻辑，如 cancel_all_orders
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # 5. 执行初始化测试 (Connectivity Check)
+    # 5. 执行初始化测试
     logger.info("🔌 正在连接交易所并同步状态...")
     try:
-        # 并发执行所有交易所的 initialize 方法
         await asyncio.gather(*(ex.initialize() for ex in adapters))
         logger.info("✅ 所有交易所连接成功！")
 
-        # --- 连接性验证 ---
         logging.info("\n" + "=" * 50)
         logging.info(f"{'Exchange':<15} | {'Symbol':<15} | {'Bid':<15} | {'Ask':<15}")
         logging.info("-" * 50)
 
         for ex in adapters:
             try:
-                # 简单测试获取第一个目标币种的价格
                 target_sym = Config.TARGET_SYMBOLS[0] if Config.TARGET_SYMBOLS else "BTC"
                 ticker = await ex.fetch_orderbook(target_sym)
 
@@ -190,7 +193,7 @@ async def main():
         return
 
     # 6. 进入主事件循环
-    logger.info("📡 启动 WebSocket 数据流监听...")
+    logger.info("📡 启动数据流监听...")
     await engine.start()
 
 
