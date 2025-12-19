@@ -27,7 +27,7 @@ common:
 strategies:
   # 当前激活的策略类型
   # 可选值: HFT_MM | SPREAD | GL_FARM | GL_INVENTORY | AI_GRID
-  active: "HFT_MM"
+  active: "AI_GRID"
 
   # --- 1. 高频做市策略 (HFT Market Making) ---
   hft_mm:
@@ -89,7 +89,7 @@ strategies:
 
   # --- 4. AI 网格策略 (AI Grid) ---
   ai_grid:
-    exchange: "GRVT"
+    exchange: "Nado"
 
     # 初始兜底参数
     upper_price: 100000.0
@@ -97,9 +97,9 @@ strategies:
     grid_count: 10
 
     # 资金管理
-    principal: 1000.0      # 投入本金 (USDT)
-    leverage: 2.0          # 杠杆倍数
-    min_order_size: 15.0   # 最小下单金额 (Notional)
+    principal: 400.0      # 投入本金 (USDT)
+    leverage: 5.0          # 杠杆倍数
+    min_order_size: 105.0   # 最小下单金额 (Notional)
 
     # AI 调度参数
     max_check_interval: 86400
@@ -111,4 +111,4 @@ services:
   llm:
     # API Key 请保留在 .env 中 (LLM_API_KEY)
     base_url: "https://api.deepseek.com"
-    model: "deepseek-chat"
+    model: "deepseek-reasoner"
