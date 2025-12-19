@@ -27,6 +27,7 @@ from app.strategies.spread_arb import SpreadArbitrageStrategy
 from app.strategies.grvt_lighter_farm import GrvtLighterFarmStrategy
 from app.strategies.grvt_inventory_farm import GrvtInventoryFarmStrategy
 from app.strategies.hft_market_making import HFTMarketMakingStrategy
+from app.strategies.ai_grid import AiAdaptiveGridStrategy
 
 # 配置日志格式
 logging.basicConfig(
@@ -86,6 +87,9 @@ async def main():
 
     elif Config.STRATEGY_TYPE == "GL_INVENTORY":
         required_exchanges.add("GRVT")
+
+    elif Config.STRATEGY_TYPE == "AI_GRID":
+        required_exchanges.add(Config.GRID_EXCHANGE)
 
     else:
         # Spread Arb 模式
@@ -160,6 +164,10 @@ async def main():
     elif Config.STRATEGY_TYPE == "GL_INVENTORY":
         logger.info("🏭 启动模式: GRVT 库存累积刷量")
         strategy = GrvtInventoryFarmStrategy(adapters_map)
+
+    elif Config.STRATEGY_TYPE == "AI_GRID":
+        logger.info("🤖 启动模式: AI 自适应网格 (AI_GRID)")
+        strategy = AiAdaptiveGridStrategy(adapters_map)
 
     else:
         logger.info(f"⚖️ 启动模式: 通用价差套利 (Spread Arb)")

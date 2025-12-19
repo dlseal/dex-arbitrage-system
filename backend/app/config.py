@@ -89,6 +89,63 @@ class Config:
     # 最大单边持仓限制 (USD)，超过此值触发强制平仓或停止开仓
     HFT_MAX_POS_USD = float(os.getenv("HFT_MAX_POS_USD", "50000.0"))
 
+    # ==========================
+    # AI 自动网格策略配置 (AI_GRID)
+    # ==========================
+    GRID_EXCHANGE = os.getenv("GRID_EXCHANGE", "GRVT")
+
+    # 默认兜底参数
+    GRID_UPPER_PRICE = float(os.getenv("GRID_UPPER_PRICE", "100000.0"))
+    GRID_LOWER_PRICE = float(os.getenv("GRID_LOWER_PRICE", "90000.0"))
+    GRID_COUNT = int(os.getenv("GRID_COUNT", "10"))
+
+    # 【核心修改】资金与杠杆配置
+    # 策略投入本金 (USDT)
+    GRID_STRATEGY_PRINCIPAL = float(os.getenv("GRID_STRATEGY_PRINCIPAL", "1000.0"))
+    # 目标合约杠杆倍数 (建议保守设置，例如 2-5倍)
+    GRID_STRATEGY_LEVERAGE = float(os.getenv("GRID_STRATEGY_LEVERAGE", "2.0"))
+    # 最小下单金额，nado限制为100u
+    GRID_MIN_ORDER_SIZE = float(os.getenv("GRID_MIN_ORDER_SIZE", "15.0"))
+
+    # 最大检查间隔 (秒)
+    GRID_MAX_CHECK_INTERVAL = int(os.getenv("GRID_MAX_CHECK_INTERVAL", "86400"))
+
+    # ==========================
+    # LLM 配置
+    # ==========================
+    LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+    LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+
+    LLM_PROMPT_TEMPLATE = """
+        你是一个加密货币高频量化交易专家。
+
+        【当前市场状态】
+        交易对: {symbol}
+        最新价格: {price}
+
+        【当前正在执行的策略】
+        状态: {current_status}
+        参数: {current_params}
+
+        【任务】
+        请分析当前行情，决定接下来的操作。
+        1. 如果需要更新策略，动作设为 "UPDATE"，并提供新的区间和格数。
+        2. 如果策略依然完美，动作设为 "CONTINUE"。
+        3. 设定该策略的【有效期 (duration_hours)】。
+
+        【输出要求】
+        严格返回 JSON 格式：
+        {{
+            "action": "UPDATE" | "CONTINUE",
+            "upper_price": <float>,
+            "lower_price": <float>,
+            "grid_count": <int, 5-30>,
+            "duration_hours": <float, 建议运行时长>,
+            "reason": "<string>"
+        }}
+        """
+
     # --- GRVT 配置 ---
     GRVT_API_KEY = os.getenv("GRVT_API_KEY")
     GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
