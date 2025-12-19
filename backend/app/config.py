@@ -75,6 +75,9 @@ class ServicesConfig(BaseModel):
 # ==========================================
 # 2. 定义总配置 Settings (整合 .env 和 .yaml)
 # ==========================================
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+YAML_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
 
 class Settings(BaseSettings):
     # --- 环境变量 (Secrets) ---
@@ -120,7 +123,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_PATH,
         env_file_encoding="utf-8",
         extra="ignore"
     )
@@ -130,8 +133,8 @@ class Settings(BaseSettings):
         # 1. 尝试从 YAML 加载策略参数
         yaml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
         yaml_data = {}
-        if os.path.exists(yaml_path):
-            with open(yaml_path, "r", encoding="utf-8") as f:
+        if os.path.exists(YAML_PATH):
+            with open(YAML_PATH, "r", encoding="utf-8") as f:
                 yaml_data = yaml.safe_load(f) or {}
 
         # 2. 实例化 (环境变量会自动填充根目录的字段)

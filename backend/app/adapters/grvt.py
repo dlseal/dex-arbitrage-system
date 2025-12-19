@@ -5,6 +5,7 @@ import logging
 import random
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Dict, Optional, Any, List
+from app.config import settings
 
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
@@ -24,7 +25,7 @@ class GrvtAdapter(BaseExchange):
         self.trading_account_id = trading_account_id
         self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
 
-        env_str = os.getenv('GRVT_ENVIRONMENT', 'prod').lower()
+        env_str = settings.grvt_environment.lower()
         env_map = {
             'prod': GrvtEnv.PROD,
             'testnet': GrvtEnv.TESTNET,

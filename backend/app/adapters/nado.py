@@ -6,6 +6,7 @@ import traceback
 from decimal import Decimal
 from typing import Dict, Optional, List, Any
 from cryptography.fernet import Fernet
+from app.config import settings
 
 # --- Nado Protocol Imports ---
 try:
@@ -33,7 +34,8 @@ class NadoAdapter(BaseExchange):
         super().__init__("Nado")
 
         # 1. 优先尝试解密
-        encrypted_key = os.getenv('ENCRYPTED_NADO_KEY')
+        encrypted_key_secret = settings.encrypted_nado_key
+        encrypted_key = encrypted_key_secret.get_secret_value() if encrypted_key_secret else None
         master_key = os.getenv('MASTER_KEY')
 
         if encrypted_key and master_key:
@@ -47,7 +49,9 @@ class NadoAdapter(BaseExchange):
                 raise ValueError("Invalid Master Key")
         else:
             # 2. 回退到明文读取 仅开发使用
-            self.private_key = private_key or os.getenv("NADO_PRIVATE_KEY")
+            self.private_key = private_key
+            if not self.private_key and settings.nado_private_key:
+                self.private_key = settings.nado_private_key.get_secret_value()
         self.mode_str = mode.upper()
         self.subaccount_name = subaccount_name
         self.target_symbols = symbols if symbols else ["BTC", "ETH", "SOL"]
