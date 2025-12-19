@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Any, Optional
-from app.config import Config
+from app.config import settings
 
 
 class LogColors:
@@ -25,8 +25,8 @@ class SpreadArbitrageStrategy:
         # 订单簿快照: {symbol: {exchange_name: {'bid': float, 'ask': float, 'ts': float}}}
         self.books: Dict[str, Dict[str, Dict]] = {}
 
-        self.spread_threshold = Config.SPREAD_THRESHOLD
-        self.trade_cooldown = Config.TRADE_COOLDOWN
+        self.spread_threshold = settings.strategies.spread_arb.threshold
+        self.trade_cooldown = settings.strategies.spread_arb.cooldown
 
         # 数据最大有效时间 (秒)，超过此时间的行情视为过期，不触发交易
         self.data_max_age = 5.0
@@ -120,7 +120,7 @@ class SpreadArbitrageStrategy:
         self.is_trading = True
 
         try:
-            quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
+            quantity = settings.get_trade_qty(symbol)
 
             self._log_opportunity(symbol, path_name, spread, price_sell, price_buy, quantity)
 

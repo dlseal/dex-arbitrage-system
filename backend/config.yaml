@@ -1,0 +1,114 @@
+# backend/config.yaml
+
+# ==========================
+# 通用基础配置 (Common)
+# ==========================
+common:
+  # 目标交易对列表
+  target_symbols:
+    - "BTC"
+    # - "ETH"
+    # - "SOL"
+
+  # 日志级别 (DEBUG, INFO, WARNING, ERROR)
+  log_level: "INFO"
+
+  # 各币种默认下单数量
+  # 对应原代码中的 TRADE_QUANTITIES
+  trade_quantities:
+    BTC: 0.001
+    ETH: 0.05
+    SOL: 1.0
+    DEFAULT: 0.0001
+
+# ==========================
+# 策略控制 (Strategies)
+# ==========================
+strategies:
+  # 当前激活的策略类型
+  # 可选值: HFT_MM | SPREAD | GL_FARM | GL_INVENTORY | AI_GRID
+  active: "HFT_MM"
+
+  # --- 1. 高频做市策略 (HFT Market Making) ---
+  hft_mm:
+    # 目标交易所 (GRVT, Lighter, Nado)
+    exchange: "Nado"
+
+    # AS模型: 风险厌恶系数 (Gamma)
+    # 值越大，持仓时对价格的偏移越激进（越急于平仓）
+    risk_aversion: 0.1
+
+    # 信号参数: OFI 敏感度 (Alpha)
+    ofi_sensitivity: 1.0
+
+    # 波动率因子 (k)
+    volatility_factor: 1.0
+
+    # 统计窗口大小 (Tick数)
+    window_size: 100
+
+    # 最小做市价差 (Ticks)
+    min_spread_ticks: 2
+
+    # 报价更新阈值 (防抖动)
+    update_threshold_ticks: 2
+
+    # 单边最大持仓限制 (USD)
+    max_pos_usd: 1000.0
+
+  # --- 2. 价差套利策略 (Spread Arbitrage) ---
+  spread_arb:
+    exchange_a: "Lighter"
+    exchange_b: "GRVT"
+
+    # 触发阈值 (0.0015 = 0.15%)
+    threshold: 0.0015
+
+    # 交易冷却时间 (秒)
+    cooldown: 1.5
+
+  # --- 3. 刷量/库存策略 (GL Farm & Inventory) ---
+  farming:
+    # 刷量方向 (BUY/SELL)
+    side: "BUY"
+
+    # 允许的最大滑点亏损 (负数表示愿意支付的成本)
+    max_slippage_tolerance: -0.0005
+
+    # 重挂单阈值
+    requote_threshold: 0.0002
+
+    # 库存刷量专用: 最大库存价值 (USD)
+    max_inventory_usd: 800.0
+
+    # 库存刷量专用: 网格层数
+    inventory_layers: 3
+
+    # 库存刷量专用: 层间距倍数
+    inventory_layer_spread: 1
+
+  # --- 4. AI 网格策略 (AI Grid) ---
+  ai_grid:
+    exchange: "GRVT"
+
+    # 初始兜底参数
+    upper_price: 100000.0
+    lower_price: 90000.0
+    grid_count: 10
+
+    # 资金管理
+    principal: 1000.0      # 投入本金 (USDT)
+    leverage: 2.0          # 杠杆倍数
+    min_order_size: 15.0   # 最小下单金额 (Notional)
+
+    # AI 调度参数
+    max_check_interval: 86400
+
+# ==========================
+# 外部服务配置 (Services)
+# ==========================
+services:
+  llm:
+    # API Key 请保留在 .env 中 (LLM_API_KEY)
+    base_url: "https://api.deepseek.com"
+    model: "deepseek-chat"

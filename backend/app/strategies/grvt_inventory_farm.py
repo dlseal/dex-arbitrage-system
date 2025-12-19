@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Any, List, Optional
-from app.config import Config
+from app.config import settings
 
 logger = logging.getLogger("InventoryFarm")
 
@@ -13,10 +13,14 @@ class GrvtInventoryFarmStrategy:
         self.adapters = adapters
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        self.max_inventory_usd = Config.MAX_INVENTORY_USD
-        self.layers = Config.INVENTORY_LAYERS
-        self.layer_spread = Config.INVENTORY_LAYER_SPREAD
-        self.requote_threshold = getattr(Config, 'REQUOTE_THRESHOLD', 0.0005)
+        # --- 配置读取 ---
+        conf = settings.strategies.farming
+
+        self.max_inventory_usd = conf.max_inventory_usd
+        self.layers = conf.inventory_layers
+        self.layer_spread = conf.inventory_layer_spread
+        self.requote_threshold = conf.requote_threshold
+        self.initial_side = conf.side.upper()
 
         self.current_inventory: Dict[str, float] = {}
         self.active_orders: Dict[str, Dict[str, float]] = {}
@@ -51,7 +55,7 @@ class GrvtInventoryFarmStrategy:
                 )
 
                 async with self.inventory_lock:
-                    for symbol in Config.TARGET_SYMBOLS:
+                    for symbol in settings.common.target_symbols:
                         real_pos = 0.0
                         for p in positions:
                             if symbol in p.get('instrument', '') or symbol == p.get('symbol', ''):
@@ -78,7 +82,7 @@ class GrvtInventoryFarmStrategy:
                 await self._process_trade(event)
             elif event.get('type') == 'tick':
                 symbol = event.get('symbol')
-                if symbol in Config.TARGET_SYMBOLS:
+                if symbol in settings.common.target_symbols:
                     asyncio.create_task(self._process_tick_logic(event))
         except Exception as e:
             logger.error(f"Strategy Error: {e}")
@@ -112,7 +116,7 @@ class GrvtInventoryFarmStrategy:
         if market_price <= 0: return
 
         pos_value = current_pos * market_price
-        target_side = Config.FARM_SIDE.upper()
+        target_side = self.initial_side
 
         is_full_buy = (target_side == 'BUY' and pos_value >= self.max_inventory_usd)
         is_full_sell = (target_side == 'SELL' and pos_value <= -self.max_inventory_usd)
@@ -130,7 +134,7 @@ class GrvtInventoryFarmStrategy:
         est_pnl = (hedge_price - target_prices[0]) / target_prices[0] if target_side == 'BUY' else \
             (target_prices[0] - hedge_price) / hedge_price
 
-        if est_pnl < Config.MAX_SLIPPAGE_TOLERANCE:
+        if est_pnl < settings.strategies.farming.max_slippage_tolerance:
             await self._cancel_local_orders(symbol)
             return
 
@@ -179,7 +183,7 @@ class GrvtInventoryFarmStrategy:
         self.active_orders[symbol] = {}
 
     async def _place_new_orders(self, symbol, side, prices):
-        quantity = Config.TRADE_QUANTITIES.get(symbol, Config.TRADE_QUANTITIES.get("DEFAULT", 0.0001))
+        quantity = settings.get_trade_qty(symbol)
         tasks = []
         adapter = self.adapters['GRVT']
 

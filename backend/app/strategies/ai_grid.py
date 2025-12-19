@@ -1,3 +1,4 @@
+# backend/app/strategies/ai_grid.py
 import asyncio
 import logging
 import time
@@ -6,7 +7,7 @@ import os
 from typing import Dict, Any, List, Optional
 from decimal import Decimal
 
-from app.config import Config
+from app.config import settings  # <--- 修改导入
 from app.utils.llm_client import fetch_grid_advice
 
 logger = logging.getLogger("AI_Grid_StepFixed")
@@ -16,8 +17,18 @@ class AiAdaptiveGridStrategy:
     def __init__(self, adapters: Dict[str, Any]):
         self.name = "AI_Grid_Contract_StepFixed"
         self.adapters = adapters
-        self.exchange_name = Config.GRID_EXCHANGE
-        self.symbol = Config.TARGET_SYMBOLS[0]
+
+        # 读取配置区域
+        conf = settings.strategies.ai_grid
+
+        self.exchange_name = conf.exchange
+        # 使用公共配置中的 target_symbols
+        if not settings.common.target_symbols:
+            logger.error("❌ [AI_Grid] 未配置 TARGET_SYMBOLS")
+            self.is_active = False
+            return
+
+        self.symbol = settings.common.target_symbols[0]
 
         # 状态初始化
         self.grid_levels: List[float] = []
@@ -25,20 +36,21 @@ class AiAdaptiveGridStrategy:
         self.grid_order_map: Dict[int, str] = {}
 
         # 基础参数
-        self.upper_price = Config.GRID_UPPER_PRICE
-        self.lower_price = Config.GRID_LOWER_PRICE
-        self.grid_count = Config.GRID_COUNT
+        self.upper_price = conf.upper_price
+        self.lower_price = conf.lower_price
+        self.grid_count = conf.grid_count
         self.quantity = 0.0001
 
         # 资金参数
-        self.principal = Config.GRID_STRATEGY_PRINCIPAL
-        self.leverage = Config.GRID_STRATEGY_LEVERAGE
+        self.principal = conf.principal
+        self.leverage = conf.leverage
 
         # 最小下单金额 (Notional)
-        config_min = Config.GRID_MIN_ORDER_SIZE
+        config_min = conf.min_order_size
         if config_min > 0:
             self.min_order_notional = config_min
         else:
+            # 兜底逻辑
             ex_name = self.exchange_name.lower()
             if 'nado' in ex_name:
                 self.min_order_notional = 105.0
@@ -47,15 +59,13 @@ class AiAdaptiveGridStrategy:
             else:
                 self.min_order_notional = 10.0
 
-        # === 新增：数量步长配置 ===
-        # Nado BTC 步长是 0.00005，为了安全，我们设为 0.0001
-        # 其他交易所通常是 0.0001 或 0.00001
+        # === 数量步长配置 ===
         self.qty_step_size = 0.0001
 
         # 时间调度
         self.strategy_expiry_ts = 0.0
         self.next_check_ts = 0.0
-        self.max_check_interval = Config.GRID_MAX_CHECK_INTERVAL
+        self.max_check_interval = conf.max_check_interval
 
         # 状态控制
         self.is_active = True
@@ -104,11 +114,8 @@ class AiAdaptiveGridStrategy:
     def _round_to_step(self, value, step):
         """将数值向下取整到最近的步长倍数"""
         if step <= 0: return value
-        # 使用 Decimal 防止浮点数精度问题 (e.g. 0.000300000000004)
         d_val = Decimal(str(value))
         d_step = Decimal(str(step))
-
-        # 向下取整逻辑: (value // step) * step
         num_steps = math.floor(float(d_val / d_step))
         rounded_val = float(Decimal(str(num_steps)) * d_step)
         return rounded_val
@@ -165,9 +172,7 @@ class AiAdaptiveGridStrategy:
                     ref_price = current_price
                     raw_qty = per_grid_usdt / ref_price
 
-                    # 3. === 关键修复：使用步长向下取整 ===
-                    # 之前的 0.00129 变成了 0.0012 (如果步长是 0.0001)
-                    # 这样保证了它是 0.0001 的倍数，也就一定是 0.00005 (Nado) 的倍数
+                    # 3. 步长取整
                     self.quantity = self._round_to_step(raw_qty, self.qty_step_size)
 
                     # 4. 防止取整后变成 0
@@ -275,9 +280,7 @@ class AiAdaptiveGridStrategy:
         adapter = self.adapters[self.exchange_name]
         async with self.order_semaphore:
             try:
-                # 安全检查
                 if self.quantity * price < self.min_order_notional * 0.9:
-                    # 日志降级为 DEBUG，避免刷屏
                     logger.debug(
                         f"Skipping small order #{index}: {self.quantity * price:.2f} < {self.min_order_notional}")
                     return

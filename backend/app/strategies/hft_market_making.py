@@ -1,3 +1,4 @@
+# backend/app/strategies/hft_market_making.py
 import asyncio
 import logging
 import time
@@ -6,7 +7,7 @@ from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from typing import Dict, Any, Optional
 
-from app.config import Config
+from app.config import settings  # <--- 修改导入
 
 logger = logging.getLogger("HFT_AS_OFI")
 
@@ -71,23 +72,27 @@ class HFTMarketMakingStrategy:
         self.name = "AS_OFI_Pro_v3_Optimized"
         self.adapters = adapters
 
-        self.exchange_name = Config.HFT_EXCHANGE
-        if not Config.TARGET_SYMBOLS:
+        # 读取配置区域
+        conf = settings.strategies.hft_mm
+
+        self.exchange_name = conf.exchange
+        if not settings.common.target_symbols:
             logger.error("❌ [HFT] 未配置 TARGET_SYMBOLS")
             self.is_active = False
             return
 
-        self.symbol = Config.TARGET_SYMBOLS[0]
-        self.quantity = Config.TRADE_QUANTITIES.get(self.symbol, 0.0001)
+        self.symbol = settings.common.target_symbols[0]
+        # 使用辅助方法获取数量
+        self.quantity = settings.get_trade_qty(self.symbol)
 
         logger.info(f"🎯 HFT Strategy Init: {self.exchange_name} | {self.symbol} | Qty: {self.quantity}")
 
-        self.risk_aversion = Config.HFT_RISK_AVERSION
-        self.ofi_sensitivity = Config.HFT_OFI_SENSITIVITY
-        self.min_spread_ticks = Config.HFT_MIN_SPREAD_TICKS
-        self.update_threshold_ticks = Config.HFT_UPDATE_THRESHOLD_TICKS
-        self.max_pos_usd = Config.HFT_MAX_POS_USD
-        self.volatility_factor = Config.HFT_VOLATILITY_FACTOR
+        self.risk_aversion = conf.risk_aversion
+        self.ofi_sensitivity = conf.ofi_sensitivity
+        self.min_spread_ticks = conf.min_spread_ticks
+        self.update_threshold_ticks = conf.update_threshold_ticks
+        self.max_pos_usd = conf.max_pos_usd
+        self.volatility_factor = conf.volatility_factor
 
         self.tick_size = 0.0
         self.quantizer: Optional[PriceQuantizer] = None
@@ -95,7 +100,8 @@ class HFTMarketMakingStrategy:
         self.inventory = 0.0
         self.inv_lock = asyncio.Lock()
 
-        self.mid_price_stats = OnlineStats(window_size=Config.HFT_WINDOW_SIZE)
+        # 使用配置的窗口大小
+        self.mid_price_stats = OnlineStats(window_size=conf.window_size)
         self.ofi_ema = EMACalculator(alpha=0.2)
         self.prev_tick: Optional[Dict] = None
 
@@ -307,8 +313,6 @@ class HFTMarketMakingStrategy:
             )
 
             if new_id:
-                # --- [修复] 增加成功日志 ---
-                # logger.info(f"✅ [HFT] 挂单成功: {side} {self.quantity} @ {target_price} (ID: {new_id})")
                 self.active_orders[side] = new_id
                 self.active_prices[side] = target_price
             else:
@@ -355,6 +359,7 @@ class HFTMarketMakingStrategy:
             adapter = self.adapters[self.exchange_name]
             positions = []
 
+            # 兼容多种适配器的获取持仓方式
             if hasattr(adapter, 'fetch_positions') and callable(adapter.fetch_positions):
                 if asyncio.iscoroutinefunction(adapter.fetch_positions):
                     positions = await adapter.fetch_positions()
@@ -405,6 +410,7 @@ class HFTMarketMakingStrategy:
                 if 'tick_size' in found:
                     self.tick_size = float(found['tick_size'])
                 elif 'price_mul' in found:
+                    # Lighter 的情况
                     self.tick_size = 0.01
 
                 if self.tick_size > 0:

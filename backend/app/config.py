@@ -1,176 +1,156 @@
-import json
+# backend/app/config.py
 import os
-from dotenv import load_dotenv
+import yaml
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 加载 .env 文件
-load_dotenv()
+
+# ==========================================
+# 1. 定义 YAML 结构对应的 Pydantic 模型
+# ==========================================
+
+class CommonConfig(BaseModel):
+    target_symbols: List[str] = ["BTC"]
+    log_level: str = "INFO"
+    trade_quantities: Dict[str, float] = {"DEFAULT": 0.0001}
 
 
-class Config:
-    # --- 全局交易标的配置 ---
-    # 默认只监听 BTC, ETH, SOL。可以通过 .env 设置 TARGET_SYMBOLS=BTC,ETH,SOL,DOGE 来覆盖
-    TARGET_SYMBOLS = os.getenv("TARGET_SYMBOLS", "BTC,ETH,SOL").split(",")
+class HftMmConfig(BaseModel):
+    exchange: str = "Nado"
+    risk_aversion: float = 0.1
+    ofi_sensitivity: float = 1.0
+    volatility_factor: float = 1.0
+    window_size: int = 100
+    min_spread_ticks: int = 2
+    update_threshold_ticks: int = 2
+    max_pos_usd: float = 1000.0
 
-    # ==========================
-    # 策略选择配置
-    # ==========================
-    # 策略类型: 'SPREAD' (价差套利) 或 'GL_FARM' (GRVT-Lighter刷量)
-    STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "GL_FARM")
 
-    # ==========================
-    # 差价对冲策略 (Strategy Config)
-    # ==========================
-    # 1. 定义参与套利的两个交易所名称 (对应 Adapter 的 name) [NEW]
-    # 允许通过环境变量动态切换，例如 A=Binance, B=GRVT
-    SPREAD_EXCHANGE_A = os.getenv("SPREAD_EXCHANGE_A", "Lighter")
-    SPREAD_EXCHANGE_B = os.getenv("SPREAD_EXCHANGE_B", "GRVT")
+class SpreadArbConfig(BaseModel):
+    exchange_a: str = "Lighter"
+    exchange_b: str = "GRVT"
+    threshold: float = 0.0015
+    cooldown: float = 1.5
 
-    # 2. 触发套利的最小价差阈值 (默认 0.002 即 0.2%)
-    SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.002"))
 
-    # 3. 交易冷却时间 (秒)，防止频繁开单
-    TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "2.0"))
+class FarmingConfig(BaseModel):
+    side: str = "BUY"
+    max_slippage_tolerance: float = -0.0005
+    requote_threshold: float = 0.0002
+    max_inventory_usd: float = 800.0
+    inventory_layers: int = 3
+    inventory_layer_spread: int = 1
 
-    # 4. 单次下单数量配置 (JSON格式)
-    _default_quantities = {"SOL": 0.01, "DEFAULT": 0.0001}
-    try:
-        _env_qty = os.getenv("TRADE_QUANTITIES")
-        TRADE_QUANTITIES = json.loads(_env_qty) if _env_qty else _default_quantities
-    except Exception as e:
-        print(f"⚠️ 解析 TRADE_QUANTITIES 失败，使用默认值: {e}")
-        TRADE_QUANTITIES = _default_quantities
 
-    # ==========================
-    # 刷量策略参数 (Volume Farming Config)
-    # ==========================
-    # 允许的最大价差亏损 (滑点容忍度)
-    MAX_SLIPPAGE_TOLERANCE = float(os.getenv("MAX_SLIPPAGE_TOLERANCE", "-0.0005"))
+class AiGridConfig(BaseModel):
+    exchange: str = "GRVT"
+    upper_price: float = 100000.0
+    lower_price: float = 90000.0
+    grid_count: int = 10
+    principal: float = 1000.0
+    leverage: float = 2.0
+    min_order_size: float = 15.0
+    max_check_interval: int = 86400
 
-    # 重挂单阈值
-    REQUOTE_THRESHOLD = float(os.getenv("REQUOTE_THRESHOLD", "0.0005"))
 
-    FARM_SIDE = os.getenv("FARM_SIDE", "BUY").upper()
-    MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "3"))
+class StrategiesConfig(BaseModel):
+    active: str = "HFT_MM"
+    hft_mm: HftMmConfig = Field(default_factory=HftMmConfig)
+    spread_arb: SpreadArbConfig = Field(default_factory=SpreadArbConfig)
+    farming: FarmingConfig = Field(default_factory=FarmingConfig)
+    ai_grid: AiGridConfig = Field(default_factory=AiGridConfig)
 
-    # ==========================
-    # 库存刷量策略专用配置 (Inventory Farm Config)
-    # ==========================
-    MAX_INVENTORY_USD = float(os.getenv("MAX_INVENTORY_USD", "800.0"))
-    INVENTORY_LAYERS = int(os.getenv("INVENTORY_LAYERS", "3"))
-    INVENTORY_LAYER_SPREAD = int(os.getenv("INVENTORY_LAYER_SPREAD", "1"))
 
-    # ==========================
-    # HFT 做市策略配置 (AS + OFI)
-    # ==========================
-    # 目标交易所 (填写 Adapter 的 name，如 "GRVT" 或 "Lighter")
-    HFT_EXCHANGE = os.getenv("HFT_EXCHANGE", "GRVT")
+class LlmConfig(BaseModel):
+    # API Key 从环境变量读取，这里只存非敏感配置
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-chat"
 
-    # AS模型参数: 风险厌恶系数 (Gamma)
-    # 值越大，持仓时对价格的偏移越激进（越急于平仓）
-    HFT_RISK_AVERSION = float(os.getenv("HFT_RISK_AVERSION", "0.1"))
 
-    # 信号参数: OFI 敏感度 (Alpha)
-    # OFI 每增加 1 单位，价格预测偏移多少个 Tick
-    HFT_OFI_SENSITIVITY = float(os.getenv("HFT_OFI_SENSITIVITY", "0.5"))
+class ServicesConfig(BaseModel):
+    llm: LlmConfig = Field(default_factory=LlmConfig)
 
-    # 波动率因子 (k的替代方案)
-    # Spread = MinSpread + VolFactor * Sigma
-    HFT_VOLATILITY_FACTOR = float(os.getenv("HFT_VOLATILITY_FACTOR", "0.8"))
 
-    # 统计窗口大小 (用于计算 OFI 均值和波动率)
-    HFT_WINDOW_SIZE = int(os.getenv("HFT_WINDOW_SIZE", "100"))
+# ==========================================
+# 2. 定义总配置 Settings (整合 .env 和 .yaml)
+# ==========================================
 
-    # 最小做市价差 (以 Tick 为单位，例如 2 ticks)
-    HFT_MIN_SPREAD_TICKS = int(os.getenv("HFT_MIN_SPREAD_TICKS", "2"))
+class Settings(BaseSettings):
+    # --- 环境变量 (Secrets) ---
+    # 对应 .env 文件中的 KEY，Pydantic 会自动读取并转为小写属性
+    grvt_api_key: Optional[SecretStr] = None
+    grvt_private_key: Optional[SecretStr] = None
+    grvt_trading_account_id: Optional[str] = None
+    grvt_environment: str = "prod"
 
-    # 报价更新阈值 (防抖动：只有新价格偏离当前订单 > N 个 Tick 才改单)
-    HFT_UPDATE_THRESHOLD_TICKS = int(os.getenv("HFT_UPDATE_THRESHOLD_TICKS", "1"))
+    lighter_api_key: Optional[SecretStr] = None
+    lighter_private_key: Optional[SecretStr] = None
+    lighter_account_index: int = 0
+    lighter_api_key_index: int = 0
 
-    # 最大单边持仓限制 (USD)，超过此值触发强制平仓或停止开仓
-    HFT_MAX_POS_USD = float(os.getenv("HFT_MAX_POS_USD", "50000.0"))
+    nado_private_key: Optional[SecretStr] = None
+    nado_mode: str = "MAINNET"
+    nado_subaccount_name: str = "default"
+    encrypted_nado_key: Optional[SecretStr] = None
+    master_key: Optional[SecretStr] = None  # 运行时输入
 
-    # ==========================
-    # AI 自动网格策略配置 (AI_GRID)
-    # ==========================
-    GRID_EXCHANGE = os.getenv("GRID_EXCHANGE", "GRVT")
+    llm_api_key: Optional[SecretStr] = None
 
-    # 默认兜底参数
-    GRID_UPPER_PRICE = float(os.getenv("GRID_UPPER_PRICE", "100000.0"))
-    GRID_LOWER_PRICE = float(os.getenv("GRID_LOWER_PRICE", "90000.0"))
-    GRID_COUNT = int(os.getenv("GRID_COUNT", "10"))
+    # --- YAML 配置 (策略参数) ---
+    common: CommonConfig = Field(default_factory=CommonConfig)
+    strategies: StrategiesConfig = Field(default_factory=StrategiesConfig)
+    services: ServicesConfig = Field(default_factory=ServicesConfig)
 
-    # 【核心修改】资金与杠杆配置
-    # 策略投入本金 (USDT)
-    GRID_STRATEGY_PRINCIPAL = float(os.getenv("GRID_STRATEGY_PRINCIPAL", "1000.0"))
-    # 目标合约杠杆倍数 (建议保守设置，例如 2-5倍)
-    GRID_STRATEGY_LEVERAGE = float(os.getenv("GRID_STRATEGY_LEVERAGE", "2.0"))
-    # 最小下单金额，nado限制为100u
-    GRID_MIN_ORDER_SIZE = float(os.getenv("GRID_MIN_ORDER_SIZE", "15.0"))
-
-    # 最大检查间隔 (秒)
-    GRID_MAX_CHECK_INTERVAL = int(os.getenv("GRID_MAX_CHECK_INTERVAL", "86400"))
-
-    # ==========================
-    # LLM 配置
-    # ==========================
-    LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
-    LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
-
-    LLM_PROMPT_TEMPLATE = """
+    # 提示词模板 (硬编码或放入 YAML 均可，这里保留硬编码方便)
+    llm_prompt_template: str = """
         你是一个加密货币高频量化交易专家。
-
-        【当前市场状态】
-        交易对: {symbol}
-        最新价格: {price}
-
-        【当前正在执行的策略】
-        状态: {current_status}
-        参数: {current_params}
-
-        【任务】
-        请分析当前行情，决定接下来的操作。
-        1. 如果需要更新策略，动作设为 "UPDATE"，并提供新的区间和格数。
-        2. 如果策略依然完美，动作设为 "CONTINUE"。
-        3. 设定该策略的【有效期 (duration_hours)】。
-
-        【输出要求】
-        严格返回 JSON 格式：
+        【当前市场状态】交易对: {symbol}, 最新价格: {price}
+        【当前策略】状态: {current_status}, 参数: {current_params}
+        【任务】分析行情，决定动作。
+        请严格返回JSON格式：
         {{
             "action": "UPDATE" | "CONTINUE",
             "upper_price": <float>,
             "lower_price": <float>,
-            "grid_count": <int, 5-30>,
-            "duration_hours": <float, 建议运行时长>,
+            "grid_count": <int>,
+            "duration_hours": <float>,
             "reason": "<string>"
         }}
-        """
+    """
 
-    # --- GRVT 配置 ---
-    GRVT_API_KEY = os.getenv("GRVT_API_KEY")
-    GRVT_PRIVATE_KEY = os.getenv("GRVT_PRIVATE_KEY")
-    GRVT_TRADING_ACCOUNT_ID = os.getenv("GRVT_TRADING_ACCOUNT_ID")
-    GRVT_ENV = os.getenv("GRVT_ENVIRONMENT", "prod")
-
-    # --- Lighter 配置 ---
-    LIGHTER_API_KEY = os.getenv("LIGHTER_API_KEY")
-    LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY")
-    LIGHTER_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
-    LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "0"))
-
-    # --- Nado 配置 ---
-    NADO_PRIVATE_KEY = os.getenv("NADO_PRIVATE_KEY")
-    NADO_MODE = os.getenv("NADO_MODE", "MAINNET")
-    NADO_SUBACCOUNT_NAME = os.getenv("NADO_SUBACCOUNT_NAME", "default")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
     @classmethod
-    def validate(cls):
-        """检查核心配置是否存在"""
-        missing = []
-        if not cls.GRVT_API_KEY: missing.append("GRVT_API_KEY")
-        if not cls.GRVT_PRIVATE_KEY: missing.append("GRVT_PRIVATE_KEY")
-        if not cls.GRVT_TRADING_ACCOUNT_ID: missing.append("GRVT_TRADING_ACCOUNT_ID")
-        if not cls.LIGHTER_PRIVATE_KEY: missing.append("LIGHTER_PRIVATE_KEY")
+    def load(cls) -> "Settings":
+        # 1. 尝试从 YAML 加载策略参数
+        yaml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
+        yaml_data = {}
+        if os.path.exists(yaml_path):
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                yaml_data = yaml.safe_load(f) or {}
 
-        if missing:
-            raise ValueError(f"❌ 缺少必要的环境变量: {', '.join(missing)}")
+        # 2. 实例化 (环境变量会自动填充根目录的字段)
+        # 将 YAML 数据注入到对应的 Pydantic 模型中
+        return cls(
+            common=CommonConfig(**yaml_data.get("common", {})),
+            strategies=StrategiesConfig(**yaml_data.get("strategies", {})),
+            services=ServicesConfig(**yaml_data.get("services", {}))
+        )
+
+    def get_trade_qty(self, symbol: str) -> float:
+        """辅助方法：获取交易数量"""
+        return self.common.trade_quantities.get(symbol, self.common.trade_quantities.get("DEFAULT", 0.0001))
+
+
+# 全局单例
+try:
+    settings = Settings.load()
+except Exception as e:
+    print(f"❌ 配置加载严重错误: {e}")
+    # 允许在没有 config.yaml 时启动（仅依赖环境变量），但策略可能缺参数
+    settings = Settings()
