@@ -21,3 +21,7 @@ nado-protocol>=0.2.8
 
 # 私钥加密
 cryptography>=46.0.3
+
+# --- 配置管理 (新增) ---
+pydantic-settings>=2.0.0  # 用于 BaseSettings
+PyYAML>=6.0               # 用于解析 config.yaml

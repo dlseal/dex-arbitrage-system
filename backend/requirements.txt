@@ -10,7 +10,11 @@ grvt-pysdk>=0.2.1
 # Lighter.xyz (指定从 GitHub 安装)
 git+https://github.com/elliottech/lighter-python.git#egg=lighter-python
 
-# 通用依赖
+# --- 配置管理 (新增) ---
+pydantic-settings>=2.0.0  # 用于 BaseSettings
+PyYAML>=6.0               # 用于解析 config.yaml
+
+# --- 通用依赖 ---
 ccxt>=4.0.0
 python-dotenv>=1.0.0
 pandas>=2.0.0
