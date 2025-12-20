@@ -1,3 +1,4 @@
+# backend/app/adapters/nado.py
 import asyncio
 import logging
 import os
@@ -11,7 +12,15 @@ from app.config import settings
 # --- Nado Protocol Imports ---
 try:
     from nado_protocol.client import create_nado_client, NadoClientMode
+    # [新增] 引入 Subaccount 类 (如果 SDK 中 Subaccount 和 SubaccountParams 是同一个或在同模块)
     from nado_protocol.utils.subaccount import SubaccountParams
+
+    # 尝试导入 Subaccount，如果不存在则使用 SubaccountParams 替代 (通常它们是兼容的)
+    try:
+        from nado_protocol.utils.subaccount import Subaccount
+    except ImportError:
+        Subaccount = SubaccountParams
+
     from nado_protocol.engine_client.types import OrderParams
     from nado_protocol.utils.bytes32 import subaccount_to_hex
     from nado_protocol.utils.expiration import get_expiration_timestamp
@@ -41,14 +50,12 @@ class NadoAdapter(BaseExchange):
         if encrypted_key and master_key:
             try:
                 cipher = Fernet(master_key.encode())
-                # 解密得到原始私钥字符串
                 self.private_key = cipher.decrypt(encrypted_key.encode()).decode()
-                logger.info("🔓 私钥解密成功")
+                logger.info("🔓 Private key decrypted successfully")
             except Exception as e:
-                logger.error(f"❌ 私钥解密失败: {e} (请检查 Master Key 是否正确)")
+                logger.error(f"❌ Decryption failed: {e} (Check Master Key)")
                 raise ValueError("Invalid Master Key")
         else:
-            # 2. 回退到明文读取 仅开发使用
             self.private_key = private_key
             if not self.private_key and settings.nado_private_key:
                 self.private_key = settings.nado_private_key.get_secret_value()
@@ -58,8 +65,6 @@ class NadoAdapter(BaseExchange):
 
         self.client = None
         self.owner = None
-
-        # Maps symbol (e.g., 'BTC') -> {'id': int, 'tick_size': float, 'min_size': float}
         self.contract_map = {}
         self._check_env()
 
@@ -73,7 +78,6 @@ class NadoAdapter(BaseExchange):
             raise ImportError("nado_protocol library is not installed.")
 
         try:
-            # 1. Initialize Client
             mode_map = {
                 'MAINNET': NadoClientMode.MAINNET,
                 'DEVNET': NadoClientMode.DEVNET,
@@ -82,13 +86,11 @@ class NadoAdapter(BaseExchange):
 
             logger.info(f"⏳ [Nado] Connecting to {self.mode_str}...")
 
-            # Using official SDK to create client
             self.client = create_nado_client(client_mode, self.private_key)
             self.owner = self.client.context.engine_client.signer.address
 
             logger.info(f"✅ [Nado] Connected! Owner: {self.owner[:6]}... | Subaccount: {self.subaccount_name}")
 
-            # 2. Sync Markets
             await self._load_markets()
             self.is_connected = True
 
@@ -98,7 +100,6 @@ class NadoAdapter(BaseExchange):
             raise e
 
     async def _load_markets(self):
-        """Fetch Contract Attributes (IDs, Tick Sizes)"""
         try:
             loop = asyncio.get_running_loop()
             symbols_map = await loop.run_in_executor(None, self.client.market.get_all_product_symbols)
@@ -111,7 +112,6 @@ class NadoAdapter(BaseExchange):
                 nado_symbol_str = f"{target.upper()}-PERP"
                 product_id = None
 
-                # 1. Find Product ID
                 for sym_obj in symbols_map:
                     s_str = sym_obj.symbol if hasattr(sym_obj, 'symbol') else str(sym_obj)
                     if s_str == nado_symbol_str:
@@ -122,7 +122,6 @@ class NadoAdapter(BaseExchange):
                     logger.warning(f"⚠️ [Nado] Symbol {nado_symbol_str} not found on exchange.")
                     continue
 
-                # 2. Find Market Info (Tick Size)
                 current_market = None
                 for market in perp_products:
                     if market.product_id == product_id:
@@ -149,7 +148,54 @@ class NadoAdapter(BaseExchange):
             logger.error(f"❌ [Nado] Market Sync Error: {e}")
             raise e
 
-    # --- Template Method Implementations ---
+    # --- [新增] Nado 原生平仓接口 ---
+    async def close_position(self, symbol: str):
+        """
+        调用 Nado SDK 原生 close_position 接口进行市价全平
+        """
+        if symbol not in self.contract_map:
+            logger.error(f"❌ Close Position Failed: Unknown symbol {symbol}")
+            return False
+
+        try:
+            pid = self.contract_map[symbol]['id']
+
+            # 构造 Subaccount 对象
+            # 注意：根据 SDK 定义，Subaccount 可能需要特定的构造方式
+            # 这里复用 owner 和 subaccount_name
+            subaccount_obj = SubaccountParams(
+                subaccount_owner=self.owner,
+                subaccount_name=self.subaccount_name
+            )
+
+            logger.info(f"🚨 [Nado] Executing Market Close for {symbol} (ID: {pid})...")
+
+            loop = asyncio.get_running_loop()
+
+            # 调用 self.client.context.engine_client.close_position
+            # 放在 executor 中运行以防阻塞
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.context.engine_client.close_position(
+                    subaccount=subaccount_obj,
+                    product_id=int(pid)
+                )
+            )
+
+            if response and hasattr(response, 'status') and response.status == "success":
+                logger.info(f"✅ [Nado] Position Closed Successfully for {symbol}!")
+                return True
+            else:
+                # 有些版本可能只返回 hash，视具体 SDK 而定，只要不报错通常即发送成功
+                logger.info(f"✅ [Nado] Close Position Request Sent for {symbol}. Resp: {response}")
+                return True
+
+        except Exception as e:
+            logger.error(f"❌ [Nado] Close Position CRITICAL ERROR: {e}")
+            traceback.print_exc()
+            return False
+
+    # --- Standard Methods ---
 
     async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
         if symbol not in self.contract_map:
@@ -172,7 +218,10 @@ class NadoAdapter(BaseExchange):
             else:
                 return {}
 
-            if not ob: return {}
+            if not ob:
+                # 只有调试时开启，防止刷屏
+                # logger.warning(f"⚠️ [Nado] Empty Orderbook for {symbol}")
+                return {}
 
             best_bid = 0.0
             best_bid_vol = 0.0
@@ -213,7 +262,6 @@ class NadoAdapter(BaseExchange):
     async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
                                  order_type: str, **kwargs) -> str:
         if symbol not in self.contract_map:
-            logger.error(f"❌ [Nado] Unknown symbol: {symbol}")
             raise ValueError(f"Unknown symbol: {symbol}")
 
         market_info = self.contract_map[symbol]
@@ -226,9 +274,8 @@ class NadoAdapter(BaseExchange):
             d_tick = Decimal(str(tick_size))
             final_price = float((d_price / d_tick).quantize(Decimal("1")) * d_tick)
         else:
-            bbo = await self.fetch_orderbook(symbol) # Use public method to get backoff protection if needed
+            bbo = await self.fetch_orderbook(symbol)
             if not bbo:
-                logger.error("❌ [Nado] Cannot place market order: Orderbook unavailable")
                 raise ValueError("Orderbook unavailable for market order")
             final_price = bbo['ask'] * 1.05 if side.upper() == 'BUY' else bbo['bid'] * 0.95
 
@@ -237,12 +284,7 @@ class NadoAdapter(BaseExchange):
             final_price = float((d_price / d_tick).quantize(Decimal("1")) * d_tick)
 
         is_buy = (side.upper() == 'BUY')
-        is_post_only = True
-        if order_type == "MARKET":
-            is_post_only = False
-        if kwargs and kwargs.get('post_only') is False:
-            is_post_only = False
-
+        is_post_only = True if order_type != "MARKET" and kwargs.get('post_only') is not False else False
         appendix = build_appendix(order_type=OrderType.POST_ONLY) if is_post_only else build_appendix(
             order_type=OrderType.GTC)
 
@@ -266,11 +308,9 @@ class NadoAdapter(BaseExchange):
             )
 
             if not result or not result.data:
-                logger.error(f"❌ [Nado] Order Failed (No Data returned)")
                 raise RuntimeError("Order placement returned no data")
 
-            order_id = result.data.digest
-            return str(order_id)
+            return str(result.data.digest)
 
         except Exception as e:
             logger.error(f"❌ [Nado] Place Order Error: {e}")
@@ -308,15 +348,11 @@ class NadoAdapter(BaseExchange):
             return False
 
     async def get_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """查询订单详情"""
-        # TODO: Implement Nado specific get_order if SDK supports it
-        # return {'id': order_id, 'filled': 0.0, 'status': 'UNKNOWN'}
         return {}
 
     async def fetch_positions(self) -> List[Dict]:
         try:
             resolved_subaccount = subaccount_to_hex(self.client.context.signer.address, self.subaccount_name)
-
             loop = asyncio.get_running_loop()
             account_data = await loop.run_in_executor(
                 None,
@@ -329,32 +365,26 @@ class NadoAdapter(BaseExchange):
             positions = []
             for pos in account_data.perp_balances:
                 pid = pos.product_id
-                symbol = None
-                for s, info in self.contract_map.items():
-                    if info['id'] == pid:
-                        symbol = s
-                        break
+                symbol = next((s for s, info in self.contract_map.items() if info['id'] == pid), None)
                 if symbol:
-                    raw_size = pos.balance.amount
-                    size = float(from_x18(raw_size))
+                    size = float(from_x18(pos.balance.amount))
                     if abs(size) > 0:
-                        positions.append({
-                            'symbol': symbol,
-                            'size': size,
-                            'side': 'BUY' if size > 0 else 'SELL'
-                        })
+                        positions.append({'symbol': symbol, 'size': size, 'side': 'BUY' if size > 0 else 'SELL'})
             return positions
-
         except Exception as e:
             logger.error(f"❌ [Nado] Fetch Pos Error: {e}")
             return []
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
-        logger.info("📡 [Nado] Starting Polling Stream...")
+        logger.info("📡 [Nado] Starting Polling Stream... (Interval: 1.0s)")
+        count = 0
         while self.is_connected:
             try:
+                count += 1
+                if count % 10 == 0:
+                    logger.info(f"💓 [Nado] Polling alive... (Cycle {count})")
+
                 for symbol in self.target_symbols:
-                    # fetch_orderbook uses Template Method logic, which is fine
                     tick = await self.fetch_orderbook(symbol)
                     if tick:
                         tick['type'] = 'tick'

@@ -95,7 +95,7 @@ strategies:
 
     # 初始兜底参数
     upper_price: 100000.0
-    lower_price: 90000.0
+    lower_price: 50000.0
     grid_count: 20
 
     # 资金管理

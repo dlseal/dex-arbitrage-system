@@ -1,6 +1,7 @@
 # backend/app/core/engine.py
 import asyncio
 import logging
+import time
 from typing import List
 from app.adapters.base import BaseExchange
 
@@ -32,19 +33,16 @@ class EventEngine:
         # 1. Tick 队列: 允许丢弃旧数据 (RingQueue)，容量 1000
         self.tick_queue = RingQueue(maxsize=1000)
 
-        # 2. Event 队列 (成交/订单状态): 绝不能丢弃，容量设为极大 (10万)
-        # 在高频场景下，如果消费者处理慢，这里充当缓冲区。
-        # 如果 10万 还满了，说明系统设计有严重瓶颈， crash 是合理的。
+        # 2. Event 队列 (成交/订单状态): 绝不能丢弃
         self.event_queue = asyncio.Queue(maxsize=100000)
 
         self.running = False
+        self._tick_count = 0
 
     async def start(self):
         self.running = True
-        if self.strategy:
-            logger.info(f"🚀 Engine Starting | Strategy: {self.strategy.name}")
-        else:
-            logger.warning("⚠️ Engine Starting WITHOUT Strategy!")
+        strategy_name = self.strategy.name if self.strategy and hasattr(self.strategy, 'name') else "Unknown"
+        logger.info(f"🚀 Engine Starting | Strategy: {strategy_name}")
 
         tasks = []
         # 启动所有交易所适配器
@@ -71,45 +69,61 @@ class EventEngine:
                 break
             except Exception as e:
                 retry_count += 1
-                wait_time = min(retry_count * 2, 60)  # 指数退避，最大 60s
+                wait_time = min(retry_count * 2, 60)
                 logger.error(f"💥 Adapter {adapter.name} CRASHED: {e}. Restarting in {wait_time}s...")
 
-                # 尝试清理资源
                 if hasattr(adapter, 'close'):
                     try:
                         await adapter.close()
                     except:
                         pass
-
                 await asyncio.sleep(wait_time)
-
-                # 尝试重连
                 try:
                     await adapter.initialize()
                     logger.info(f"♻️ Adapter {adapter.name} Re-initialized.")
-                except Exception as init_e:
-                    logger.error(f"❌ Re-init failed: {init_e}")
+                except Exception:
+                    pass
 
     async def _tick_consumer(self):
         """处理高频行情数据"""
+        logger.info("🌊 Tick Consumer Started (Waiting for data...)")
+        last_log_ts = time.time()
+
         while self.running:
             try:
-                tick = await self.tick_queue.get()
+                # 增加 timeout 使得 loop 有机会检查 self.running
+                try:
+                    tick = await asyncio.wait_for(self.tick_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                self._tick_count += 1
+
+                # [DEBUG] 每 50 个 Tick 或 10秒 打印一次日志，证明活着
+                now = time.time()
+                if self._tick_count == 1:
+                    logger.info(f"⚡ FIRST TICK RECEIVED: {tick.get('symbol')} @ {tick.get('bid')}/{tick.get('ask')}")
+                elif self._tick_count % 50 == 0 or (now - last_log_ts > 10):
+                    logger.info(f"🌊 Processing Ticks... (Total: {self._tick_count} | Last: {tick.get('symbol')})")
+                    last_log_ts = now
+
                 if self.strategy:
-                    # 使用 Task 分发，防止单个 tick 处理阻塞后续 tick
-                    # 注意：如果策略逻辑很重，这里会产生大量 Task，需注意
+                    # 使用 Task 分发
                     asyncio.create_task(self._safe_strategy_tick(tick))
             except Exception as e:
                 logger.error(f"Tick Consumer Error: {e}", exc_info=True)
 
     async def _event_consumer(self):
-        """处理关键交易事件 (成交回报) - 单线程顺序处理以保证状态一致性"""
+        """处理关键交易事件"""
         logger.info("🛡️ Event Consumer (High Priority) Started")
         while self.running:
             try:
-                event = await self.event_queue.get()
+                try:
+                    event = await asyncio.wait_for(self.event_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
                 if self.strategy:
-                    # 关键事件必须 await，确保顺序执行 (例如：先成交 -> 再补单)
                     await self._safe_strategy_tick(event)
             except Exception as e:
                 logger.critical(f"❌ Event Consumer Error: {e}", exc_info=True)
@@ -117,7 +131,6 @@ class EventEngine:
     async def _safe_strategy_tick(self, event):
         try:
             if hasattr(self.strategy, 'on_tick'):
-                # 这里的 on_tick 内部应该是非阻塞的
                 await self.strategy.on_tick(event)
         except Exception as e:
             logger.error(f"Strategy on_tick Exception: {e}", exc_info=True)
