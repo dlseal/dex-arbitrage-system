@@ -241,10 +241,10 @@ class HFTMarketMakingStrategy:
 
                 # 6. [调试] 打印详细的计算逻辑 (每5秒一次)
                 if current_ts - self.last_log_ts > 5.0:
+                    lag = current_ts - tick_ts
                     logger.info(
-                        f"🧮 [Calc] Mid:{mid_price:.1f} Vol:{volatility:.2f} "
-                        f"Skew:{inv_risk:.2f} (Inv:{current_inv:.4f}) | "
-                        f"Mkt:{bid_p:.0f}/{ask_p:.0f} -> My:{target_bid:.0f}/{target_ask:.0f}"
+                        f"🧮 [Calc] 🕒Lag:{lag * 1000:.1f}ms | Mid:{mid_price:.1f} Vol:{volatility:.2f} "
+                        f"Skew:{inv_risk:.2f} | Mkt:{bid_p:.0f}/{ask_p:.0f}"
                     )
                     self.last_log_ts = current_ts
 
