@@ -1,8 +1,8 @@
-# backend/app/strategies/hft_market_making.py
 import asyncio
 import logging
 import time
 import math
+import json
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from typing import Dict, Any, Optional
@@ -192,6 +192,9 @@ class HFTMarketMakingStrategy:
                 raw_bid = reservation_price - half_spread
                 raw_ask = reservation_price + half_spread
 
+                # [优化] 防止Post-Only互穿：更严格的边界检查
+                # Polling 模式下，Bid可能已经上涨，所以我们不能只依赖 snapshot 的 price
+                # 至少保持在 snapshot bid + tick
                 raw_bid = min(raw_bid, ask_p - self.tick_size)
                 raw_ask = max(raw_ask, bid_p + self.tick_size)
 
@@ -302,18 +305,19 @@ class HFTMarketMakingStrategy:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _manage_order_side(self, side, target_price):
+        """
+        下单管理：包含 Post-Only 失败后的自动重试逻辑 (Chase the Maker)
+        """
         if self.pending_actions[side]: return
 
         # --- Pre-trade Risk Check ---
         if self.risk_controller:
-            # HFT 对延迟敏感，但在下单前检查一次是必要的
-            # 注意：如果 RiskController 计算太慢，可能需要优化
             try:
                 allowed = await self.risk_controller.check_trade_risk(self.symbol, self.quantity, target_price)
                 if not allowed:
                     return
             except Exception:
-                pass  # 风控挂了不应阻塞策略，或者视重要程度决定是否 return
+                pass
 
         self.pending_actions[side] = True
 
@@ -321,6 +325,7 @@ class HFTMarketMakingStrategy:
             current_id = self.active_orders[side]
             current_price = self.active_prices[side]
 
+            # 价格变动不大则忽略，减少 API 调用
             if current_id and current_price > 0:
                 diff_ticks = abs(target_price - current_price) / self.tick_size
                 if diff_ticks < self.update_threshold_ticks:
@@ -333,24 +338,54 @@ class HFTMarketMakingStrategy:
                 except Exception:
                     pass
 
-            new_id = await adapter.create_order(
-                symbol=self.symbol,
-                side=side,
-                amount=self.quantity,
-                price=target_price,
-                params={"post_only": True}
-            )
+            # 尝试下单，增加重试逻辑处理 Post-Only 失败 (Error 2008)
+            retry_price = target_price
+            for attempt in range(2):
+                try:
+                    new_id = await adapter.create_order(
+                        symbol=self.symbol,
+                        side=side,
+                        amount=self.quantity,
+                        price=retry_price,
+                        params={"post_only": True}
+                    )
 
-            if new_id:
-                self.active_orders[side] = new_id
-                self.active_prices[side] = target_price
-            else:
-                self.active_orders[side] = None
-                self.active_prices[side] = 0.0
+                    if new_id:
+                        self.active_orders[side] = new_id
+                        self.active_prices[side] = retry_price
+                        # 成功则退出重试循环
+                        break
+                    else:
+                        self.active_orders[side] = None
+                        self.active_prices[side] = 0.0
+                        break
+
+                except Exception as e:
+                    err_str = str(e)
+                    # 处理 "2008": Post-Only crosses book
+                    # 处理 "post-only": 通用文本匹配
+                    if "2008" in err_str or "post-only" in err_str.lower():
+                        if attempt == 0:
+                            # 第一次失败，计算新的安全价格
+                            # 如果是买单，价格太高导致 Cross，需要降低价格
+                            # 如果是卖单，价格太低导致 Cross，需要提高价格
+                            offset = self.tick_size
+                            if side == 'BUY':
+                                retry_price = retry_price - offset
+                                logger.warning(f"⚠️ [HFT] Post-Only Fail (BUY). Retrying @ {retry_price}")
+                            else:
+                                retry_price = retry_price + offset
+                                logger.warning(f"⚠️ [HFT] Post-Only Fail (SELL). Retrying @ {retry_price}")
+                            continue  # 进入下一次循环重试
+
+                    # 其他错误直接抛出或记录，不再重试
+                    logger.error(f"Quote {side} Error: {e}")
+                    self.active_orders[side] = None
+                    self.active_prices[side] = 0.0
+                    break
 
         except Exception as e:
-            # 记录错误，但不一定要触发熔断，HFT 偶尔报错很正常
-            logger.error(f"Quote {side} Error: {e}")
+            logger.error(f"Quote {side} Critical Error: {e}")
         finally:
             self.pending_actions[side] = False
 
