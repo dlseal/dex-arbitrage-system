@@ -12,11 +12,15 @@ logger = logging.getLogger("AiGridStrategy")
 
 
 class AiAdaptiveGridStrategy:
-    def __init__(self, adapters: Dict[str, Any], symbol: str, exchange: str):
+    def __init__(self, adapters: Dict[str, Any], risk_controller: Any = None):
         self.adapters = adapters
-        self.symbol = symbol
-        self.exchange = exchange
-        self.adapter = adapters.get(exchange)
+        self.risk_controller = risk_controller
+        self.exchange = settings.strategies.ai_grid.exchange
+        if not settings.common.target_symbols:
+            raise ValueError("Config target_symbols is empty")
+        self.symbol = settings.common.target_symbols[0]
+
+        self.adapter = adapters.get(self.exchange)
 
         # --- 核心配置 ---
         self.grid_levels = 10  # 网格数量
@@ -122,8 +126,11 @@ class AiAdaptiveGridStrategy:
             # 假设 AI 返回: center=1000, range=200 (即 900-1100), volatility='high'
 
             # 这里用简单逻辑模拟 AI 建议
-            ticker = await self.adapter.fetch_ticker(self.symbol)
-            price = ticker['last']
+            ob = await self.adapter.fetch_orderbook(self.symbol)
+            if not ob:
+                logger.warning("Orderbook data missing, skipping grid update")
+                return
+            price = (ob['bid'] + ob['ask']) / 2
 
             # [优化点3] 动态网格间距：波动大间距大，波动小间距小
             # volatility_factor = 0.01 if ai_says_high_volatility else 0.005

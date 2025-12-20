@@ -205,7 +205,7 @@ class GrvtAdapter(BaseExchange):
                         amount=qty_float,
                         price=None,
                         params=req_params
-                    ), timeout=1.0)
+                    ), timeout=3.0)
             else:
                 await asyncio.wait_for(
                     self.ws_client.create_limit_order(
@@ -214,7 +214,7 @@ class GrvtAdapter(BaseExchange):
                         amount=qty_float,
                         price=px_float,
                         params=req_params
-                    ), timeout=1.0)
+                    ), timeout=3.0)
 
             return str(client_order_id)
 

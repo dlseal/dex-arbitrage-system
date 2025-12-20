@@ -7,7 +7,8 @@ from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from typing import Dict, Any, Optional
 
-from app.config import settings  # <--- 修改导入
+from app.config import settings
+from app.core.risk_controller import GlobalRiskController
 
 logger = logging.getLogger("HFT_AS_OFI")
 
@@ -68,9 +69,10 @@ class PriceQuantizer:
 
 
 class HFTMarketMakingStrategy:
-    def __init__(self, adapters: Dict[str, Any]):
+    def __init__(self, adapters: Dict[str, Any], risk_controller: GlobalRiskController = None):
         self.name = "AS_OFI_Pro_v3_Optimized"
         self.adapters = adapters
+        self.risk_controller = risk_controller
 
         # 读取配置区域
         conf = settings.strategies.hft_mm
@@ -149,9 +151,7 @@ class HFTMarketMakingStrategy:
                 # tick['ts'] 通常是毫秒
                 tick_ts = tick.get('ts', 0) / 1000.0
 
-                # [Fix 3] 修复时间戳丢弃逻辑
-                # 原代码: if current_ts - tick_ts > 1.0: return
-                # 新代码: 使用 abs() 并放宽到 5秒，防止服务器时钟略慢导致数据全丢
+                # [优化] 使用 abs() 并放宽到 5秒，防止服务器时钟略慢导致数据全丢
                 if abs(current_ts - tick_ts) > 5.0:
                     return
 
@@ -260,15 +260,27 @@ class HFTMarketMakingStrategy:
         logger.critical(f"🚨 [BAILOUT] {side} Size:{abs(inventory)} Val:{value:.0f}")
 
         try:
-            await self.adapters[self.exchange_name].create_order(
-                symbol=self.symbol,
-                side=side,
-                amount=abs(inventory),
-                order_type='MARKET'
-            )
+            # Bailout 不做风控检查，优先平仓
+            # 简单的重试机制
+            for i in range(3):
+                try:
+                    await self.adapters[self.exchange_name].create_order(
+                        symbol=self.symbol,
+                        side=side,
+                        amount=abs(inventory),
+                        order_type='MARKET'
+                    )
+                    break
+                except Exception as inner_e:
+                    if i == 2: raise inner_e
+                    await asyncio.sleep(0.5)
+
             await asyncio.sleep(1.0)
         except Exception as e:
             logger.error(f"❌ Bailout Failed: {e}")
+            # 如果 Bailout 失败，触发风控熔断
+            if self.risk_controller:
+                self.risk_controller.trigger_circuit_breaker(f"Bailout Failed: {e}")
         finally:
             self.pending_actions[side] = False
 
@@ -291,6 +303,18 @@ class HFTMarketMakingStrategy:
 
     async def _manage_order_side(self, side, target_price):
         if self.pending_actions[side]: return
+
+        # --- Pre-trade Risk Check ---
+        if self.risk_controller:
+            # HFT 对延迟敏感，但在下单前检查一次是必要的
+            # 注意：如果 RiskController 计算太慢，可能需要优化
+            try:
+                allowed = await self.risk_controller.check_trade_risk(self.symbol, self.quantity, target_price)
+                if not allowed:
+                    return
+            except Exception:
+                pass  # 风控挂了不应阻塞策略，或者视重要程度决定是否 return
+
         self.pending_actions[side] = True
 
         try:
@@ -325,6 +349,7 @@ class HFTMarketMakingStrategy:
                 self.active_prices[side] = 0.0
 
         except Exception as e:
+            # 记录错误，但不一定要触发熔断，HFT 偶尔报错很正常
             logger.error(f"Quote {side} Error: {e}")
         finally:
             self.pending_actions[side] = False
