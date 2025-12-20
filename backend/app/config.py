@@ -105,18 +105,37 @@ class Settings(BaseSettings):
     services: ServicesConfig = Field(default_factory=ServicesConfig)
 
     llm_prompt_template: str = """
-        你是一个加密货币高频量化交易专家。
-        【当前市场状态】交易对: {symbol}, 最新价格: {price}
-        【当前策略】状态: {current_status}, 参数: {current_params}
-        【任务】分析行情，决定动作。
+        你是一个加密货币高频量化交易专家。你正在管理一个 {symbol} 的网格交易策略。
+
+        【市场数据】
+        1. 价格: {price}
+        2. 波动率 (ATR-14): {atr} (如果 ATR 升高，应增加网格间距/减少网格数)
+        3. 趋势指标: RSI-14={rsi}, 布林带位置={bb_pct}% (0=下轨, 100=上轨)
+        4. 短期趋势 (1H): {trend_1h}
+        5. 盘口压力: 买盘 {bid_vol} vs 卖盘 {ask_vol} (Imbalance: {imbalance}%)
+        
+        【最近 K 线 (15m)】
+        {recent_candles}
+
+        【当前策略状态】
+        状态: {current_status}
+        当前持仓: {inventory}
+        参数: {current_params}
+
+        【任务】
+        请根据波动率(ATR)和趋势(RSI/MA)优化网格参数。
+        - 如果 RSI > 70 (超买)，考虑向上偏移区间或减少多单网格。
+        - 如果 ATR 激增，说明波动剧烈，请扩大 grid_count 或 widening 价格区间以防破网。
+        - 如果盘口卖压极大，考虑下调 upper_price。
+
         请严格返回JSON格式：
         {{
             "action": "UPDATE" | "CONTINUE",
             "upper_price": <float>,
             "lower_price": <float>,
             "grid_count": <int>,
-            "duration_hours": <float>,
-            "reason": "<string>"
+            "duration_hours": <float>, 
+            "reason": "<string, max 50 words>"
         }}
     """
 

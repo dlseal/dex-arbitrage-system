@@ -131,8 +131,22 @@ class GrvtInventoryFarmStrategy:
         hedge_price = lighter_tick['bid'] if target_side == 'BUY' else lighter_tick['ask']
         if hedge_price <= 0: return
 
-        est_pnl = (hedge_price - target_prices[0]) / target_prices[0] if target_side == 'BUY' else \
-            (target_prices[0] - hedge_price) / hedge_price
+        # [Fix 5] 使用 Decimal 修复 PnL 计算精度
+        try:
+            d_hedge = Decimal(str(hedge_price))
+            d_target = Decimal(str(target_prices[0]))
+
+            if target_side == 'BUY':
+                # 买入逻辑: (Hedge卖价 - Target买价) / Target买价
+                est_pnl_decimal = (d_hedge - d_target) / d_target
+            else:
+                # 卖出逻辑: (Target卖价 - Hedge买价) / Hedge买价
+                est_pnl_decimal = (d_target - d_hedge) / d_hedge
+
+            est_pnl = float(est_pnl_decimal)
+        except Exception:
+            # 防止除以零或其他数学错误
+            est_pnl = -1.0
 
         if est_pnl < settings.strategies.farming.max_slippage_tolerance:
             await self._cancel_local_orders(symbol)

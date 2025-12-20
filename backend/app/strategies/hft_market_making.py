@@ -146,8 +146,13 @@ class HFTMarketMakingStrategy:
         async with self.calc_lock:
             try:
                 current_ts = time.time()
+                # tick['ts'] 通常是毫秒
                 tick_ts = tick.get('ts', 0) / 1000.0
-                if current_ts - tick_ts > 1.0:
+
+                # [Fix 3] 修复时间戳丢弃逻辑
+                # 原代码: if current_ts - tick_ts > 1.0: return
+                # 新代码: 使用 abs() 并放宽到 5秒，防止服务器时钟略慢导致数据全丢
+                if abs(current_ts - tick_ts) > 5.0:
                     return
 
                 if self.tick_size <= 0:

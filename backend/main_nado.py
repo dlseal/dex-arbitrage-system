@@ -18,22 +18,20 @@ if current_dir not in sys.path:
 # 必须在导入任何其他 app 模块之前执行！
 # -------------------------------------------------------------------------
 try:
-    # 先导入我们的专用配置
+    # 1. 导入 Nado 专用配置
     from app import config_nado
 
-    # 强行将 'app.config' 指向 'app.config_nado'
-    # 这样当 NadoAdapter 执行 "from app.config import settings" 时，
-    # 实际上拿到的是 config_nado 里的 settings
+    # 2. 强行劫持 sys.modules
     sys.modules['app.config'] = config_nado
 
-    # 为了保险，把 settings 也直接挂载过去（防止 from app.config import settings 写法）
+    # 3. 双重保险：挂载 settings 对象
     if not hasattr(sys.modules['app.config'], 'settings'):
         sys.modules['app.config'].settings = config_nado.settings
 
-    print("✅ 成功劫持配置模块: app.config -> app.config_nado")
+    print("✅ [Security] Config module hijacked: app.config -> app.config_nado")
 
 except Exception as e:
-    print(f"❌ 配置劫持失败: {e}")
+    print(f"❌ Config hijack failed: {e}")
     sys.exit(1)
 
 # -------------------------------------------------------------------------
