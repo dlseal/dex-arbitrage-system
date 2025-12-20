@@ -5,44 +5,43 @@ import sys
 import os
 import signal
 import getpass
+import traceback
 
-# -------------------------------------------------------------------------
-# 1. 路径与环境准备
-# -------------------------------------------------------------------------
+# 1. 路径设置
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# -------------------------------------------------------------------------
-# 2. [关键修复] 劫持 app.config
-# 必须在导入任何其他 app 模块之前执行！
-# -------------------------------------------------------------------------
+# 2. [关键修复] 配置劫持 - 必须最先执行
 try:
-    # 1. 导入 Nado 专用配置
-    from app import config_nado
+    # 强制加载 nado 专用配置
+    import app.config_nado as config_nado
 
-    # 2. 强行劫持 sys.modules
+    # 注入到 sys.modules，欺骗后续的 import app.config
     sys.modules['app.config'] = config_nado
 
-    # 3. 双重保险：挂载 settings 对象
-    if not hasattr(sys.modules['app.config'], 'settings'):
-        sys.modules['app.config'].settings = config_nado.settings
+    # 确保 settings 对象存在
+    if not hasattr(config_nado, 'settings'):
+        print("❌ Error: config_nado missing 'settings' object")
+        sys.exit(1)
 
-    print("✅ [Security] Config module hijacked: app.config -> app.config_nado")
+    print("✅ [Boot] Config hijacked: app.config -> app.config_nado")
 
 except Exception as e:
-    print(f"❌ Config hijack failed: {e}")
+    print(f"❌ Config hijack critical failure: {e}")
+    traceback.print_exc()
     sys.exit(1)
 
-# -------------------------------------------------------------------------
-# 3. 现在可以安全导入业务模块了
-# -------------------------------------------------------------------------
-# 此时导入 NadoAdapter，它内部 import app.config 不会再报错
-from app.adapters.nado import NadoAdapter
-from app.core.engine import EventEngine
-
-# 引入 Nado 专用配置对象
-settings = config_nado.settings
+# 3. 业务模块导入 (必须在劫持之后)
+try:
+    from app.adapters.nado import NadoAdapter
+    from app.core.engine import EventEngine
+    # 这里的 settings 已经是 config_nado.settings
+    from app.config import settings
+except ImportError as e:
+    print(f"❌ Import Error: {e}")
+    traceback.print_exc()
+    sys.exit(1)
 
 logging.basicConfig(
     level=settings.common.log_level,
@@ -53,25 +52,19 @@ logger = logging.getLogger("NadoMain")
 
 
 async def main():
-    logger.info("🚀 启动 Nado 专用交易系统 (Pydantic v1 / Web3 v6 兼容模式)")
+    logger.info(f"🚀 Nado Trading System Starting (Mode: {settings.nado_mode})")
 
-    # --- 密钥解密逻辑 ---
+    # --- 密钥处理 ---
     if settings.encrypted_nado_key and not os.getenv("MASTER_KEY"):
-        print("\n" + "=" * 50)
-        print("🔐 安全模式: 检测到加密密钥")
-        print("=" * 50)
         try:
-            key = getpass.getpass("🔑 请输入 Master Key 解密 Nado 私钥 > ")
+            print("\n🔐 Security Check")
+            key = getpass.getpass("Enter Master Key > ")
             if not key: return
             os.environ["MASTER_KEY"] = key.strip()
         except KeyboardInterrupt:
             return
 
-    # --- 策略选择 ---
-    strategy_type = settings.strategies.active
-    logger.info(f"📋 当前策略: {strategy_type}")
-
-    # --- 加载 Adapter ---
+    # --- 初始化 Adapter ---
     try:
         nado_key = settings.nado_private_key.get_secret_value() if settings.nado_private_key else None
 
@@ -83,59 +76,70 @@ async def main():
         )
         adapters_map = {adapter.name: adapter}
         adapters = [adapter]
-        logger.info("📦 Nado Adapter 已加载")
     except Exception as e:
-        logger.critical(f"❌ Nado Adapter 初始化失败: {e}", exc_info=True)
+        logger.critical(f"❌ Adapter Init Failed: {e}", exc_info=True)
         return
 
-    # --- 加载策略 ---
-    # 注意：这里也需要处理策略内部对 app.config 的引用
-    strategy = None
+    # --- 初始化策略 ---
+    strategy_type = settings.strategies.active
+    logger.info(f"📋 Strategy: {strategy_type}")
 
+    strategy = None
     try:
         if strategy_type == "AI_GRID":
             from app.strategies.ai_grid import AiAdaptiveGridStrategy
+            # 注入 RiskController 如果有的话，这里简化为 None 或自行初始化
             strategy = AiAdaptiveGridStrategy(adapters_map)
-
         elif strategy_type == "HFT_MM":
             from app.strategies.hft_market_making import HFTMarketMakingStrategy
             strategy = HFTMarketMakingStrategy(adapters_map)
         else:
-            logger.error(f"❌ Nado 模式不支持策略: {strategy_type} (仅支持 AI_GRID 或 HFT_MM)")
+            logger.error(f"❌ Unsupported Strategy: {strategy_type}")
             return
-    except ImportError as e:
-        logger.error(f"❌ 策略加载失败 (依赖缺失): {e}")
-        return
     except Exception as e:
-        logger.error(f"❌ 策略初始化错误: {e}", exc_info=True)
+        logger.critical(f"❌ Strategy Init Failed: {e}", exc_info=True)
         return
 
     # --- 启动引擎 ---
     engine = EventEngine(exchanges=adapters, strategy=strategy)
 
-    def handle_exit(sig, frame):
-        logger.info("\n🛑 正在停止系统...")
-        sys.exit(0)
+    # 信号处理
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
 
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
+    def signal_handler():
+        logger.info("🛑 Stop signal received.")
+        stop_event.set()
 
-    logger.info("🔌 连接交易所...")
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+
+    logger.info("🔌 Connecting to Exchange...")
     try:
         await adapter.initialize()
     except Exception as e:
-        logger.error(f"❌ 连接失败: {e}")
+        logger.error(f"❌ Connection Failed: {e}")
         return
 
-    logger.info("📡 启动事件循环...")
-    await engine.start()
+    logger.info("📡 Engine Start")
+    engine_task = asyncio.create_task(engine.start())
+
+    await stop_event.wait()
+
+    # 优雅关闭
+    logger.info("🛑 Shutting down...")
+    engine.running = False
+    engine_task.cancel()
+    if hasattr(adapter, 'close'):
+        await adapter.close()
+
+    try:
+        await engine_task
+    except asyncio.CancelledError:
+        pass
 
 
 if __name__ == "__main__":
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
