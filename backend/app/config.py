@@ -2,8 +2,8 @@
 import os
 import yaml
 from typing import List, Dict, Optional
-# Pydantic V1: BaseSettings 直接从 pydantic 导入
-from pydantic import BaseModel, Field, SecretStr, BaseSettings
+from pydantic import BaseModel, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # ==========================================
@@ -72,7 +72,7 @@ class ServicesConfig(BaseModel):
 
 
 # ==========================================
-# 2. 定义总配置 Settings (V1 版本写法)
+# 2. 定义总配置 Settings (整合 .env 和 .yaml)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -80,6 +80,7 @@ YAML_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yam
 
 class Settings(BaseSettings):
     # --- 环境变量 (Secrets) ---
+    # 对应 .env 文件中的 KEY，Pydantic 会自动读取并转为小写属性
     grvt_api_key: Optional[SecretStr] = None
     grvt_private_key: Optional[SecretStr] = None
     grvt_trading_account_id: Optional[str] = None
@@ -119,26 +120,23 @@ class Settings(BaseSettings):
         }}
     """
 
-    # --- Pydantic V1 配置写法 ---
-    class Config:
-        env_file = ENV_PATH
-        env_file_encoding = "utf-8"
-        extra = "ignore" # 允许 .env 中存在多余字段
+    model_config = SettingsConfigDict(
+        env_file=ENV_PATH,
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
     @classmethod
     def load(cls) -> "Settings":
         # 1. 尝试从 YAML 加载策略参数
+        yaml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
         yaml_data = {}
         if os.path.exists(YAML_PATH):
-            try:
-                with open(YAML_PATH, "r", encoding="utf-8") as f:
-                    yaml_data = yaml.safe_load(f) or {}
-            except Exception as e:
-                print(f"⚠️ YAML Load Warning: {e}")
+            with open(YAML_PATH, "r", encoding="utf-8") as f:
+                yaml_data = yaml.safe_load(f) or {}
 
-        # 2. 实例化 (环境变量会自动填充)
-        # 注意：Pydantic V1 在实例化时会先读取 env，再用传入的 kwargs 覆盖或合并
-        # 这里我们将 YAML 数据作为 kwargs 传入
+        # 2. 实例化 (环境变量会自动填充根目录的字段)
+        # 将 YAML 数据注入到对应的 Pydantic 模型中
         return cls(
             common=CommonConfig(**yaml_data.get("common", {})),
             strategies=StrategiesConfig(**yaml_data.get("strategies", {})),
@@ -146,6 +144,7 @@ class Settings(BaseSettings):
         )
 
     def get_trade_qty(self, symbol: str) -> float:
+        """辅助方法：获取交易数量"""
         return self.common.trade_quantities.get(symbol, self.common.trade_quantities.get("DEFAULT", 0.0001))
 
 
