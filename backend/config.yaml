@@ -90,16 +90,18 @@ strategies:
   # --- 4. AI 网格策略 (AI Grid) ---
   ai_grid:
     exchange: "Nado"
+    # 模式: ARITHMETIC (等差) 或 GEOMETRIC (等比)
+    grid_mode: "GEOMETRIC"
 
     # 初始兜底参数
     upper_price: 100000.0
     lower_price: 90000.0
-    grid_count: 10
+    grid_count: 20
 
     # 资金管理
     principal: 400.0      # 投入本金 (USDT)
     leverage: 5.0          # 杠杆倍数
-    min_order_size: 105.0   # 最小下单金额 (Notional)
+    min_order_size: 100.0   # 最小下单金额 (Notional)
 
     # AI 调度参数
     max_check_interval: 86400
