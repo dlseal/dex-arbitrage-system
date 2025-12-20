@@ -1,3 +1,4 @@
+# backend/app/strategies/ai_grid.py
 import asyncio
 import logging
 import time
@@ -149,6 +150,8 @@ class AiAdaptiveGridStrategy:
     def __init__(self, adapters: Dict[str, Any], risk_controller: Any = None):
         self.adapters = adapters
         self.risk_controller = risk_controller
+        # [关键修复] 添加 name 属性，防止 Engine 启动时报错
+        self.name = "AI_GRID"
 
         # 配置读取
         if hasattr(settings.strategies, 'ai_grid'):
@@ -291,23 +294,27 @@ class AiAdaptiveGridStrategy:
         rsi_val = indicators['rsi']
         trend_str = indicators['trend']
 
-        # 3. 组装 Prompt 参数
+        # 3. 组装 Prompt 参数 - 包含 ATR/RSI 等
         context_params = {
             "atr": f"{atr_val:.4f}" if atr_val else "Collecting Data",
             "rsi": f"{rsi_val:.2f}" if rsi_val else "Collecting Data",
             "trend_1h": trend_str,
             "bid_vol": ticker.get('bid_volume', 0),
             "ask_vol": ticker.get('ask_volume', 0),
-            "imbalance": 0.0,  # 可扩展计算 Orderbook Imbalance
+            "imbalance": 0.0,
             "recent_candles": self.candle_manager.get_recent_candles_str()
         }
 
+        # [关键修复] 合并参数: Config参数 + 上下文指标参数
+        # 否则 fetch_grid_advice 里的 format(**current_params) 找不到 {atr} 等 key
+        request_params = self.conf.dict()
+        request_params.update(context_params)
+
         # 4. 调用 LLM
-        # 如果数据太少(刚启动)，LLM 可能依据不足，但这符合预期
         advice = await fetch_grid_advice(
             symbol=self.symbol,
             current_price=current_price,
-            current_params=self.conf.dict(),
+            current_params=request_params,  # 传入完整字典
             status_str="ACTIVE"
         )
 
@@ -340,7 +347,6 @@ class AiAdaptiveGridStrategy:
         step = (upper - lower) / self.grid_levels
 
         # 计算每格数量 (基于 min_order_size 配置，通常是 USDT 价值)
-        # 例如 min_order_size = 100U, price = 50000 -> 0.002 BTC
         raw_qty = self.conf.min_order_size / current_price
         qty = float(Decimal(str(raw_qty)).quantize(Decimal("0.0001")))  # 简单精度控制
 
