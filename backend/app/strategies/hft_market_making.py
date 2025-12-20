@@ -1,3 +1,4 @@
+# backend/app/strategies/hft_market_making.py
 import asyncio
 import logging
 import time
@@ -36,8 +37,9 @@ class OnlineStats:
         n = len(self.values)
         if n < 2: return 0.0
         mean = self.sum / n
-        variance = (self.sq_sum / n) - (mean * mean)
-        return math.sqrt(max(0.0, variance))
+        # 防止精度误差导致负数
+        variance = max(0.0, (self.sq_sum / n) - (mean * mean))
+        return math.sqrt(variance)
 
 
 class EMACalculator:
@@ -84,7 +86,6 @@ class HFTMarketMakingStrategy:
             return
 
         self.symbol = settings.common.target_symbols[0]
-        # 使用辅助方法获取数量
         self.quantity = settings.get_trade_qty(self.symbol)
 
         logger.info(f"🎯 HFT Strategy Init: {self.exchange_name} | {self.symbol} | Qty: {self.quantity}")
@@ -95,6 +96,12 @@ class HFTMarketMakingStrategy:
         self.update_threshold_ticks = conf.update_threshold_ticks
         self.max_pos_usd = conf.max_pos_usd
         self.volatility_factor = conf.volatility_factor
+
+        # [新增] 安全限制参数 (硬编码或从配置读取)
+        # 限制单边报价偏离中间价的最大百分比 (例如 0.2%)
+        self.max_dist_pct = 0.002
+        # 限制库存倾斜导致的最大价格偏移 (USD)
+        self.max_skew_usd = 50.0
 
         self.tick_size = 0.0
         self.quantizer: Optional[PriceQuantizer] = None
@@ -115,6 +122,9 @@ class HFTMarketMakingStrategy:
         self.is_active = True
         self.pos_sync_time = 0
         self.err_count = 0
+
+        # 调试日志控制
+        self.last_log_ts = 0
 
         self._validate_adapter()
         asyncio.create_task(self._initial_setup())
@@ -148,11 +158,10 @@ class HFTMarketMakingStrategy:
         async with self.calc_lock:
             try:
                 current_ts = time.time()
-                # tick['ts'] 通常是毫秒
                 tick_ts = tick.get('ts', 0) / 1000.0
 
-                # [优化] 使用 abs() 并放宽到 5秒，防止服务器时钟略慢导致数据全丢
-                if abs(current_ts - tick_ts) > 5.0:
+                # 宽松时间检查
+                if abs(current_ts - tick_ts) > 10.0:
                     return
 
                 if self.tick_size <= 0:
@@ -165,26 +174,36 @@ class HFTMarketMakingStrategy:
                 bid_v, ask_v = self._extract_volumes(tick)
                 mid_price = (bid_p + ask_p) / 2.0
 
+                # 更新统计
                 self.mid_price_stats.update(mid_price)
                 ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
                 avg_ofi = self.ofi_ema.update(ofi)
+
+                # 波动率保护：如果数据不足，给定一个极小的默认值
                 volatility = self.mid_price_stats.get_std_dev()
-                if volatility <= 0: volatility = mid_price * 0.0001
+                if volatility <= 0: volatility = mid_price * 0.00005
 
                 async with self.inv_lock:
                     current_inv = self.inventory
 
                 pos_value = current_inv * mid_price
-                bailout_threshold = self.max_pos_usd * 2.0
 
+                # 1. 熔断检查
+                bailout_threshold = self.max_pos_usd * 2.0
                 if abs(pos_value) > bailout_threshold:
                     await self._execute_bailout(current_inv, pos_value)
                     return
 
-                inv_risk = current_inv * self.risk_aversion * (volatility ** 2)
+                # 2. 核心计算 (AS模型)
+                # [优化] 限制波动率对 skew 的影响，防止平方项爆炸
+                # 将 inv_risk 限制在 +/- max_skew_usd 范围内
+                raw_inv_risk = current_inv * self.risk_aversion * (volatility ** 2)
+                inv_risk = max(min(raw_inv_risk, self.max_skew_usd), -self.max_skew_usd)
+
                 ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
                 reservation_price = mid_price + ofi_impact - inv_risk
 
+                # 计算半价差
                 half_spread_base = (self.min_spread_ticks / 2.0) * self.tick_size
                 half_spread_vol = self.volatility_factor * volatility
                 half_spread = half_spread_base + half_spread_vol
@@ -192,18 +211,42 @@ class HFTMarketMakingStrategy:
                 raw_bid = reservation_price - half_spread
                 raw_ask = reservation_price + half_spread
 
-                # [优化] 防止Post-Only互穿：更严格的边界检查
-                # Polling 模式下，Bid可能已经上涨，所以我们不能只依赖 snapshot 的 price
-                # 至少保持在 snapshot bid + tick
-                raw_bid = min(raw_bid, ask_p - self.tick_size)
-                raw_ask = max(raw_ask, bid_p + self.tick_size)
+                # 3. [关键优化] 价格边界钳制 (Price Clamping)
+                # 确保报价不偏离中间价太远
+                max_dist = mid_price * self.max_dist_pct
+                min_safe_bid = mid_price - max_dist
+                max_safe_ask = mid_price + max_dist
 
-                target_bid = self.quantizer.quantize(raw_bid, rounding=ROUND_FLOOR)
-                target_ask = self.quantizer.quantize(raw_ask, rounding=ROUND_CEILING)
+                # 4. [关键优化] 确保不穿过盘口 (Post-Only 保护)
+                # Bid 必须 <= Ask-Tick, 且 >= MinSafe
+                # Ask 必须 >= Bid+Tick, 且 <= MaxSafe
 
+                # 初步修正
+                final_bid = min(raw_bid, ask_p - self.tick_size)  # 不能吃单
+                final_bid = max(final_bid, min_safe_bid)  # 不能太低
+
+                final_ask = max(raw_ask, bid_p + self.tick_size)  # 不能吃单
+                final_ask = min(final_ask, max_safe_ask)  # 不能太高
+
+                # 量化价格
+                target_bid = self.quantizer.quantize(final_bid, rounding=ROUND_FLOOR)
+                target_ask = self.quantizer.quantize(final_ask, rounding=ROUND_CEILING)
+
+                # 5. 最小价差保护
                 if target_ask - target_bid < self.tick_size:
-                    target_bid = self.quantizer.quantize(mid_price - self.tick_size / 2, ROUND_FLOOR)
-                    target_ask = target_bid + self.tick_size
+                    # 如果挤压得太厉害，以 mid 为中心重置
+                    center = self.quantizer.quantize(mid_price, ROUND_FLOOR)
+                    target_bid = center - self.tick_size
+                    target_ask = center + self.tick_size
+
+                # 6. [调试] 打印详细的计算逻辑 (每5秒一次)
+                if current_ts - self.last_log_ts > 5.0:
+                    logger.info(
+                        f"🧮 [Calc] Mid:{mid_price:.1f} Vol:{volatility:.2f} "
+                        f"Skew:{inv_risk:.2f} (Inv:{current_inv:.4f}) | "
+                        f"Mkt:{bid_p:.0f}/{ask_p:.0f} -> My:{target_bid:.0f}/{target_ask:.0f}"
+                    )
+                    self.last_log_ts = current_ts
 
                 allow_buy = pos_value < self.max_pos_usd
                 allow_sell = pos_value > -self.max_pos_usd
@@ -263,8 +306,6 @@ class HFTMarketMakingStrategy:
         logger.critical(f"🚨 [BAILOUT] {side} Size:{abs(inventory)} Val:{value:.0f}")
 
         try:
-            # Bailout 不做风控检查，优先平仓
-            # 简单的重试机制
             for i in range(3):
                 try:
                     await self.adapters[self.exchange_name].create_order(
@@ -277,11 +318,9 @@ class HFTMarketMakingStrategy:
                 except Exception as inner_e:
                     if i == 2: raise inner_e
                     await asyncio.sleep(0.5)
-
             await asyncio.sleep(1.0)
         except Exception as e:
             logger.error(f"❌ Bailout Failed: {e}")
-            # 如果 Bailout 失败，触发风控熔断
             if self.risk_controller:
                 self.risk_controller.trigger_circuit_breaker(f"Bailout Failed: {e}")
         finally:
@@ -305,12 +344,9 @@ class HFTMarketMakingStrategy:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _manage_order_side(self, side, target_price):
-        """
-        下单管理：包含 Post-Only 失败后的自动重试逻辑 (Chase the Maker)
-        """
         if self.pending_actions[side]: return
 
-        # --- Pre-trade Risk Check ---
+        # Pre-trade Risk Check
         if self.risk_controller:
             try:
                 allowed = await self.risk_controller.check_trade_risk(self.symbol, self.quantity, target_price)
@@ -325,7 +361,7 @@ class HFTMarketMakingStrategy:
             current_id = self.active_orders[side]
             current_price = self.active_prices[side]
 
-            # 价格变动不大则忽略，减少 API 调用
+            # 防抖动：只有价格变动超过 threshold 或者 之前没单子 时才下单
             if current_id and current_price > 0:
                 diff_ticks = abs(target_price - current_price) / self.tick_size
                 if diff_ticks < self.update_threshold_ticks:
@@ -338,8 +374,8 @@ class HFTMarketMakingStrategy:
                 except Exception:
                     pass
 
-            # 尝试下单，增加重试逻辑处理 Post-Only 失败 (Error 2008)
             retry_price = target_price
+            # 重试逻辑：处理 Post-Only 冲突
             for attempt in range(2):
                 try:
                     new_id = await adapter.create_order(
@@ -353,7 +389,6 @@ class HFTMarketMakingStrategy:
                     if new_id:
                         self.active_orders[side] = new_id
                         self.active_prices[side] = retry_price
-                        # 成功则退出重试循环
                         break
                     else:
                         self.active_orders[side] = None
@@ -361,25 +396,19 @@ class HFTMarketMakingStrategy:
                         break
 
                 except Exception as e:
-                    err_str = str(e)
-                    # 处理 "2008": Post-Only crosses book
-                    # 处理 "post-only": 通用文本匹配
-                    if "2008" in err_str or "post-only" in err_str.lower():
+                    err_str = str(e).lower()
+                    # 常见的 Post-Only 错误码处理
+                    if "2008" in err_str or "post-only" in err_str or "cross" in err_str:
                         if attempt == 0:
-                            # 第一次失败，计算新的安全价格
-                            # 如果是买单，价格太高导致 Cross，需要降低价格
-                            # 如果是卖单，价格太低导致 Cross，需要提高价格
+                            # 第一次失败，根据方向微调价格
                             offset = self.tick_size
                             if side == 'BUY':
-                                retry_price = retry_price - offset
-                                logger.warning(f"⚠️ [HFT] Post-Only Fail (BUY). Retrying @ {retry_price}")
+                                retry_price -= offset
                             else:
-                                retry_price = retry_price + offset
-                                logger.warning(f"⚠️ [HFT] Post-Only Fail (SELL). Retrying @ {retry_price}")
-                            continue  # 进入下一次循环重试
+                                retry_price += offset
+                            continue
 
-                    # 其他错误直接抛出或记录，不再重试
-                    logger.error(f"Quote {side} Error: {e}")
+                    logger.warning(f"⚠️ Quote {side} Fail: {e}")
                     self.active_orders[side] = None
                     self.active_prices[side] = 0.0
                     break
@@ -424,7 +453,6 @@ class HFTMarketMakingStrategy:
             adapter = self.adapters[self.exchange_name]
             positions = []
 
-            # 兼容多种适配器的获取持仓方式
             if hasattr(adapter, 'fetch_positions') and callable(adapter.fetch_positions):
                 if asyncio.iscoroutinefunction(adapter.fetch_positions):
                     positions = await adapter.fetch_positions()
@@ -475,7 +503,6 @@ class HFTMarketMakingStrategy:
                 if 'tick_size' in found:
                     self.tick_size = float(found['tick_size'])
                 elif 'price_mul' in found:
-                    # Lighter 的情况
                     self.tick_size = 0.01
 
                 if self.tick_size > 0:
