@@ -398,14 +398,15 @@ class HFTMarketMakingStrategy:
                 except Exception as e:
                     err_str = str(e).lower()
                     # 常见的 Post-Only 错误码处理
-                    if "2008" in err_str or "post-only" in err_str or "cross" in err_str:
+                    if "2008" in err_str or "post-only" in err_str:
                         if attempt == 0:
-                            # 第一次失败，根据方向微调价格
-                            offset = self.tick_size
+                            # 加大退让幅度，确保能挂上去
+                            safe_pad = self.tick_size * 2.0
                             if side == 'BUY':
-                                retry_price -= offset
+                                retry_price -= safe_pad
                             else:
-                                retry_price += offset
+                                retry_price += safe_pad
+                            logger.info(f"⚠️ Post-Only冲突，尝试修正价格重挂: {side} {retry_price}")
                             continue
 
                     logger.warning(f"⚠️ Quote {side} Fail: {e}")
