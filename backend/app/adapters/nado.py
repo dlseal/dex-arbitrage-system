@@ -1,4 +1,3 @@
-# backend/app/adapters/nado.py
 import asyncio
 import logging
 import os
@@ -219,8 +218,6 @@ class NadoAdapter(BaseExchange):
                 return {}
 
             if not ob:
-                # 只有调试时开启，防止刷屏
-                # logger.warning(f"⚠️ [Nado] Empty Orderbook for {symbol}")
                 return {}
 
             best_bid = 0.0
@@ -376,25 +373,48 @@ class NadoAdapter(BaseExchange):
             return []
 
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
-        logger.info("📡 [Nado] Starting Polling Stream... (Interval: 1.0s)")
-        count = 0
-        while self.is_connected:
-            try:
-                count += 1
-                if count % 10 == 0:
-                    logger.info(f"💓 [Nado] Polling alive... (Cycle {count})")
+        """
+        [Optimized] 激进的高频轮询模式
+        1. 使用 asyncio.gather 并发查询所有币种
+        2. 极短的休眠间隔 (0.1s)
+        """
+        logger.info("📡 [Nado] Starting Aggressive Polling Stream... (Interval: 0.1s)")
 
-                for symbol in self.target_symbols:
-                    tick = await self.fetch_orderbook(symbol)
-                    if tick:
-                        tick['type'] = 'tick'
-                        try:
-                            tick_queue.put_nowait(tick)
-                        except:
-                            pass
-                await asyncio.sleep(1.0)
+        while self.is_connected:
+            start_ts = time.time()
+            try:
+                # 1. 构造任务列表：对所有目标币种并发 fetch_orderbook
+                tasks = [self._safe_fetch_and_push(symbol, tick_queue) for symbol in self.target_symbols]
+
+                # 2. 并发执行
+                await asyncio.gather(*tasks)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Poll Loop Error: {e}")
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(1.0)
+                continue
+
+            # 3. 极速休眠控制
+            # 计算刚才消耗的时间，保持 0.1s 的节奏，如果请求慢了就不休眠直接下一次
+            elapsed = time.time() - start_ts
+            sleep_time = max(0.05, 0.1 - elapsed)
+            await asyncio.sleep(sleep_time)
+
+    async def _safe_fetch_and_push(self, symbol: str, tick_queue: asyncio.Queue):
+        """单个币种的安全抓取，失败不影响整体"""
+        try:
+            # 直接调用内部 fetch_orderbook (BaseExchange 提供的包装方法)
+            # 注意：如果 backoff 限制了频率，这里会自动等待，防止被封 IP
+            tick = await self.fetch_orderbook(symbol)
+            if tick and tick.get('bid') > 0:
+                tick['type'] = 'tick'
+                # 使用 put_nowait 防止队列满时阻塞 Loop
+                try:
+                    tick_queue.put_nowait(tick)
+                except asyncio.QueueFull:
+                    pass
+        except Exception:
+            # 吞掉单个币种的错误，防止影响 gather
+            pass
