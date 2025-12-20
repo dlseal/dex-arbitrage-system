@@ -65,7 +65,7 @@ strategies:
     threshold: 0.0015
 
     # 交易冷却时间 (秒)
-    cooldown: 1.5
+    cooldown: 3
 
   # --- 3. 刷量/库存策略 (GL Farm & Inventory) ---
   farming:
