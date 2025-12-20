@@ -2,25 +2,25 @@ python-dotenv>=1.0.0
 pytz>=2025.2
 aiohttp>=3.8.0
 websocket-client>=1.6.0
-# 升级 Pydantic 到 v2
-pydantic>=2.0.0
+
+# === 降级 Pydantic 以兼容 Nado SDK ===
+# Nado 强制要求 < 2.0.0
+pydantic==1.10.13
+# 注意：删除了 pydantic-settings，因为 V1 版本 BaseSettings 直接在 pydantic 里
+
 pycryptodome>=3.15.0
 ecdsa>=0.17.0
 requests==2.32.5
 eval_type_backport
 tenacity>=9.1.2
 
-# --- 关键修改：降级 Web3 以兼容 Nado ---
-# Web3 v6.4.0 依赖 eth-account >=0.8.0，这与 nado-protocol 的要求 (<0.9.0) 兼容
+# === 降级 Web3 以兼容 Nado SDK ===
 web3==6.4.0
 eth-utils>=2.0.0
 
 # Nado SDK
-nado-protocol>=0.2.8
+nado-protocol==0.2.8
 
-# 私钥加密
-cryptography>=46.0.3
-
-# --- 配置管理 ---
-pydantic-settings>=2.0.0
+# 加密
+cryptography>=41.0.0
 PyYAML>=6.0
