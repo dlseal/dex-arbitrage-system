@@ -121,7 +121,9 @@ class GrvtAdapter(BaseExchange):
                 return s.split('-')[0]
         return "UNKNOWN"
 
-    async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
+    # --- Template Method Implementations ---
+
+    async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
         info = self._get_contract_info(symbol)
         if not info: return {}
         loop = asyncio.get_running_loop()
@@ -138,17 +140,14 @@ class GrvtAdapter(BaseExchange):
             }
         except Exception as e:
             logger.error(f"Fetch OB error: {e}")
-            return {}
+            raise e
 
-    async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                           order_type: str = "LIMIT", params: Dict = None) -> Optional[str]:
+    async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
+                                 order_type: str, **kwargs) -> str:
         info = self._get_contract_info(symbol)
         if not info:
             logger.error(f"❌ [GRVT] Contract info not found for {symbol}")
-            return None
-
-        if params is None:
-            params = {}
+            raise ValueError(f"Contract info not found for {symbol}")
 
         try:
             tick_size = info['tick_size']
@@ -169,33 +168,25 @@ class GrvtAdapter(BaseExchange):
 
             if qty_float <= 0:
                 logger.warning(f"⚠️ Order size too small: {qty_float}")
-                return None
+                raise ValueError("Order size too small")
 
         except Exception as e:
             logger.error(f"❌ [GRVT] Precision Math Error: {e}")
-            return None
+            raise e
 
         self._order_seq = (self._order_seq + 1) % 1000
-        # 组合策略：时间戳(毫秒) + 3位序列号 (避免同1毫秒重复)
-        ts_part = int(time.time() * 1000) & 0xFFFFFF  # 截断一些高位以留空间
+        ts_part = int(time.time() * 1000) & 0xFFFFFF
         client_order_id = (ts_part << 10) | self._order_seq
         safe_side = side.lower()
 
-        # 基础参数
         req_params = {
             'client_order_id': client_order_id,
         }
+        # Merge kwargs
+        req_params.update(kwargs)
 
-        # 合并传入的 params (如 post_only)
-        if params:
-            req_params.update(params)
-
-        # 默认 LIMIT 单开启 Post-Only，除非 params 里明确指定了 False
         if order_type == "LIMIT":
-            # 如果 strategy 没传 post_only，默认设为 True（安全模式）
-            # 如果 strategy 传了 False，这里就用 False（套利模式）
             final_post_only = req_params.get('post_only', True)
-
             req_params.update({
                 'post_only': final_post_only,
                 'timeInForce': 'GTT',
@@ -228,18 +219,17 @@ class GrvtAdapter(BaseExchange):
             return str(client_order_id)
 
         except asyncio.TimeoutError:
-            logger.error(f"❌ [GRVT] Order Timeout (5s) - Possible Ghost Order! ID: {client_order_id}")
-            return None
+            logger.error(f"❌ [GRVT] Order Timeout (1s) - Possible Ghost Order! ID: {client_order_id}")
+            return None  # Or raise exception based on preference
         except Exception as e:
-            # 记录详细错误，方便调试 Post-Only 拒绝原因
             err_msg = str(e).lower()
             if "post-only" in err_msg or "maker" in err_msg:
                 logger.warning(f"⚠️ [GRVT] Order Rejected (Post-Only): {e}")
             else:
                 logger.error(f"❌ [GRVT] Create Order Error: {e}")
-            return None
+            raise e
 
-    async def cancel_order(self, order_id: str, symbol: str = None):
+    async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
         try:
             oid = int(order_id) if str(order_id).isdigit() else order_id
 
@@ -251,10 +241,41 @@ class GrvtAdapter(BaseExchange):
 
             params = {'client_order_id': oid}
             await self.ws_client.cancel_order(id=None, symbol=inst_id, params=params)
+            return True
 
         except Exception as e:
             if "not found" not in str(e).lower():
                 logger.warning(f"Cancel failed for {order_id}: {e}")
+            return False
+
+    async def get_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        """Fetch order details using REST"""
+        # GRVT CCXT rest client supports fetch_order
+        try:
+            oid = int(order_id) if str(order_id).isdigit() else order_id
+            info = self._get_contract_info(symbol)
+            if not info: return {}
+
+            loop = asyncio.get_running_loop()
+            # Try fetching by client_order_id logic if needed, but fetch_order usually takes ID
+            # Note: GRVT CCXT implementation details might vary for client_order_id vs id
+            # Assuming fetch_order works with the ID returned by create_order
+            order = await loop.run_in_executor(
+                None,
+                lambda: self.rest_client.fetch_order(id=oid, symbol=info['id'])
+            )
+
+            return {
+                'id': str(order.get('id', '')),
+                'client_order_id': str(order.get('clientOrderId', '')),
+                'filled': float(order.get('filled', 0.0)),
+                'status': order.get('status', 'unknown'),
+                'price': float(order.get('price', 0.0) or 0.0),
+                'avg_price': float(order.get('average', 0.0) or 0.0),
+            }
+        except Exception as e:
+            logger.debug(f"get_order failed: {e}")
+            return {}
 
     async def close(self):
         logger.info("🛑 [GRVT] Closing resources...")

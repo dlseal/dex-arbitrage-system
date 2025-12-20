@@ -149,7 +149,9 @@ class NadoAdapter(BaseExchange):
             logger.error(f"❌ [Nado] Market Sync Error: {e}")
             raise e
 
-    async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
+    # --- Template Method Implementations ---
+
+    async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
         if symbol not in self.contract_map:
             return {}
 
@@ -157,7 +159,6 @@ class NadoAdapter(BaseExchange):
             pid = self.contract_map[symbol]['id']
             loop = asyncio.get_running_loop()
 
-            # --- [修复 1] 添加 depth 参数 ---
             if hasattr(self.client.market, 'get_orderbook'):
                 ob = await loop.run_in_executor(
                     None,
@@ -173,7 +174,6 @@ class NadoAdapter(BaseExchange):
 
             if not ob: return {}
 
-            # --- [修复 2] 解析时除以 1e18 (x18 -> Float) ---
             best_bid = 0.0
             best_bid_vol = 0.0
             if hasattr(ob, 'bids') and len(ob.bids) > 0:
@@ -210,11 +210,11 @@ class NadoAdapter(BaseExchange):
             logger.error(f"Fetch OB Error: {e}")
             return {}
 
-    async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                           order_type: str = "LIMIT", params: Dict = None) -> Optional[str]:
+    async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
+                                 order_type: str, **kwargs) -> str:
         if symbol not in self.contract_map:
             logger.error(f"❌ [Nado] Unknown symbol: {symbol}")
-            return None
+            raise ValueError(f"Unknown symbol: {symbol}")
 
         market_info = self.contract_map[symbol]
         pid = market_info['id']
@@ -226,10 +226,10 @@ class NadoAdapter(BaseExchange):
             d_tick = Decimal(str(tick_size))
             final_price = float((d_price / d_tick).quantize(Decimal("1")) * d_tick)
         else:
-            bbo = await self.fetch_orderbook(symbol)
+            bbo = await self.fetch_orderbook(symbol) # Use public method to get backoff protection if needed
             if not bbo:
                 logger.error("❌ [Nado] Cannot place market order: Orderbook unavailable")
-                return None
+                raise ValueError("Orderbook unavailable for market order")
             final_price = bbo['ask'] * 1.05 if side.upper() == 'BUY' else bbo['bid'] * 0.95
 
             d_price = Decimal(str(final_price))
@@ -240,7 +240,7 @@ class NadoAdapter(BaseExchange):
         is_post_only = True
         if order_type == "MARKET":
             is_post_only = False
-        if params and params.get('post_only') is False:
+        if kwargs and kwargs.get('post_only') is False:
             is_post_only = False
 
         appendix = build_appendix(order_type=OrderType.POST_ONLY) if is_post_only else build_appendix(
@@ -267,23 +267,23 @@ class NadoAdapter(BaseExchange):
 
             if not result or not result.data:
                 logger.error(f"❌ [Nado] Order Failed (No Data returned)")
-                return None
+                raise RuntimeError("Order placement returned no data")
 
             order_id = result.data.digest
             return str(order_id)
 
         except Exception as e:
             logger.error(f"❌ [Nado] Place Order Error: {e}")
-            return None
+            raise e
 
-    async def cancel_order(self, order_id: str, symbol: str = None):
+    async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
         try:
             pid = self.contract_map.get(symbol, {}).get('id')
             if not pid:
                 if self.contract_map:
                     pid = list(self.contract_map.values())[0]['id']
                 else:
-                    return
+                    return False
 
             sender_hex = subaccount_to_hex(SubaccountParams(
                 subaccount_owner=self.owner,
@@ -301,9 +301,17 @@ class NadoAdapter(BaseExchange):
                 None,
                 lambda: self.client.market.cancel_orders(cancel_params)
             )
+            return True
 
         except Exception as e:
             logger.warning(f"⚠️ [Nado] Cancel Failed: {e}")
+            return False
+
+    async def get_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        """查询订单详情"""
+        # TODO: Implement Nado specific get_order if SDK supports it
+        # return {'id': order_id, 'filled': 0.0, 'status': 'UNKNOWN'}
+        return {}
 
     async def fetch_positions(self) -> List[Dict]:
         try:
@@ -346,16 +354,17 @@ class NadoAdapter(BaseExchange):
         while self.is_connected:
             try:
                 for symbol in self.target_symbols:
+                    # fetch_orderbook uses Template Method logic, which is fine
                     tick = await self.fetch_orderbook(symbol)
                     if tick:
                         tick['type'] = 'tick'
-                        tick_queue.put_nowait(tick)
+                        try:
+                            tick_queue.put_nowait(tick)
+                        except:
+                            pass
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Poll Loop Error: {e}")
                 await asyncio.sleep(5.0)
-
-    async def close(self):
-        self.is_connected = False

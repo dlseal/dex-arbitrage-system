@@ -255,18 +255,21 @@ class LighterAdapter(BaseExchange):
                 await self.close()
                 raise
 
-    async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
+    # --- Template Method Implementations ---
+
+    async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
+        # Lighter relies on WS for OB, REST fetch is not efficient or implemented here.
+        # Return empty safe defaults or cached if we had it (but manager handles cache).
         empty_ret = {'exchange': self.name, 'symbol': symbol, 'bid': 0.0, 'ask': 0.0, 'ts': int(time.time() * 1000)}
         return empty_ret
 
-    async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                           order_type: str = "LIMIT") -> str:
+    async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
+                                 order_type: str, **kwargs) -> str:
         info = self.market_config.get(symbol)
         if not info:
             logging.error(f"❌ [Lighter] Symbol '{symbol}' not found.")
-            return None
+            raise ValueError(f"Symbol '{symbol}' not found")
 
-        # ✅ 修复精度：使用 Decimal 计算，完全杜绝 float 误差
         try:
             d_amount = Decimal(str(amount))
             d_size_mul = Decimal(str(info['size_mul']))
@@ -279,12 +282,11 @@ class LighterAdapter(BaseExchange):
                 price_int = int((d_price * d_price_mul).to_integral_value(rounding=ROUND_HALF_UP))
         except Exception as e:
             logging.error(f"❌ [Lighter] Math Error: {e}")
-            return None
+            raise e
 
         is_ask = True if side.lower() == 'sell' else False
         self._order_seq = (self._order_seq + 1) % 1000
-        # 组合策略：时间戳(毫秒) + 3位序列号 (避免同1毫秒重复)
-        ts_part = int(time.time() * 1000) & 0xFFFFFF  # 截断一些高位以留空间
+        ts_part = int(time.time() * 1000) & 0xFFFFFF
         client_order_index = (ts_part << 10) | self._order_seq
 
         try:
@@ -304,12 +306,36 @@ class LighterAdapter(BaseExchange):
 
             if err:
                 logging.error(f"❌ [Lighter] Order Error: {err}")
-                return None
+                raise RuntimeError(f"Lighter Order Error: {err}")
             return str(client_order_index)
 
         except asyncio.TimeoutError:
-            logging.error(f"❌ [Lighter] Order Timeout (5s)")
-            return None
+            logging.error(f"❌ [Lighter] Order Timeout (1s)")
+            raise
         except Exception as e:
             logging.error(f"❌ [Lighter] Create Exception: {e}")
-            return None
+            raise e
+
+    async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
+        # Lighter usually cancels by order_index
+        info = self.market_config.get(symbol)
+        if not info: return False
+        try:
+            oid_int = int(order_id)
+            res, tx_hash, err = await self.client.cancel_limit_order(
+                market_index=info['id'],
+                client_order_index=oid_int
+            )
+            if err:
+                logger.warning(f"Lighter cancel error: {err}")
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"Lighter cancel exception: {e}")
+            return False
+
+    async def get_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        """Lighter get_order implementation"""
+        # Note: Lighter's Python SDK might need ApiClient to fetch orders by ID
+        # Implementing a safe placeholder if specific method unknown
+        return {}
