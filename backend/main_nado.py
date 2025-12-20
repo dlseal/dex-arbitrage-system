@@ -33,7 +33,7 @@ except ImportError as e:
     print(f"❌ Import Error: {e}")
     sys.exit(1)
 
-# 日志配置 - [修复] 使用 %(name)s 替代硬编码，以便看到 Engine/Strategy 的日志
+# 日志配置
 logging.basicConfig(
     level=settings.common.log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -72,7 +72,6 @@ async def main():
         if strategy_type == "AI_GRID":
             from app.strategies.ai_grid import AiAdaptiveGridStrategy
             strategy = AiAdaptiveGridStrategy(adapters_map)
-            # [关键修复] 注入 name 属性，防止 EventEngine 启动日志报错
             strategy.name = "AI_GRID"
         elif strategy_type == "HFT_MM":
             from app.strategies.hft_market_making import HFTMarketMakingStrategy
@@ -82,7 +81,6 @@ async def main():
             logger.error(f"❌ Unknown Strategy: {strategy_type}")
             return
 
-        # [可选] 如果策略有 start 方法，手动触发初始化（如构建网格）
         if hasattr(strategy, 'start'):
             logger.info("🧠 Bootstrapping Strategy Logic...")
             await strategy.start()
@@ -93,23 +91,48 @@ async def main():
         logger.critical(f"❌ Init Failed: {e}", exc_info=True)
         return
 
-    # --- 信号处理 ---
+    # --- 信号处理 (修改后) ---
     stop_event = asyncio.Event()
 
-    def signal_handler():
-        logger.info("🛑 Stop signal received.")
+    def signal_shutdown_handler():
+        """处理 SIGTERM (kill 命令) -> 执行退出"""
+        logger.info("🛑 Stop signal (SIGTERM) received. Shutting down...")
         stop_event.set()
 
-    # Windows 兼容性处理
+    def signal_ignore_handler():
+        """处理 SIGINT (Ctrl+C) -> 忽略并警告"""
+        logger.warning("⚠️ Ctrl+C (SIGINT) received. IGNORED to prevent accidental stop.")
+        logger.warning("ℹ️  To stop the process, use 'kill <pid>' (SIGTERM).")
+
+    # 非 Windows 系统下 (Linux/Mac) 分离信号处理
     if sys.platform != 'win32':
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, signal_handler)
-            except NotImplementedError:
-                pass
+
+        # 1. 注册 SIGTERM 用于真正的停止
+        try:
+            loop.add_signal_handler(signal.SIGTERM, signal_shutdown_handler)
+        except NotImplementedError:
+            pass
+
+        # 2. 注册 SIGINT 用于屏蔽 Ctrl+C
+        try:
+            loop.add_signal_handler(signal.SIGINT, signal_ignore_handler)
+        except NotImplementedError:
+            pass
     else:
+        # Windows 下通常很难屏蔽 Ctrl+C 且不影响控制台，保持原样
         logger.info("ℹ️ Windows Mode: Use Ctrl+C to stop.")
+
+        def simple_handler():
+            logger.info("🛑 Stop signal received.")
+            stop_event.set()
+
+        try:
+            # Windows 只能简单捕获
+            loop = asyncio.get_running_loop()
+            # 注意: Windows asyncio 对信号支持有限，通常依赖 KeyboardInterrupt
+        except Exception:
+            pass
 
     # --- 连接与启动 ---
     logger.info("🔌 Connecting...")
@@ -122,34 +145,33 @@ async def main():
     logger.info("📡 Engine Starting...")
     engine_task = asyncio.create_task(engine.start())
 
-    # --- [主循环] 包含任务健康检查 ---
+    # --- [主循环] ---
     try:
         while not stop_event.is_set():
-            # [关键修复] 监控 Engine 任务状态，如果崩溃立即报错
             if engine_task.done():
                 exc = engine_task.exception()
                 if exc:
                     logger.critical(f"💥 Engine Task CRASHED: {exc}")
-                    # 打印完整堆栈方便调试
                     traceback.print_exception(type(exc), exc, exc.__traceback__)
                 else:
-                    logger.warning("⚠️ Engine task finished unexpectedly (no exception).")
+                    logger.warning("⚠️ Engine task finished unexpectedly.")
                 break
 
-            # 正常的保活循环
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("🛑 Keyboard Interrupt (Ctrl+C).")
+        # 这里的 KeyboardInterrupt 主要针对 Windows，或者信号注册失败的情况
+        logger.info("🛑 Keyboard Interrupt caught in main loop.")
+        stop_event.set()
+
     finally:
         logger.info("🛑 Shutting down...")
         engine.running = False
         stop_event.set()
 
-        # 优雅关闭流程
         if not engine_task.done():
             engine_task.cancel()
 
@@ -174,4 +196,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        # 如果信号被屏蔽，这里不会触发；如果未屏蔽(Windows)，这里处理退出
         pass
