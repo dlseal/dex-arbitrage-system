@@ -12,8 +12,6 @@ tenacity>=9.1.2
 
 # 升级 Web3 相关库以兼容 Pydantic v2
 web3>=7.0.0
-eth-account>=0.13.4
-# 移除旧的 eth-utils<5.0.0 限制，因为 Web3 v7 需要新版
 eth-utils>=2.0.0
 
 # Nado SDK
