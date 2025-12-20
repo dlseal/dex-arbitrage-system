@@ -11,7 +11,7 @@ try:
     from app.config import settings
 except ImportError:
     import sys
-
+    # 兼容 Nado 模式下的劫持配置
     if 'app.config' in sys.modules:
         settings = sys.modules['app.config'].settings
     else:
@@ -32,7 +32,7 @@ class LLMClient:
         if not self.api_key:
             return {}
 
-        logger.info(f"📤 [LLM Prompt] {prompt}")
+        logger.info(f"📤 [LLM Prompt] {prompt[:200]}... (len={len(prompt)})")
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -65,9 +65,13 @@ class LLMClient:
                 raise ValueError(f"API Error [{response.status_code}]: {response.text}")
 
             resp_json = response.json()
-            raw_content = resp_json["choices"][0]["message"]["content"]
+            # 兼容不同的 API 响应结构
+            if "choices" in resp_json and len(resp_json["choices"]) > 0:
+                raw_content = resp_json["choices"][0]["message"]["content"]
+            else:
+                raw_content = json.dumps(resp_json)
 
-            logger.info(f"📥 [LLM Raw Response] {raw_content}")
+            logger.info(f"📥 [LLM Response] {raw_content[:100]}...")
 
             clean_json = self._clean_and_extract_json(raw_content)
             if not clean_json:
@@ -89,11 +93,14 @@ class LLMClient:
             except:
                 pass
 
-            # 去除 Markdown
+            # 去除 Markdown 代码块标记
             if "```" in content:
-                content = content.replace("```json", "").replace("```", "").strip()
+                # 移除 ```json 和 结尾的 ```
+                content = re.sub(r'```json\s*', '', content)
+                content = re.sub(r'```\s*$', '', content)
+                content = content.strip()
 
-            # 补全截断 (虽然加了 max_tokens 应该不需要了，但以防万一)
+            # 简单的 JSON 补全尝试 (应对 max_tokens 截断)
             if content and not content.endswith("}"):
                 if content.endswith('"'):
                     content += '}'
@@ -103,27 +110,36 @@ class LLMClient:
                     content += '}'
 
             return json.loads(content)
-        except:
+        except Exception as e:
+            logger.debug(f"JSON extract error: {e}")
             return None
 
 
-# [修改点 3] 更新函数签名，接收 status_str
 async def fetch_grid_advice(symbol: str, current_price: float, current_params: Dict[str, Any],
                             status_str: str = "ACTIVE") -> Dict[str, Any]:
+    """
+    异步获取网格策略建议
+    """
     try:
         client = LLMClient()
 
-        # 将 status_str 传给 format
+        # [CRITICAL FIX] 必须使用 **current_params 解包字典
+        # 否则 prompt 模板中的 {atr}, {rsi} 等占位符无法被替换，导致 KeyError
         prompt = settings.llm_prompt_template.format(
             symbol=symbol,
             price=current_price,
             current_status=status_str,
-            current_params=current_params
+            current_params=current_params,  # 对应模板中的 {current_params} 占位符
+            **current_params                # 对应模板中的 {atr}, {rsi}, {recent_candles} 等占位符
         )
 
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(None, lambda: client.consult(prompt))
         return response
+
+    except KeyError as e:
+        logger.error(f"❌ Fetch Advice Template Error: Missing key {e}")
+        return {}
     except Exception as e:
         logger.error(f"❌ Fetch Advice Final Failure: {e}")
         return {}
