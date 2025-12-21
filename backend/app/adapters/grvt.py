@@ -60,6 +60,7 @@ class GrvtAdapter(BaseExchange):
             'private_key': self.private_key,
             'api_key': self.api_key
         }
+        # 初始化同步 REST 客户端
         self.rest_client = GrvtCcxt(env=self.env, parameters=params)
 
         logger.info(f"⏳ [GRVT] Syncing markets...")
@@ -71,6 +72,7 @@ class GrvtAdapter(BaseExchange):
             quote = market.get('quote')
             kind = market.get('kind')
 
+            # 筛选我们关注的永续合约
             if kind == 'PERPETUAL' and quote == 'USDT':
                 if base in self.target_symbols:
                     symbol = f"{base}-{quote}"
@@ -108,12 +110,22 @@ class GrvtAdapter(BaseExchange):
         return await loop.run_in_executor(None, lambda: self.rest_client.fetch_markets(params={}))
 
     def _get_contract_info(self, symbol: str):
-        if "-" not in symbol: symbol = f"{symbol}-USDT"
-        info = self.contract_map.get(symbol)
-        if not info:
-            logger.error(f"Symbol {symbol} not found in map")
-            return None
-        return info
+        # 统一格式化为 BTC-USDT 查找
+        if "-" not in symbol and "_" not in symbol:
+            symbol = f"{symbol}-USDT"
+
+        # 尝试直接匹配
+        if symbol in self.contract_map:
+            return self.contract_map[symbol]
+
+        # 尝试通过 raw_id 反向查找 (如果不常用可以忽略，但为了稳健)
+        for k, v in self.contract_map.items():
+            if v['id'] == symbol:
+                return v
+
+        # 再次尝试转换格式
+        norm_symbol = symbol.replace('_', '-')
+        return self.contract_map.get(norm_symbol)
 
     def _get_symbol_from_instrument(self, instrument_id):
         for s, info in self.contract_map.items():
@@ -121,7 +133,64 @@ class GrvtAdapter(BaseExchange):
                 return s.split('-')[0]
         return "UNKNOWN"
 
-    # --- Template Method Implementations ---
+    # --- 核心交易接口 ---
+
+    async def fetch_positions(self, symbols: List[str] = None) -> List[Dict]:
+        """
+        [PROD FIX] 实现 fetch_positions 以支持仓位同步
+        """
+        try:
+            target_instruments = []
+            if symbols:
+                for s in symbols:
+                    info = self._get_contract_info(s)
+                    if info:
+                        target_instruments.append(info['id'])
+
+            # 如果没找到映射，可能就是原始 instrument_id，直接传递
+            if symbols and not target_instruments:
+                target_instruments = symbols
+
+            loop = asyncio.get_running_loop()
+
+            # 调用底层同步 fetch_positions
+            # 根据官方用例: fetch_positions(symbols=['BTC_USDT_Perp'])
+            kwargs = {}
+            if target_instruments:
+                kwargs['symbols'] = target_instruments
+
+            positions = await loop.run_in_executor(
+                None,
+                lambda: self.rest_client.fetch_positions(**kwargs)
+            )
+            return positions
+        except Exception as e:
+            logger.error(f"❌ [GRVT] Fetch Positions Failed: {e}")
+            # 这里抛出异常，让上层策略知道同步失败，而不是返回空列表误导策略
+            raise e
+
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """
+        [PROD FIX] 实现 cancel_all_orders 以支持 Bailout
+        """
+        try:
+            info = self._get_contract_info(symbol)
+            if not info:
+                logger.warning(f"⚠️ Cancel All: Unknown symbol {symbol}")
+                return False
+
+            inst_id = info['id']
+            loop = asyncio.get_running_loop()
+
+            logger.info(f"🚨 [GRVT] Cancelling ALL orders for {inst_id}...")
+            await loop.run_in_executor(
+                None,
+                lambda: self.rest_client.cancel_all_orders(symbol=inst_id)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ [GRVT] Cancel All Failed: {e}")
+            return False
 
     async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
         info = self._get_contract_info(symbol)
@@ -146,7 +215,6 @@ class GrvtAdapter(BaseExchange):
                                  order_type: str, **kwargs) -> str:
         info = self._get_contract_info(symbol)
         if not info:
-            logger.error(f"❌ [GRVT] Contract info not found for {symbol}")
             raise ValueError(f"Contract info not found for {symbol}")
 
         try:
@@ -154,6 +222,7 @@ class GrvtAdapter(BaseExchange):
             min_size = info['min_size']
 
             d_amount = Decimal(str(amount))
+            # 向下取整到最小交易单位
             if min_size > 0:
                 d_amount = (d_amount / min_size).to_integral_value(rounding=ROUND_DOWN) * min_size
 
@@ -167,36 +236,38 @@ class GrvtAdapter(BaseExchange):
             px_float = float(d_price) if price is not None else None
 
             if qty_float <= 0:
-                logger.warning(f"⚠️ Order size too small: {qty_float}")
-                raise ValueError("Order size too small")
+                raise ValueError(f"Order size too small after quantization: {qty_float}")
 
         except Exception as e:
-            logger.error(f"❌ [GRVT] Precision Math Error: {e}")
+            logger.error(f"❌ [GRVT] Math Error: {e}")
             raise e
 
-        self._order_seq = (self._order_seq + 1) % 1000
+        self._order_seq = (self._order_seq + 1) % 10000
         ts_part = int(time.time() * 1000) & 0xFFFFFF
-        client_order_id = (ts_part << 10) | self._order_seq
+        client_order_id = (ts_part << 14) | self._order_seq  # 增加位宽防止碰撞
         safe_side = side.lower()
 
         req_params = {
             'client_order_id': client_order_id,
         }
-        # Merge kwargs
         req_params.update(kwargs)
 
         if order_type == "LIMIT":
+            # 默认 Post Only
             final_post_only = req_params.get('post_only', True)
             req_params.update({
                 'post_only': final_post_only,
                 'timeInForce': 'GTT',
-                'order_duration_secs': 2591999,
+                'order_duration_secs': 3600,  # 1小时自动过期，防止僵尸单
             })
 
         try:
             target_symbol_id = info['id']
 
             if order_type == "MARKET":
+                # Market 单不能有 post_only
+                if 'post_only' in req_params: del req_params['post_only']
+
                 await asyncio.wait_for(
                     self.ws_client.create_order(
                         symbol=target_symbol_id,
@@ -205,7 +276,7 @@ class GrvtAdapter(BaseExchange):
                         amount=qty_float,
                         price=None,
                         params=req_params
-                    ), timeout=3.0)
+                    ), timeout=5.0)  # 稍微放宽市价单超时
             else:
                 await asyncio.wait_for(
                     self.ws_client.create_limit_order(
@@ -219,12 +290,13 @@ class GrvtAdapter(BaseExchange):
             return str(client_order_id)
 
         except asyncio.TimeoutError:
-            logger.error(f"❌ [GRVT] Order Timeout (1s) - Possible Ghost Order! ID: {client_order_id}")
-            return None  # Or raise exception based on preference
+            logger.error(f"❌ [GRVT] Order Timeout (WS) - ID: {client_order_id}")
+            return None
         except Exception as e:
             err_msg = str(e).lower()
             if "post-only" in err_msg or "maker" in err_msg:
-                logger.warning(f"⚠️ [GRVT] Order Rejected (Post-Only): {e}")
+                # 正常的业务逻辑错误，不用 error 级别
+                logger.warning(f"⚠️ [GRVT] Post-Only Reject: {e}")
             else:
                 logger.error(f"❌ [GRVT] Create Order Error: {e}")
             raise e
@@ -232,13 +304,13 @@ class GrvtAdapter(BaseExchange):
     async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
         try:
             oid = int(order_id) if str(order_id).isdigit() else order_id
-
             inst_id = None
             if symbol:
                 info = self._get_contract_info(symbol)
                 if info:
                     inst_id = info['id']
 
+            # GRVT WS cancel usually needs client_order_id inside params
             params = {'client_order_id': oid}
             await self.ws_client.cancel_order(id=None, symbol=inst_id, params=params)
             return True
@@ -249,17 +321,12 @@ class GrvtAdapter(BaseExchange):
             return False
 
     async def get_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Fetch order details using REST"""
-        # GRVT CCXT rest client supports fetch_order
         try:
             oid = int(order_id) if str(order_id).isdigit() else order_id
             info = self._get_contract_info(symbol)
             if not info: return {}
 
             loop = asyncio.get_running_loop()
-            # Try fetching by client_order_id logic if needed, but fetch_order usually takes ID
-            # Note: GRVT CCXT implementation details might vary for client_order_id vs id
-            # Assuming fetch_order works with the ID returned by create_order
             order = await loop.run_in_executor(
                 None,
                 lambda: self.rest_client.fetch_order(id=oid, symbol=info['id'])
@@ -274,7 +341,6 @@ class GrvtAdapter(BaseExchange):
                 'avg_price': float(order.get('average', 0.0) or 0.0),
             }
         except Exception as e:
-            logger.debug(f"get_order failed: {e}")
             return {}
 
     async def close(self):
@@ -326,7 +392,6 @@ class GrvtAdapter(BaseExchange):
                                 'ts': int(time.time() * 1000)
                             }
                             event_queue.put_nowait(event)
-                            logger.info(f"⚡️ [GRVT Fill] {symbol_base} {side} {filled_size} (ID:{final_order_id})")
                     return
 
                 if "book" in str(channel):
@@ -368,6 +433,7 @@ class GrvtAdapter(BaseExchange):
 
             while self.is_connected:
                 await asyncio.sleep(5)
+                # Watchdog
                 if time.time() - self.last_ws_msg_time > 60.0:
                     logger.error("❌ [GRVT] Watchdog: No data for 60s.")
                     self.is_connected = False
