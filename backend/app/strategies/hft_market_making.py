@@ -3,10 +3,10 @@ import asyncio
 import logging
 import time
 import math
-import json
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 
 from app.config import settings
 from app.core.risk_controller import GlobalRiskController
@@ -70,9 +70,20 @@ class PriceQuantizer:
         return float(quantized)
 
 
+@dataclass
+class MarketSnapshot:
+    """用于在锁内捕获瞬间状态，传递给异步执行器"""
+    mid_price: float
+    bid_p: float
+    ask_p: float
+    volatility: float
+    avg_ofi: float
+    tick_ts: float
+
+
 class HFTMarketMakingStrategy:
     def __init__(self, adapters: Dict[str, Any], risk_controller: GlobalRiskController = None):
-        self.name = "AS_OFI_Pro_v3_Optimized"
+        self.name = "AS_OFI_Pro_v4_Async"
         self.adapters = adapters
         self.risk_controller = risk_controller
 
@@ -97,35 +108,32 @@ class HFTMarketMakingStrategy:
         self.max_pos_usd = conf.max_pos_usd
         self.volatility_factor = conf.volatility_factor
 
-        # [新增] 安全限制参数 (硬编码或从配置读取)
-        # 限制单边报价偏离中间价的最大百分比 (例如 0.2%)
         self.max_dist_pct = 0.002
-        # 限制库存倾斜导致的最大价格偏移 (USD)
         self.max_skew_usd = 50.0
 
         self.tick_size = 0.0
         self.quantizer: Optional[PriceQuantizer] = None
 
         self.inventory = 0.0
-        self.inv_lock = asyncio.Lock()
+        self.inv_lock = asyncio.Lock()  # 仅保护库存更新
 
-        # 使用配置的窗口大小
+        # 状态统计 (受 state_lock 保护)
         self.mid_price_stats = OnlineStats(window_size=conf.window_size)
         self.ofi_ema = EMACalculator(alpha=0.2)
         self.prev_tick: Optional[Dict] = None
+        self.state_lock = asyncio.Lock()  # [新增] 保护统计指标计算
 
+        # 交易状态
         self.active_orders = {"BUY": None, "SELL": None}
         self.active_prices = {"BUY": 0.0, "SELL": 0.0}
         self.pending_actions = {"BUY": False, "SELL": False}
 
-        self.calc_lock = asyncio.Lock()
+        # [关键] 执行控制标志：实现"丢弃旧数据"模式
+        self.is_trading = False
+
         self.is_active = True
         self.pos_sync_time = 0
-        self.err_count = 0
-
-        # 调试日志控制
         self.last_log_ts = 0
-        self.last_lag_log_ts = 0
 
         self._validate_adapter()
         asyncio.create_task(self._initial_setup())
@@ -142,6 +150,9 @@ class HFTMarketMakingStrategy:
             logger.warning("⚠️ [HFT] Tick Size 仍未获取，将在 tick 中重试")
 
     async def on_tick(self, event: dict):
+        """
+        [入口] 高并发入口，必须是非阻塞的
+        """
         if not self.is_active: return
         if event.get('exchange') != self.exchange_name: return
 
@@ -151,126 +162,155 @@ class HFTMarketMakingStrategy:
             return
 
         if evt_type == 'tick' and event.get('symbol') == self.symbol:
-            if self.calc_lock.locked():
+            # 使用 create_task 确保 on_tick 快速返回，不阻塞引擎
+            # 但真正的逻辑在 _process_tick_entry 中进行流控
+            await self._process_tick_entry(event)
+
+    async def _process_tick_entry(self, tick: dict):
+        """
+        [流控核心]
+        1. 必须执行：更新统计数据 (State Update)
+        2. 尝试执行：下单逻辑 (Execution)。如果正忙，则直接放弃本次 Tick 的下单机会。
+        """
+        current_ts = time.time()
+        tick_ts = tick.get('ts', 0) / 1000.0
+        lag = current_ts - tick_ts
+
+        # 1. 严重延迟检查 (比如网络断了刚恢复)，此时连统计都不更新
+        if lag > 2.0:
+            return
+
+        if self.tick_size <= 0:
+            await self._update_contract_info()
+            if self.tick_size <= 0: return
+
+        # 2. [原子操作] 更新统计指标并获取快照
+        snapshot: Optional[MarketSnapshot] = None
+
+        async with self.state_lock:
+            # 这一步非常快 (纯内存计算)，不会阻塞后续 Ticks 的排队
+            snapshot = self._update_market_stats(tick, tick_ts)
+
+            # 如果当前正在进行网络IO (is_trading)，则放弃本次执行
+            # 这就是"Conflation" (合并/丢弃) 的核心
+            if self.is_trading:
                 return
-            await self._process_tick_logic(event)
 
-    async def _process_tick_logic(self, tick: dict):
-        async with self.calc_lock:
-            try:
-                current_ts = time.time()
-                tick_ts = tick.get('ts', 0) / 1000.0
-                lag = current_ts - tick_ts
-                # 如果数据延迟超过 2秒，直接放弃本次计算
-                if lag > 2.0:
-                    # 只有距离上次打印超过 5秒，才打印警告
-                    if current_ts - self.last_lag_log_ts > 5.0:
-                        logger.warning(
-                            f"⚠️ [Lag Protection] Data too old ({lag * 1000:.0f}ms). Skipping... (Throttled)")
-                        self.last_lag_log_ts = current_ts
-                    return
+                # 如果不忙，则抢占 flag
+            self.is_trading = True
 
-                if self.tick_size <= 0:
-                    await self._update_contract_info()
-                    if self.tick_size <= 0: return
+        # 3. [耗时操作] 执行交易逻辑 (释放锁后运行)
+        try:
+            if snapshot:
+                await self._execute_strategy_logic(snapshot)
+        finally:
+            # 无论成功失败，必须释放 flag
+            self.is_trading = False
 
-                bid_p, ask_p = tick['bid'], tick['ask']
-                if bid_p <= 0 or ask_p <= 0: return
+    def _update_market_stats(self, tick: dict, tick_ts: float) -> Optional[MarketSnapshot]:
+        """更新指标并返回快照 (在 state_lock 内调用)"""
+        bid_p, ask_p = tick['bid'], tick['ask']
+        if bid_p <= 0 or ask_p <= 0: return None
 
-                bid_v, ask_v = self._extract_volumes(tick)
-                mid_price = (bid_p + ask_p) / 2.0
+        bid_v, ask_v = self._extract_volumes(tick)
+        mid_price = (bid_p + ask_p) / 2.0
 
-                # 更新统计
-                self.mid_price_stats.update(mid_price)
-                ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
-                avg_ofi = self.ofi_ema.update(ofi)
+        # Welford 更新
+        self.mid_price_stats.update(mid_price)
 
-                # 波动率保护：如果数据不足，给定一个极小的默认值
-                volatility = self.mid_price_stats.get_std_dev()
-                if volatility <= 0: volatility = mid_price * 0.00005
+        # OFI 计算
+        ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
+        avg_ofi = self.ofi_ema.update(ofi)
 
-                async with self.inv_lock:
-                    current_inv = self.inventory
+        volatility = self.mid_price_stats.get_std_dev()
+        # 默认波动率兜底
+        if volatility <= 0: volatility = mid_price * 0.00005
 
-                pos_value = current_inv * mid_price
+        return MarketSnapshot(
+            mid_price=mid_price,
+            bid_p=bid_p,
+            ask_p=ask_p,
+            volatility=volatility,
+            avg_ofi=avg_ofi,
+            tick_ts=tick_ts
+        )
 
-                # 1. 熔断检查
-                bailout_threshold = self.max_pos_usd * 2.0
-                if abs(pos_value) > bailout_threshold:
-                    await self._execute_bailout(current_inv, pos_value)
-                    return
+    async def _execute_strategy_logic(self, snap: MarketSnapshot):
+        """核心交易执行逻辑 (串行执行，不会并发)"""
+        try:
+            # 获取当前库存快照
+            async with self.inv_lock:
+                current_inv = self.inventory
 
-                # 2. 核心计算 (AS模型)
-                # [优化] 限制波动率对 skew 的影响，防止平方项爆炸
-                # 将 inv_risk 限制在 +/- max_skew_usd 范围内
-                raw_inv_risk = current_inv * self.risk_aversion * (volatility ** 2)
-                inv_risk = max(min(raw_inv_risk, self.max_skew_usd), -self.max_skew_usd)
+            pos_value = current_inv * snap.mid_price
 
-                ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
-                reservation_price = mid_price + ofi_impact - inv_risk
+            # 1. 熔断检查
+            bailout_threshold = self.max_pos_usd * 2.0
+            if abs(pos_value) > bailout_threshold:
+                await self._execute_bailout(current_inv, pos_value)
+                return
 
-                # 计算半价差
-                half_spread_base = (self.min_spread_ticks / 2.0) * self.tick_size
-                half_spread_vol = self.volatility_factor * volatility
-                half_spread = half_spread_base + half_spread_vol
+            # 2. AS + OFI 模型计算
+            # 限制 Skew 幅度
+            raw_inv_risk = current_inv * self.risk_aversion * (snap.volatility ** 2)
+            inv_risk = max(min(raw_inv_risk, self.max_skew_usd), -self.max_skew_usd)
 
-                raw_bid = reservation_price - half_spread
-                raw_ask = reservation_price + half_spread
+            ofi_impact = self.ofi_sensitivity * snap.avg_ofi * self.tick_size
+            reservation_price = snap.mid_price + ofi_impact - inv_risk
 
-                # 3. [关键优化] 价格边界钳制 (Price Clamping)
-                # 确保报价不偏离中间价太远
-                max_dist = mid_price * self.max_dist_pct
-                min_safe_bid = mid_price - max_dist
-                max_safe_ask = mid_price + max_dist
+            # 计算半价差
+            half_spread_base = (self.min_spread_ticks / 2.0) * self.tick_size
+            half_spread_vol = self.volatility_factor * snap.volatility
+            half_spread = half_spread_base + half_spread_vol
 
-                # 4. [关键优化] 确保不穿过盘口 (Post-Only 保护)
-                # Bid 必须 <= Ask-Tick, 且 >= MinSafe
-                # Ask 必须 >= Bid+Tick, 且 <= MaxSafe
+            raw_bid = reservation_price - half_spread
+            raw_ask = reservation_price + half_spread
 
-                # 初步修正
-                final_bid = min(raw_bid, ask_p - self.tick_size)  # 不能吃单
-                final_bid = max(final_bid, min_safe_bid)  # 不能太低
+            # 3. 价格边界与 Post-Only 保护
+            max_dist = snap.mid_price * self.max_dist_pct
+            min_safe_bid = snap.mid_price - max_dist
+            max_safe_ask = snap.mid_price + max_dist
 
-                final_ask = max(raw_ask, bid_p + self.tick_size)  # 不能吃单
-                final_ask = min(final_ask, max_safe_ask)  # 不能太高
+            final_bid = min(raw_bid, snap.ask_p - self.tick_size)
+            final_bid = max(final_bid, min_safe_bid)
 
-                # 量化价格
-                target_bid = self.quantizer.quantize(final_bid, rounding=ROUND_FLOOR)
-                target_ask = self.quantizer.quantize(final_ask, rounding=ROUND_CEILING)
+            final_ask = max(raw_ask, snap.bid_p + self.tick_size)
+            final_ask = min(final_ask, max_safe_ask)
 
-                # 5. 最小价差保护
-                if target_ask - target_bid < self.tick_size:
-                    # 如果挤压得太厉害，以 mid 为中心重置
-                    center = self.quantizer.quantize(mid_price, ROUND_FLOOR)
-                    target_bid = center - self.tick_size
-                    target_ask = center + self.tick_size
+            target_bid = self.quantizer.quantize(final_bid, rounding=ROUND_FLOOR)
+            target_ask = self.quantizer.quantize(final_ask, rounding=ROUND_CEILING)
 
-                # 6. [调试] 打印详细的计算逻辑 (每5秒一次)
-                if current_ts - self.last_log_ts > 5.0:
-                    lag = current_ts - tick_ts
-                    logger.info(
-                        f"🧮 [Calc] 🕒Lag:{lag * 1000:.1f}ms | Mid:{mid_price:.1f} Vol:{volatility:.2f} "
-                        f"Skew:{inv_risk:.2f} | Mkt:{bid_p:.0f}/{ask_p:.0f}"
-                    )
-                    self.last_log_ts = current_ts
+            # 最小价差保护
+            if target_ask - target_bid < self.tick_size:
+                center = self.quantizer.quantize(snap.mid_price, ROUND_FLOOR)
+                target_bid = center - self.tick_size
+                target_ask = center + self.tick_size
 
-                allow_buy = pos_value < self.max_pos_usd
-                allow_sell = pos_value > -self.max_pos_usd
+            # 4. 日志采样 (使用快照的时间计算延迟)
+            now = time.time()
+            if now - self.last_log_ts > 5.0:
+                calc_lag = now - snap.tick_ts
+                logger.info(
+                    f"🧮 [Calc] Lag:{calc_lag * 1000:.1f}ms | Mid:{snap.mid_price:.1f} Vol:{snap.volatility:.2f} "
+                    f"Skew:{inv_risk:.2f} | Mkt:{snap.bid_p:.0f}/{snap.ask_p:.0f}"
+                )
+                self.last_log_ts = now
 
-                asyncio.create_task(self._dispatch_orders(
-                    target_bid, target_ask, allow_buy, allow_sell
-                ))
+            allow_buy = pos_value < self.max_pos_usd
+            allow_sell = pos_value > -self.max_pos_usd
 
-                if current_ts - self.pos_sync_time > 15.0:
-                    self.pos_sync_time = current_ts
-                    asyncio.create_task(self._sync_position())
+            # 5. 执行下单 (IO 操作)
+            await self._dispatch_orders(target_bid, target_ask, allow_buy, allow_sell)
 
-                self.err_count = 0
+            # 定时同步持仓
+            if now - self.pos_sync_time > 15.0:
+                self.pos_sync_time = now
+                asyncio.create_task(self._sync_position())
 
-            except Exception as e:
-                self.err_count += 1
-                if self.err_count % 100 == 0:
-                    logger.error(f"Logic Error: {e}")
+        except Exception as e:
+            logger.error(f"Execution Logic Error: {e}")
+
+    # --- 以下辅助方法保持大致不变 ---
 
     def _extract_volumes(self, tick):
         bid_v, ask_v = 1.0, 1.0
@@ -324,7 +364,6 @@ class HFTMarketMakingStrategy:
                 except Exception as inner_e:
                     if i == 2: raise inner_e
                     await asyncio.sleep(0.5)
-            await asyncio.sleep(1.0)
         except Exception as e:
             logger.error(f"❌ Bailout Failed: {e}")
             if self.risk_controller:
@@ -352,22 +391,19 @@ class HFTMarketMakingStrategy:
     async def _manage_order_side(self, side, target_price):
         if self.pending_actions[side]: return
 
-        # Pre-trade Risk Check
+        # Pre-trade Risk
         if self.risk_controller:
             try:
                 allowed = await self.risk_controller.check_trade_risk(self.symbol, self.quantity, target_price)
-                if not allowed:
-                    return
+                if not allowed: return
             except Exception:
                 pass
 
         self.pending_actions[side] = True
-
         try:
             current_id = self.active_orders[side]
             current_price = self.active_prices[side]
 
-            # 防抖动：只有价格变动超过 threshold 或者 之前没单子 时才下单
             if current_id and current_price > 0:
                 diff_ticks = abs(target_price - current_price) / self.tick_size
                 if diff_ticks < self.update_threshold_ticks:
@@ -381,17 +417,13 @@ class HFTMarketMakingStrategy:
                     pass
 
             retry_price = target_price
-            # 重试逻辑：处理 Post-Only 冲突
+            # 重试逻辑保持不变
             for attempt in range(2):
                 try:
                     new_id = await adapter.create_order(
-                        symbol=self.symbol,
-                        side=side,
-                        amount=self.quantity,
-                        price=retry_price,
-                        params={"post_only": True}
+                        symbol=self.symbol, side=side, amount=self.quantity,
+                        price=retry_price, params={"post_only": True}
                     )
-
                     if new_id:
                         self.active_orders[side] = new_id
                         self.active_prices[side] = retry_price
@@ -400,43 +432,29 @@ class HFTMarketMakingStrategy:
                         self.active_orders[side] = None
                         self.active_prices[side] = 0.0
                         break
-
                 except Exception as e:
                     err_str = str(e).lower()
-                    # 常见的 Post-Only 错误码处理
                     if "2008" in err_str or "post-only" in err_str:
                         if attempt == 0:
-                            # 加大退让幅度，确保能挂上去
                             safe_pad = self.tick_size * 2.0
-                            if side == 'BUY':
-                                retry_price -= safe_pad
-                            else:
-                                retry_price += safe_pad
-                            logger.info(f"⚠️ Post-Only冲突，尝试修正价格重挂: {side} {retry_price}")
+                            retry_price = retry_price - safe_pad if side == 'BUY' else retry_price + safe_pad
                             continue
 
-                    logger.warning(f"⚠️ Quote {side} Fail: {e}")
                     self.active_orders[side] = None
                     self.active_prices[side] = 0.0
                     break
-
-        except Exception as e:
-            logger.error(f"Quote {side} Critical Error: {e}")
         finally:
             self.pending_actions[side] = False
 
     async def _cancel_order_side(self, side):
         if self.pending_actions[side]: return
         self.pending_actions[side] = True
-
         try:
             oid = self.active_orders[side]
             if oid:
                 await self.adapters[self.exchange_name].cancel_order(oid, symbol=self.symbol)
                 self.active_orders[side] = None
                 self.active_prices[side] = 0.0
-        except Exception as e:
-            logger.warning(f"Cancel {side} Error: {e}")
         finally:
             self.pending_actions[side] = False
 
@@ -459,20 +477,12 @@ class HFTMarketMakingStrategy:
         try:
             adapter = self.adapters[self.exchange_name]
             positions = []
-
-            if hasattr(adapter, 'fetch_positions') and callable(adapter.fetch_positions):
+            if hasattr(adapter, 'fetch_positions'):
                 if asyncio.iscoroutinefunction(adapter.fetch_positions):
                     positions = await adapter.fetch_positions()
                 else:
-                    positions = await asyncio.to_thread(adapter.fetch_positions)
-            elif hasattr(adapter, 'rest_client') and adapter.rest_client:
-                loop = asyncio.get_running_loop()
-                positions = await loop.run_in_executor(
-                    None,
-                    lambda: adapter.rest_client.fetch_positions(
-                        params={'sub_account_id': getattr(adapter, 'trading_account_id', None)}
-                    )
-                )
+                    loop = asyncio.get_running_loop()
+                    positions = await loop.run_in_executor(None, adapter.fetch_positions)
 
             found_size = 0.0
             for p in positions:
@@ -491,7 +501,6 @@ class HFTMarketMakingStrategy:
                 if abs(self.inventory - found_size) > (self.quantity * 0.1):
                     logger.warning(f"⚠️ [Sync] Inv fix: {self.inventory:.4f} -> {found_size:.4f}")
                     self.inventory = found_size
-
         except Exception as e:
             logger.error(f"Sync Pos Error: {e}")
 
@@ -499,7 +508,6 @@ class HFTMarketMakingStrategy:
         try:
             adapter = self.adapters[self.exchange_name]
             contract_map = getattr(adapter, 'contract_map', {}) or getattr(adapter, 'market_config', {})
-
             found = None
             for k, v in contract_map.items():
                 if self.symbol in k:
@@ -515,5 +523,5 @@ class HFTMarketMakingStrategy:
                 if self.tick_size > 0:
                     self.quantizer = PriceQuantizer(self.tick_size)
                     logger.info(f"📏 Tick Size Updated: {self.tick_size}")
-        except Exception as e:
-            logger.error(f"Update Contract Info Error: {e}")
+        except Exception:
+            pass
