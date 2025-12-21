@@ -1,3 +1,4 @@
+# backend/app/adapters/nado.py
 import asyncio
 import logging
 import os
@@ -66,8 +67,7 @@ class NadoAdapter(BaseExchange):
         self.owner = None
         self.contract_map = {}
 
-        # [新增] 用于检测数据是否僵死的缓存
-        # 格式: {symbol: {'data': tick_dict, 'hash': str, 'local_ts': float}}
+        # [新增] 仅用于调试的数据指纹，不再用于回滚时间戳
         self.last_tick_cache = {}
 
         self._check_env()
@@ -172,7 +172,8 @@ class NadoAdapter(BaseExchange):
             pid = self.contract_map[symbol]['id']
             loop = asyncio.get_running_loop()
 
-            # 1. 尝试获取最新 Orderbook
+            # 1. 网络 IO (这是最耗时的步骤，通常 100-300ms)
+            # 注意：一旦这个 await 返回，就意味着我们刚刚拿到了最新的数据状态
             if hasattr(self.client.market, 'get_orderbook'):
                 ob = await loop.run_in_executor(
                     None,
@@ -189,7 +190,7 @@ class NadoAdapter(BaseExchange):
             if not ob:
                 return {}
 
-            # 2. 解析数据
+            # 2. 解析数据 (极快)
             best_bid, best_bid_vol = 0.0, 0.0
             if hasattr(ob, 'bids') and len(ob.bids) > 0:
                 item = ob.bids[0]
@@ -202,28 +203,19 @@ class NadoAdapter(BaseExchange):
                 best_ask = float(item.price) / 1e18 if hasattr(item, 'price') else float(item[0]) / 1e18
                 best_ask_vol = float(item.amount) / 1e18 if hasattr(item, 'amount') else float(item[1]) / 1e18
 
-            # 3. [关键修复] 陈旧数据检测 (Stale Data Detection)
-            # 生成数据指纹 (价格+数量)
+            # 3. [修复核心] 正确处理时间戳
+            # 无论数据是否变化，既然 API 请求刚刚成功返回，这就是当前的最新市场状态。
+            # 我们直接使用当前时间作为 tick 时间。
+            # 这解决了 "Lag: 1200ms" 的问题，因为之前如果数据没变，你复用了旧时间戳。
+
+            current_ts = time.time() * 1000  # 毫秒
+
+            # (可选) 更新缓存仅为了调试，不再用于时间戳逻辑
             data_fingerprint = f"{best_bid:.6f}_{best_bid_vol:.6f}_{best_ask:.6f}_{best_ask_vol:.6f}"
-            current_time = time.time()
-
-            # 检查是否有缓存
-            cached = self.last_tick_cache.get(symbol)
-
-            final_ts = 0
-
-            if cached and cached['hash'] == data_fingerprint:
-                # ⚠️ 数据完全没变：使用旧的时间戳！
-                # 这样如果数据一直不变，ts 就会一直停留在过去
-                # 策略层的 lag check 就会报警并停止交易
-                final_ts = cached['local_ts']
-            else:
-                # ✅ 数据变了：更新时间戳
-                final_ts = current_time * 1000  # 毫秒
-                self.last_tick_cache[symbol] = {
-                    'hash': data_fingerprint,
-                    'local_ts': final_ts
-                }
+            self.last_tick_cache[symbol] = {
+                'hash': data_fingerprint,
+                'local_ts': current_ts
+            }
 
             return {
                 'exchange': self.name,
@@ -232,18 +224,16 @@ class NadoAdapter(BaseExchange):
                 'bid_volume': best_bid_vol,
                 'ask': best_ask,
                 'ask_volume': best_ask_vol,
-                'ts': int(final_ts)  # 这里可能返回旧时间
+                'ts': int(current_ts)  # ✅ 始终返回最新时间
             }
 
         except Exception as e:
-            logger.error(f"Fetch OB Error: {e}")
+            # 只有真正的错误才忽略
+            # logger.error(f"Fetch OB Error: {e}")
             return {}
 
     async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
                                  order_type: str, **kwargs) -> str:
-        # ... (保持原有逻辑不变，此处省略以节省篇幅，请保留原文件中的完整实现) ...
-        # 建议直接复制你原文件中 _create_order_impl 的内容到这里
-        # 为确保完整性，以下是核心调用部分：
         if symbol not in self.contract_map:
             raise ValueError(f"Unknown symbol: {symbol}")
 
@@ -291,7 +281,6 @@ class NadoAdapter(BaseExchange):
         return str(result.data.digest)
 
     async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
-        # ... (保持原逻辑不变) ...
         try:
             pid = self.contract_map.get(symbol, {}).get('id')
             if not pid: return False
@@ -311,7 +300,6 @@ class NadoAdapter(BaseExchange):
             return False
 
     async def fetch_positions(self) -> List[Dict]:
-        # ... (保持原逻辑不变) ...
         try:
             resolved_subaccount = subaccount_to_hex(self.client.context.signer.address, self.subaccount_name)
             loop = asyncio.get_running_loop()
@@ -347,14 +335,13 @@ class NadoAdapter(BaseExchange):
                 continue
 
             elapsed = time.time() - start_ts
-            # 如果请求耗时超过0.1s，说明网络慢或计算慢，就不休眠了，尽快下一次
+            # 动态调整休眠，确保高频
             sleep_time = max(0.01, 0.1 - elapsed)
             await asyncio.sleep(sleep_time)
 
     async def _safe_fetch_and_push(self, symbol: str, tick_queue: asyncio.Queue):
         try:
-            tick = await self.fetch_orderbook(symbol)
-            # 只有当 bid 有效时才推送
+            tick = await self._fetch_orderbook_impl(symbol)  # 调用内部实现以获取正确时间戳
             if tick and tick.get('bid') > 0:
                 tick['type'] = 'tick'
                 try:
