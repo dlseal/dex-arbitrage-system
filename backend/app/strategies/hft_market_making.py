@@ -125,6 +125,7 @@ class HFTMarketMakingStrategy:
 
         # 调试日志控制
         self.last_log_ts = 0
+        self.last_lag_log_ts = 0
 
         self._validate_adapter()
         asyncio.create_task(self._initial_setup())
@@ -161,9 +162,12 @@ class HFTMarketMakingStrategy:
                 tick_ts = tick.get('ts', 0) / 1000.0
                 lag = current_ts - tick_ts
                 # 如果数据延迟超过 2秒，直接放弃本次计算
-                if abs(lag) > 2.0:
-                    if self.err_count == 0:
-                        logger.warning(f"⚠️ [Lag Protection] Data too old ({lag * 1000:.0f}ms). Skipping...")
+                if lag > 2.0:
+                    # 只有距离上次打印超过 5秒，才打印警告
+                    if current_ts - self.last_lag_log_ts > 5.0:
+                        logger.warning(
+                            f"⚠️ [Lag Protection] Data too old ({lag * 1000:.0f}ms). Skipping... (Throttled)")
+                        self.last_lag_log_ts = current_ts
                     return
 
                 if self.tick_size <= 0:
