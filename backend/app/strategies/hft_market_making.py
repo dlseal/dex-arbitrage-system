@@ -159,9 +159,11 @@ class HFTMarketMakingStrategy:
             try:
                 current_ts = time.time()
                 tick_ts = tick.get('ts', 0) / 1000.0
-
-                # 宽松时间检查
-                if abs(current_ts - tick_ts) > 10.0:
+                lag = current_ts - tick_ts
+                # 如果数据延迟超过 2秒，直接放弃本次计算
+                if abs(lag) > 2.0:
+                    if self.err_count == 0:
+                        logger.warning(f"⚠️ [Lag Protection] Data too old ({lag * 1000:.0f}ms). Skipping...")
                     return
 
                 if self.tick_size <= 0:
