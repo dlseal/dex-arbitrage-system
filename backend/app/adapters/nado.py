@@ -275,6 +275,12 @@ class NadoAdapter(BaseExchange):
         except Exception as e:
             if self._handle_waf_error(e, "PlaceOrder"):
                 raise RuntimeError("Cloudflare Blocked")
+
+            # [Fix 2008 Error Noise] 检查 Post-Only 错误，记录为 Warning 而非 Error，并重新抛出以便策略捕获
+            err_str = str(e)
+            if "2008" in err_str or "post-only" in err_str:
+                logger.warning(f"⚠️ [Nado] Post-Only Rejected: {symbol} @ {final_price}")
+
             raise e
 
     async def _cancel_order_impl(self, order_id: str, symbol: str) -> bool:
@@ -300,7 +306,8 @@ class NadoAdapter(BaseExchange):
             logger.warning(f"⚠️ [Nado] Cancel Failed: {e}")
             return False
 
-    async def fetch_positions(self) -> List[Dict]:
+    # [Fix] 增加 symbols 参数以兼容策略调用
+    async def fetch_positions(self, symbols: List[str] = None) -> List[Dict]:
         if not self._check_waf_status(): return []
 
         try:
@@ -315,6 +322,11 @@ class NadoAdapter(BaseExchange):
             for pos in account_data.perp_balances:
                 pid = pos.product_id
                 symbol = next((s for s, info in self.contract_map.items() if info['id'] == pid), None)
+
+                # 如果指定了 symbols，进行过滤
+                if symbols and symbol not in symbols:
+                    continue
+
                 if symbol:
                     size = float(from_x18(pos.balance.amount))
                     if abs(size) > 0:
@@ -323,6 +335,8 @@ class NadoAdapter(BaseExchange):
         except Exception as e:
             if self._handle_waf_error(e, "FetchPos"):
                 return []
+            # 记录详细错误以便调试
+            logger.error(f"❌ [Nado] Fetch Pos Error: {e}")
             return []
 
     # 🟢 [调整] 降频后的双轮询循环
