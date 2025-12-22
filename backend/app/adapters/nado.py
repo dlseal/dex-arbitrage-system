@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import time
-import traceback
 from decimal import Decimal
 from typing import Dict, Optional, List, Any
 from cryptography.fernet import Fernet
@@ -105,7 +104,6 @@ class NadoAdapter(BaseExchange):
         """检查是否处于熔断冷却期"""
         if time.time() < self.waf_cool_down_until:
             remaining = self.waf_cool_down_until - time.time()
-            # 只有剩余时间较长时才频繁打印，防止日志刷屏
             if remaining > 1.0 and int(remaining) % 5 == 0:
                 logger.warning(f"🛡️ [WAF Protection] Cooling down... {remaining:.1f}s left")
             return False
@@ -115,7 +113,6 @@ class NadoAdapter(BaseExchange):
         """处理 Cloudflare 错误，触发熔断"""
         err_str = str(e)
         if "<!DOCTYPE html>" in err_str or "Just a moment" in err_str or "challenge-platform" in err_str:
-            # 触发 10秒 熔断
             self.waf_cool_down_until = time.time() + 10.0
             logger.error(f"🚫 [Cloudflare Blocked] {context} failed. Triggering 10s cool-down.")
             return True
@@ -133,7 +130,6 @@ class NadoAdapter(BaseExchange):
                 nado_symbol_str = f"{target.upper()}-PERP"
                 product_id = None
 
-                # 兼容对象或字典属性访问
                 for sym_obj in symbols_map:
                     s_str = sym_obj.symbol if hasattr(sym_obj, 'symbol') else str(sym_obj)
                     if s_str == nado_symbol_str:
@@ -184,9 +180,9 @@ class NadoAdapter(BaseExchange):
                 logger.error(f"❌ [Nado] Close Pos Error: {e}")
             return False
 
-    async def _fetch_orderbook_impl(self, symbol: str) -> Dict[str, float]:
-        if not self._check_waf_status(): return {}
-        if symbol not in self.contract_map: return {}
+    async def _fetch_orderbook_impl(self, symbol: str) -> Optional[Dict[str, float]]:
+        if not self._check_waf_status(): return None
+        if symbol not in self.contract_map: return None
 
         try:
             pid = self.contract_map[symbol]['id']
@@ -203,15 +199,13 @@ class NadoAdapter(BaseExchange):
                     lambda: self.client.market.get_market_liquidity(product_id=pid, depth=10)
                 )
             else:
-                return {}
+                return None
 
-            if not ob: return {}
+            if not ob: return None
 
-            # 兼容 SDK 返回对象或列表的情况
             best_bid = float(ob.bids[0].price) / 1e18 if hasattr(ob.bids[0], 'price') else float(ob.bids[0][0]) / 1e18
             best_ask = float(ob.asks[0].price) / 1e18 if hasattr(ob.asks[0], 'price') else float(ob.asks[0][0]) / 1e18
 
-            # 使用当前时间，确保不报 Lag
             return {
                 'exchange': self.name,
                 'symbol': symbol,
@@ -222,8 +216,8 @@ class NadoAdapter(BaseExchange):
 
         except Exception as e:
             if self._handle_waf_error(e, "FetchOB"):
-                return {}  # 静默返回
-            return {}
+                return None
+            return None
 
     async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float],
                                  order_type: str, **kwargs) -> str:
@@ -254,30 +248,23 @@ class NadoAdapter(BaseExchange):
         is_buy = (side.upper() == 'BUY')
         is_post_only = True if order_type != "MARKET" and kwargs.get('post_only') is not False else False
 
-        # [修复] OrderType 设置
-        # 参考代码确认了 Post-Only 的用法。
-        # 针对 Taker (Bailout) 单，如果 OrderType.GTC 不存在，标准写法通常是 OrderType.LIMIT。
+        # [OrderType Fix]
         try:
             if is_post_only:
                 appendix = build_appendix(order_type=OrderType.POST_ONLY)
             else:
-                # 尝试使用 LIMIT (标准限价单)，如果不存在则回退
                 t_type = getattr(OrderType, 'LIMIT', None)
                 if not t_type:
-                    t_type = getattr(OrderType, 'IOC', None)  # 再次尝试 IOC
+                    t_type = getattr(OrderType, 'IOC', None)
 
                 if t_type:
                     appendix = build_appendix(order_type=t_type)
                 else:
-                    # 极少数情况：如果都没有，可能 build_appendix 不传参数就是标准单
-                    # 或者我们使用默认值
                     appendix = build_appendix()
-        except Exception as e:
-            # 最后的兜底，防止因为枚举问题导致无法平仓
-            logger.warning(f"⚠️ [Nado] OrderType resolve failed: {e}, using default appendix")
+        except Exception:
             appendix = build_appendix(order_type=OrderType.POST_ONLY) if is_post_only else build_appendix()
 
-        # 参考代码使用了更长的过期时间 (30天)，这里我们也适当延长
+        # [Expiration] 30 days
         expiration = get_expiration_timestamp(60 * 60 * 24 * 30)
 
         order_params = OrderParams(
@@ -302,8 +289,6 @@ class NadoAdapter(BaseExchange):
             if self._handle_waf_error(e, "PlaceOrder"):
                 raise RuntimeError("Cloudflare Blocked")
 
-            # [Fix 2008 Error Noise]
-            # 检查 Post-Only 错误，记录为 Warning 而非 Error，减少日志噪音
             err_str = str(e)
             if "2008" in err_str or "post-only" in err_str:
                 logger.warning(f"⚠️ [Nado] Post-Only Rejected: {symbol} @ {final_price}")
@@ -333,9 +318,9 @@ class NadoAdapter(BaseExchange):
             logger.warning(f"⚠️ [Nado] Cancel Failed: {e}")
             return False
 
-    # [修复] 增加 symbols 参数以兼容策略调用
-    async def fetch_positions(self, symbols: List[str] = None) -> List[Dict]:
-        if not self._check_waf_status(): return []
+    # [Fix] Returns None on error to prevent fake fills
+    async def fetch_positions(self, symbols: List[str] = None) -> Optional[List[Dict]]:
+        if not self._check_waf_status(): return None
 
         try:
             resolved_subaccount = subaccount_to_hex(self.client.context.signer.address, self.subaccount_name)
@@ -350,7 +335,6 @@ class NadoAdapter(BaseExchange):
                 pid = pos.product_id
                 symbol = next((s for s, info in self.contract_map.items() if info['id'] == pid), None)
 
-                # 如果指定了 symbols，进行过滤
                 if symbols and symbol not in symbols:
                     continue
 
@@ -361,24 +345,21 @@ class NadoAdapter(BaseExchange):
             return positions
         except Exception as e:
             if self._handle_waf_error(e, "FetchPos"):
-                return []
-            # 记录详细错误以便调试
-            logger.error(f"❌ [Nado] Fetch Pos Error: {e}")
-            return []
+                return None
 
-    # 🟢 [调整] 降频后的双轮询循环
+            # Log error but return None so strategy knows it failed
+            logger.error(f"❌ [Nado] Fetch Pos Error: {e}")
+            return None
+
+    # 🟢 Safe Polling Loop
     async def listen_websocket(self, tick_queue: asyncio.Queue, event_queue: asyncio.Queue):
         logger.info("📡 [Nado] Starting Safe Polling Stream (Anti-WAF Mode)...")
 
         last_pos_poll = 0
-        pos_interval = 2.0  # [降频] 持仓轮询: 2.0s (原1.0s)
-
-        # [降频] 行情轮询目标间隔: 0.5s (原0.1s)
-        # 这对于 Cloudflare 保护的 API 来说是比较安全的上限
+        pos_interval = 2.0
         tick_interval = 0.5
 
         while self.is_connected:
-            # 如果正在熔断冷却中，暂停轮询
             if not self._check_waf_status():
                 await asyncio.sleep(1.0)
                 continue
@@ -387,11 +368,11 @@ class NadoAdapter(BaseExchange):
             tasks = []
 
             try:
-                # 1. 任务: 获取 Orderbook
+                # 1. Orderbook
                 for symbol in self.target_symbols:
                     tasks.append(self._safe_fetch_and_push(symbol, tick_queue))
 
-                # 2. 任务: 获取持仓
+                # 2. Positions
                 if start_ts - last_pos_poll > pos_interval:
                     tasks.append(self._poll_positions_and_emit_trades(event_queue))
                     last_pos_poll = start_ts
@@ -406,7 +387,6 @@ class NadoAdapter(BaseExchange):
                 await asyncio.sleep(1.0)
                 continue
 
-            # 智能休眠 (控制 tick 频率)
             elapsed = time.time() - start_ts
             sleep_time = max(0.05, tick_interval - elapsed)
             await asyncio.sleep(sleep_time)
@@ -414,6 +394,10 @@ class NadoAdapter(BaseExchange):
     async def _poll_positions_and_emit_trades(self, event_queue: asyncio.Queue):
         try:
             current_positions = await self.fetch_positions()
+            # [Fix] If API failed (None), do NOT process, to avoid resetting position to 0
+            if current_positions is None:
+                return
+
             new_pos_map = {p['symbol']: float(p['size']) for p in current_positions}
 
             for symbol in self.target_symbols:
@@ -446,7 +430,7 @@ class NadoAdapter(BaseExchange):
     async def _safe_fetch_and_push(self, symbol: str, tick_queue: asyncio.Queue):
         try:
             tick = await self._fetch_orderbook_impl(symbol)
-            if tick and tick.get('bid') > 0:
+            if tick and tick.get('bid') is not None and tick.get('bid') > 0:
                 tick['type'] = 'tick'
                 try:
                     tick_queue.put_nowait(tick)
