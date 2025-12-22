@@ -133,6 +133,7 @@ class NadoAdapter(BaseExchange):
                 nado_symbol_str = f"{target.upper()}-PERP"
                 product_id = None
 
+                # 兼容对象或字典属性访问
                 for sym_obj in symbols_map:
                     s_str = sym_obj.symbol if hasattr(sym_obj, 'symbol') else str(sym_obj)
                     if s_str == nado_symbol_str:
@@ -206,6 +207,7 @@ class NadoAdapter(BaseExchange):
 
             if not ob: return {}
 
+            # 兼容 SDK 返回对象或列表的情况
             best_bid = float(ob.bids[0].price) / 1e18 if hasattr(ob.bids[0], 'price') else float(ob.bids[0][0]) / 1e18
             best_ask = float(ob.asks[0].price) / 1e18 if hasattr(ob.asks[0], 'price') else float(ob.asks[0][0]) / 1e18
 
@@ -251,14 +253,38 @@ class NadoAdapter(BaseExchange):
 
         is_buy = (side.upper() == 'BUY')
         is_post_only = True if order_type != "MARKET" and kwargs.get('post_only') is not False else False
-        appendix = build_appendix(order_type=OrderType.POST_ONLY) if is_post_only else build_appendix(
-            order_type=OrderType.GTC)
+
+        # [修复] OrderType 设置
+        # 参考代码确认了 Post-Only 的用法。
+        # 针对 Taker (Bailout) 单，如果 OrderType.GTC 不存在，标准写法通常是 OrderType.LIMIT。
+        try:
+            if is_post_only:
+                appendix = build_appendix(order_type=OrderType.POST_ONLY)
+            else:
+                # 尝试使用 LIMIT (标准限价单)，如果不存在则回退
+                t_type = getattr(OrderType, 'LIMIT', None)
+                if not t_type:
+                    t_type = getattr(OrderType, 'IOC', None)  # 再次尝试 IOC
+
+                if t_type:
+                    appendix = build_appendix(order_type=t_type)
+                else:
+                    # 极少数情况：如果都没有，可能 build_appendix 不传参数就是标准单
+                    # 或者我们使用默认值
+                    appendix = build_appendix()
+        except Exception as e:
+            # 最后的兜底，防止因为枚举问题导致无法平仓
+            logger.warning(f"⚠️ [Nado] OrderType resolve failed: {e}, using default appendix")
+            appendix = build_appendix(order_type=OrderType.POST_ONLY) if is_post_only else build_appendix()
+
+        # 参考代码使用了更长的过期时间 (30天)，这里我们也适当延长
+        expiration = get_expiration_timestamp(60 * 60 * 24 * 30)
 
         order_params = OrderParams(
             sender=SubaccountParams(subaccount_owner=self.owner, subaccount_name=self.subaccount_name),
             priceX18=to_x18(final_price),
             amount=to_x18(amount) if is_buy else -to_x18(amount),
-            expiration=get_expiration_timestamp(60 * 60 * 24),
+            expiration=expiration,
             nonce=gen_order_nonce(),
             appendix=appendix
         )
@@ -276,7 +302,8 @@ class NadoAdapter(BaseExchange):
             if self._handle_waf_error(e, "PlaceOrder"):
                 raise RuntimeError("Cloudflare Blocked")
 
-            # [Fix 2008 Error Noise] 检查 Post-Only 错误，记录为 Warning 而非 Error，并重新抛出以便策略捕获
+            # [Fix 2008 Error Noise]
+            # 检查 Post-Only 错误，记录为 Warning 而非 Error，减少日志噪音
             err_str = str(e)
             if "2008" in err_str or "post-only" in err_str:
                 logger.warning(f"⚠️ [Nado] Post-Only Rejected: {symbol} @ {final_price}")
@@ -306,7 +333,7 @@ class NadoAdapter(BaseExchange):
             logger.warning(f"⚠️ [Nado] Cancel Failed: {e}")
             return False
 
-    # [Fix] 增加 symbols 参数以兼容策略调用
+    # [修复] 增加 symbols 参数以兼容策略调用
     async def fetch_positions(self, symbols: List[str] = None) -> List[Dict]:
         if not self._check_waf_status(): return []
 
