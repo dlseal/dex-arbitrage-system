@@ -9,11 +9,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("BaseExchange")
 
+
 @dataclass
 class Balance:
     currency: str
     total: float
     free: float
+
 
 class BaseExchange(ABC):
     """
@@ -39,9 +41,23 @@ class BaseExchange(ABC):
         try:
             return await self._create_order_impl(symbol, side, amount, price, order_type, **kwargs)
         except Exception as e:
-            if self.backoff_controller:
-                self.backoff_controller.record_error(self.name)
-            logger.error(f"❌ [{self.name}] Order Failed: {e}")
+            # [Fix] 智能错误分类：区分"业务拒单"与"系统故障"
+            err_str = str(e).lower()
+            is_operational = "post-only" in err_str or "2008" in err_str or "insufficient" in err_str
+
+            if is_operational:
+                # 业务逻辑错误（如Post-Only重叠、余额不足）：
+                # 1. 仅记录警告，减少日志噪音
+                # 2. 这里的 Warning 可能与 Adapter 层的 Warning 重复，但作为基类兜底是必要的
+                # 3. 关键：不要触发 backoff_controller.record_error，避免策略因拒单而被错误熔断
+                logger.warning(f"⚠️ [{self.name}] Order Rejected: {err_str}")
+            else:
+                # 系统/网络错误：
+                # 记录错误并触发熔断计数
+                if self.backoff_controller:
+                    self.backoff_controller.record_error(self.name)
+                logger.error(f"❌ [{self.name}] Order Failed: {e}")
+
             raise e
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
@@ -50,7 +66,8 @@ class BaseExchange(ABC):
         try:
             return await self._cancel_order_impl(order_id, symbol)
         except Exception as e:
-            logger.error(f"❌ [{self.name}] Cancel Failed: {e}")
+            # 撤单失败通常不影响核心链路，记录警告即可
+            logger.warning(f"⚠️ [{self.name}] Cancel Failed: {e}")
             return False
 
     async def fetch_orderbook(self, symbol: str) -> Dict[str, float]:
@@ -79,7 +96,8 @@ class BaseExchange(ABC):
     # --- 抽象实现 ---
 
     @abstractmethod
-    async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float], order_type: str, **kwargs) -> str:
+    async def _create_order_impl(self, symbol: str, side: str, amount: float, price: Optional[float], order_type: str,
+                                 **kwargs) -> str:
         pass
 
     @abstractmethod
