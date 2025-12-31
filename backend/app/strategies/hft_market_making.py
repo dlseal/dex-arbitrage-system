@@ -159,7 +159,9 @@ class HFTMarketMakingStrategy:
         # 2. 时效性检查 (HFT 关键: 丢弃超过 500ms 的旧数据)
         now_ms = time.time() * 1000
         tick_ts = event.get('ts', now_ms)
-        if now_ms - tick_ts > 500:
+        latency = now_ms - tick_ts
+        if latency > 2000:
+            logger.warning(f"⚠️ [HFT] Tick too old: {latency:.0f}ms > 2000ms. Dropping.")
             return
 
         # 3. 熔断模式下不处理 Tick，专心平仓
