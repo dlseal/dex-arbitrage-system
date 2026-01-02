@@ -11,15 +11,15 @@ logger = logging.getLogger("GRVT_Lighter_Farm")
 
 class GrvtLighterFarmStrategy:
     """
-    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V5)
+    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V6)
 
     修复:
-    1. 解决 "REST API 回滚 WS 状态" 导致的平仓单消失问题 (Phantom Zero Fix).
-    2. 增加 side 配置支持 (BOTH/BUY/SELL).
+    1. 增加订单生命周期管理: 监听 CANCELED/REJECTED 事件，防止 Post-Only 拒单导致的死锁。
+    2. 保持之前所有的 V5 修复 (Anti-Phantom Zero, Price Logic).
     """
 
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v5_Stable"
+        self.name = "GrvtLighter_Farm_v6_Lifecycle"
         self.adapters = adapters
 
         self.grvt = adapters.get('GRVT')
@@ -34,10 +34,10 @@ class GrvtLighterFarmStrategy:
         self.pos_grvt: Dict[str, float] = {}
         self.pos_lighter: Dict[str, float] = {}
 
-        # 关键修复: 记录最后一次 WS 成交时间，用于防止 API 数据回滚
+        # 记录最后一次 WS 成交时间
         self.last_grvt_fill_ts: Dict[str, float] = {}
 
-        # 挂单管理
+        # 挂单管理 (Key State)
         self.active_maker_orders: Dict[str, Dict[str, str]] = {}
         self.maker_order_info: Dict[str, Dict[str, dict]] = {}
 
@@ -51,7 +51,7 @@ class GrvtLighterFarmStrategy:
         conf = settings.strategies.farming
         self.target_symbols = settings.common.target_symbols
 
-        self.farm_side = str(getattr(conf, 'side', 'BOTH')).upper()  # BOTH, BUY, SELL
+        self.farm_side = str(getattr(conf, 'side', 'BOTH')).upper()
         self.slippage_tolerance = float(conf.max_slippage_tolerance)
         self.max_inventory_usd = float(conf.max_inventory_usd)
         self.requote_threshold = float(conf.requote_threshold)
@@ -63,7 +63,7 @@ class GrvtLighterFarmStrategy:
         self.momentum_threshold = 0.001
 
         self.running = True
-        logger.info(f"🛡️ [Strategy] V5 Started. Side={self.farm_side}, Tol={self.slippage_tolerance}")
+        logger.info(f"🛡️ [Strategy] V6 Started. Side={self.farm_side}, Lifecycle=Active")
 
         asyncio.create_task(self._watchdog_loop())
 
@@ -80,11 +80,46 @@ class GrvtLighterFarmStrategy:
             await self._process_tick(event)
         elif etype == 'trade':
             await self._process_trade(event)
+        elif etype == 'order':  # 新增: 处理订单状态变更
+            await self._process_order_event(event)
+
+    async def _process_order_event(self, event: dict):
+        """
+        处理订单状态回调 (CANCELED, REJECTED, FILLED)
+        这是防止 Post-Only 被拒后策略卡死的关键。
+        """
+        if event.get('exchange') != 'GRVT': return
+
+        order_id = str(event.get('id', ''))
+        status = event.get('status', '').upper()
+        symbol = event.get('symbol', '')
+
+        # 如果订单已结束 (被拒、被撤、完全成交)，清理本地状态
+        if status in ['CANCELED', 'REJECTED', 'FILLED', 'CLOSED']:
+            self._remove_order_from_memory(symbol, order_id)
+
+            if status == 'REJECTED':
+                logger.warning(f"❌ [Order Rejected] {symbol} ID:{order_id} - Likely Post-Only violation. Will retry.")
+
+    def _remove_order_from_memory(self, symbol, order_id):
+        """ 安全地从内存中移除订单 """
+        if symbol in self.active_maker_orders:
+            # 查找并删除对应的 side
+            found_side = None
+            for side, oid in self.active_maker_orders[symbol].items():
+                if str(oid) == order_id:
+                    found_side = side
+                    break
+
+            if found_side:
+                del self.active_maker_orders[symbol][found_side]
+                if found_side in self.maker_order_info.get(symbol, {}):
+                    del self.maker_order_info[symbol][found_side]
+                # logger.debug(f"🗑️ [Order Cleaned] {symbol} {found_side} {order_id}")
 
     async def _process_trade(self, trade: dict):
         symbol = trade['symbol']
         exchange = trade['exchange']
-
         try:
             size = float(trade['size'])
             side = trade['side']
@@ -93,16 +128,12 @@ class GrvtLighterFarmStrategy:
 
         if exchange == 'GRVT':
             logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {trade.get('price')}")
-
-            # 记录成交时间，通知 Watchdog 暂时不要相信 REST API
             self.last_grvt_fill_ts[symbol] = time.time()
 
             async with self.hedge_lock:
                 current = self.pos_grvt.get(symbol, 0.0)
                 change = size if side == 'BUY' else -size
                 self.pos_grvt[symbol] = current + change
-
-                # 立即对冲
                 await self._execute_hedge_logic(symbol)
 
         elif exchange == 'Lighter':
@@ -154,11 +185,9 @@ class GrvtLighterFarmStrategy:
             try:
                 grvt_p = self.pos_grvt.get(symbol, 0.0)
                 lighter_p = self.pos_lighter.get(symbol, 0.0)
-
                 diff = -grvt_p - lighter_p
 
-                if abs(diff) < 0.0001:
-                    return
+                if abs(diff) < 0.0001: return
 
                 hedge_side = 'BUY' if diff > 0 else 'SELL'
                 hedge_size = abs(diff)
@@ -169,9 +198,7 @@ class GrvtLighterFarmStrategy:
                     retry_count += 1
                     continue
 
-                # 激进对冲: Taker 不考虑利润，只求成交
                 ref_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
-                # 1.5% 滑点保护
                 limit_price = ref_price * 1.015 if hedge_side == 'BUY' else ref_price * 0.985
 
                 logger.info(f"🌊 [FIRING HEDGE] Lighter {hedge_side} {hedge_size} @ ~{limit_price:.4f}")
@@ -225,7 +252,7 @@ class GrvtLighterFarmStrategy:
 
                 safe_qty = self._check_liquidity(lighter_tick, qty)
                 if safe_qty < (qty * 0.1):
-                    logger.warning(f"⚠️ [Liquidity] Too thin, skipping.")
+                    # logger.warning(f"⚠️ [Liquidity] Too thin, skipping.")
                     await self._cancel_all_maker(symbol)
                     return
 
@@ -233,39 +260,40 @@ class GrvtLighterFarmStrategy:
                 allow_buy = momentum != 'BEARISH'
                 allow_sell = momentum != 'BULLISH'
 
-                # 计算价格 (Fix: 买单锚定Bid, 卖单锚定Ask, 负滑点=加价)
                 bid_ref = self._get_weighted_price(lighter_tick, 'BUY', safe_qty)
                 ask_ref = self._get_weighted_price(lighter_tick, 'SELL', safe_qty)
 
                 if bid_ref and ask_ref:
-                    # 检查 side 配置
                     should_buy = self.farm_side in ['BOTH', 'BUY']
                     should_sell = self.farm_side in ['BOTH', 'SELL']
 
                     if should_buy and allow_buy:
-                        # Price = Bid * (1 - (-0.0004)) = Bid * 1.0004
                         my_bid = bid_ref * (1 - self.slippage_tolerance)
                         orders_to_place.append(('BUY', my_bid))
 
                     if should_sell and allow_sell:
-                        # Price = Ask * (1 + (-0.0004)) = Ask * 0.9996
                         my_ask = ask_ref * (1 + self.slippage_tolerance)
                         orders_to_place.append(('SELL', my_ask))
 
             # --- 场景 B: 平仓模式 (CLOSE) ---
             else:
-                # 无论之前配置什么，平仓时必须全速平掉
+                # 平仓逻辑
                 close_tolerance = min(self.slippage_tolerance, -0.0005)
 
                 if g_pos > 0:  # Long -> Sell to Close
                     ref = self._get_weighted_price(lighter_tick, 'SELL', abs(g_pos))
                     if ref:
-                        orders_to_place.append(('SELL', ref * (1 + close_tolerance)))
+                        # 如果计算出的价格太低导致穿仓被拒，
+                        # 下次重试时，价格可能会随市场变动，或者我们可以稍微保守一点？
+                        # 暂时保持激进，依赖 _process_order_event 清理状态后的重试
+                        price = ref * (1 + close_tolerance)
+                        orders_to_place.append(('SELL', price))
 
                 elif g_pos < 0:  # Short -> Buy to Close
                     ref = self._get_weighted_price(lighter_tick, 'BUY', abs(g_pos))
                     if ref:
-                        orders_to_place.append(('BUY', ref * (1 - close_tolerance)))
+                        price = ref * (1 - close_tolerance)
+                        orders_to_place.append(('BUY', price))
 
             await self._reconcile_orders(symbol, orders_to_place, qty)
 
@@ -312,9 +340,7 @@ class GrvtLighterFarmStrategy:
 
         for side in sides_to_cancel:
             await self.grvt.cancel_order(current_orders[side], symbol=symbol)
-            if side in self.active_maker_orders[symbol]:
-                del self.active_maker_orders[symbol][side]
-                del self.maker_order_info[symbol][side]
+            self._remove_order_from_memory(symbol, current_orders[side])
 
         for side, price in desired_map.items():
             order_qty = qty
@@ -369,27 +395,19 @@ class GrvtLighterFarmStrategy:
         if cum_vol == 0: return base_price
         return cum_cost / cum_vol
 
-    # ==================================================================
-    # 后台守护 (关键修复: 防止 REST API 覆盖最新的 WS 状态)
-    # ==================================================================
-
     async def _watchdog_loop(self):
         logger.info("🐶 Watchdog started...")
         while self.running:
             try:
                 await asyncio.sleep(5.0)
 
-                # 获取 REST 仓位
                 grvt_positions = await self.grvt.fetch_positions(symbols=self.target_symbols)
                 lighter_positions = await self._fetch_lighter_positions_safe()
 
                 for symbol in self.target_symbols:
-                    # 1. 智能合并 GRVT 仓位
-                    # 如果最近 15 秒内有 WS 成交，不要信任 REST (REST 可能延迟)
                     last_fill = self.last_grvt_fill_ts.get(symbol, 0)
                     trust_rest = (time.time() - last_fill) > 15.0
 
-                    # 从 REST 数据中解析
                     rest_g_pos = 0.0
                     for p in grvt_positions:
                         p_sym = p.get('instrument') or p.get('symbol')
@@ -402,16 +420,11 @@ class GrvtLighterFarmStrategy:
                     l_pos = lighter_positions.get(symbol, self.pos_lighter.get(symbol, 0.0))
 
                     async with self.hedge_lock:
-                        # 仅当 REST 数据可信时才覆盖本地 GRVT 状态
                         if trust_rest:
                             self.pos_grvt[symbol] = rest_g_pos
-                        else:
-                            # 否则保留 WS 计算出的 pos_grvt，防止回滚到 0
-                            pass
 
                         self.pos_lighter[symbol] = l_pos
 
-                        # 校验平衡
                         g_final = self.pos_grvt.get(symbol, 0.0)
                         if abs(g_final + l_pos) > 0.0001:
                             logger.warning(f"🐶 [Watchdog] Unbalanced {symbol}: G={g_final} L={l_pos}")
