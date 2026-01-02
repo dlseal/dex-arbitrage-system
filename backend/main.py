@@ -85,6 +85,9 @@ class SystemOrchestrator:
         required_exchanges = set()
         if strategy_type == "HFT_MM":
             required_exchanges.add(settings.strategies.hft_mm.exchange)
+        elif strategy_type == "GL_FARM":  # 新增
+            required_exchanges.add("GRVT")
+            required_exchanges.add("Lighter")
         elif strategy_type == "AI_GRID":
             required_exchanges.add(settings.strategies.ai_grid.exchange)
         elif strategy_type == "SPREAD_ARB":
@@ -172,6 +175,12 @@ class SystemOrchestrator:
                 adapters=adapters_map,
                 risk_controller=self.risk_controller
             )
+        elif strategy_type == "GL_FARM":
+            from app.strategies.grvt_lighter_farm import GrvtLighterFarmStrategy
+            # 确保 Lighter 和 GRVT 适配器都已加载
+            if "GRVT" not in adapters_map or "Lighter" not in adapters_map:
+                raise RuntimeError("GL_FARM strategy requires both GRVT and Lighter adapters")
+            return GrvtLighterFarmStrategy(adapters=adapters_map)
         elif strategy_type == "AI_GRID":
             from app.strategies.ai_grid import AiAdaptiveGridStrategy
             return AiAdaptiveGridStrategy(
