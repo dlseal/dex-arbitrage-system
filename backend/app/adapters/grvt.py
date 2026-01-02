@@ -364,34 +364,38 @@ class GrvtAdapter(BaseExchange):
                     state = feed_data.get("state", {})
                     status = state.get("status", "").upper()
 
+                    # 获取ID
                     client_oid = message.get('client_order_id') or feed_data.get('client_order_id') or state.get(
                         'client_order_id')
                     system_oid = message.get('order_id') or feed_data.get('order_id')
                     final_order_id = str(client_oid) if client_oid else str(system_oid)
 
-                    if status in ["FILLED", "PARTIALLY_FILLED"]:
-                        legs = feed_data.get("legs", [])
-                        filled_size = sum(float(l.get("size", 0)) for l in legs)
+                    instrument = feed_data.get("instrument") or state.get("instrument")
+                    symbol_base = self._get_symbol_from_instrument(instrument)
 
-                        if filled_size > 0 and legs:
-                            leg = legs[0]
-                            symbol_base = self._get_symbol_from_instrument(leg.get("instrument"))
-                            is_buy = leg.get("is_buying_asset", False)
-                            side = "BUY" if is_buy else "SELL"
-                            price = float(leg.get("limit_price", 0))
+                    # [MODIFIED] 推送所有关键状态，包括 REJECTED/CANCELED
+                    if status in ["FILLED", "PARTIALLY_FILLED", "CANCELED", "REJECTED"]:
+                        event = {
+                            'type': 'order',  # 使用通用的 order 事件类型
+                            'exchange': self.name,
+                            'symbol': symbol_base,
+                            'order_id': final_order_id,
+                            'status': status,
+                            'ts': int(time.time() * 1000)
+                        }
+                        # 额外补充成交信息
+                        if status in ["FILLED", "PARTIALLY_FILLED"]:
+                            legs = feed_data.get("legs", [])
+                            filled_size = sum(float(l.get("size", 0)) for l in legs)
+                            if filled_size > 0 and legs:
+                                leg = legs[0]
+                                is_buy = leg.get("is_buying_asset", False)
+                                event['side'] = "BUY" if is_buy else "SELL"
+                                event['price'] = float(leg.get("limit_price", 0))
+                                event['size'] = filled_size
+                                event['type'] = 'trade'  # 保持对 trade 处理的兼容
 
-                            event = {
-                                'type': 'trade',
-                                'exchange': self.name,
-                                'symbol': symbol_base,
-                                'side': side,
-                                'price': price,
-                                'size': filled_size,
-                                'order_id': final_order_id,
-                                'status': status,
-                                'ts': int(time.time() * 1000)
-                            }
-                            event_queue.put_nowait(event)
+                        event_queue.put_nowait(event)
                     return
 
                 if "book" in str(channel):
