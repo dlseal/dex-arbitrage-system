@@ -27,7 +27,7 @@ common:
 strategies:
   # 当前激活的策略类型
   # 可选值: HFT_MM | SPREAD | GL_FARM | GL_INVENTORY | AI_GRID
-  active: "AI_GRID"
+  active: "GL_FARM"
 
   # --- 1. 高频做市策略 (HFT Market Making) ---
   hft_mm:
@@ -70,13 +70,16 @@ strategies:
   # --- 3. 刷量/库存策略 (GL Farm & Inventory) ---
   farming:
     # 刷量方向 (BUY/SELL)
-    side: "BUY"
+    side: "BOTH"
 
     # 允许的最大滑点亏损 (负数表示愿意支付的成本)
-    max_slippage_tolerance: -0.0005
+    max_slippage_tolerance: -0.0004
 
     # 重挂单阈值
     requote_threshold: 0.0002
+
+    # 订单深度
+    required_depth_ratio: 3.0
 
     # 库存刷量专用: 最大库存价值 (USD)
     max_inventory_usd: 800.0
