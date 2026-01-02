@@ -11,16 +11,16 @@ logger = logging.getLogger("GRVT_Lighter_Farm")
 
 class GrvtLighterFarmStrategy:
     """
-    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V7)
+    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V8)
 
-    核心升级:
-    1. Dynamic Chasing: 实时跟随 Lighter 价格变化进行改单，防止挂单“僵死”。
-    2. Price Clamping: 严格限制挂单价格不穿仓，防止被拒。
-    3. Zombie Cleaner: 自动清理无效订单。
+    核心升级 V8:
+    1. Event-Driven Retry: 收到 REJECTED/CANCELED 事件后，立即触发补单，0延迟，无视2s限制。
+    2. Dynamic Chasing: 实时跟随 Lighter 价格改单。
+    3. Price Clamping: 价格钳位防止穿仓。
     """
 
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v7_Chasing"
+        self.name = "GrvtLighter_Farm_v8_EventDriven"
         self.adapters = adapters
 
         self.grvt = adapters.get('GRVT')
@@ -52,20 +52,18 @@ class GrvtLighterFarmStrategy:
 
         self.farm_side = str(getattr(conf, 'side', 'BOTH')).upper()
         self.slippage_tolerance = float(conf.max_slippage_tolerance)
-        # 改单阈值: 降低这个值会让挂单跳动得更频繁，紧贴盘口
-        # 建议设为 0.0001 (1bps) 甚至更低
         self.requote_threshold = float(getattr(conf, 'requote_threshold', 0.0001))
-
         self.required_depth_ratio = float(getattr(conf, 'required_depth_ratio', 3.0))
 
-        # 存活时间: 为了追单，我们可以允许更短的存活时间，比如 1秒
+        # 订单存活时间 (仅针对活跃订单)
         self.min_order_lifetime = 1.0
-        self.urgent_threshold = 0.005  # 0.5% 偏差就视为紧急改单
+        self.urgent_threshold = 0.005
+
         self.momentum_window = 2.0
         self.momentum_threshold = 0.001
 
         self.running = True
-        logger.info(f"🛡️ [Strategy] V7 Started. Chasing Active. Requote={self.requote_threshold}")
+        logger.info(f"🛡️ [Strategy] V8 Started. Event-Driven Retry Active.")
 
         asyncio.create_task(self._watchdog_loop())
 
@@ -86,15 +84,29 @@ class GrvtLighterFarmStrategy:
             await self._process_order_event(event)
 
     async def _process_order_event(self, event: dict):
+        """
+        [关键优化] 处理订单事件
+        一旦发现订单死掉 (REJECTED/CANCELED)，立即触发新的 Quote 循环。
+        """
         if event.get('exchange') != 'GRVT': return
+
         order_id = str(event.get('order_id', '') or event.get('id', ''))
         status = event.get('status', '').upper()
         symbol = event.get('symbol', '')
 
         if status in ['CANCELED', 'REJECTED', 'FILLED', 'CLOSED']:
             if status == 'REJECTED':
-                logger.warning(f"❌ [Order Rejected] {symbol} ID:{order_id}")
+                logger.warning(f"❌ [Order Rejected] {symbol} ID:{order_id} -> Retrying immediately.")
+
+            # 1. 立即清理内存状态 (这会让 _reconcile_orders 认为当前无单)
             self._remove_order_from_memory(symbol, order_id)
+
+            # 2. [V8 Upgrade] 立即触发挂单更新，不要等下一个 Tick
+            # 只有 REJECTED 或 CANCELED 需要立即补单 (FILLED 会走 trade 逻辑触发对冲)
+            if status in ['REJECTED', 'CANCELED']:
+                # 给极短的延迟让 Loop 喘口气，避免死循环高频报错
+                await asyncio.sleep(0.05)
+                asyncio.create_task(self._update_maker_quotes(symbol))
 
     def _remove_order_from_memory(self, symbol, order_id):
         if symbol in self.active_maker_orders:
@@ -139,12 +151,11 @@ class GrvtLighterFarmStrategy:
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        # 只要任意一边价格变动，都应该触发 Quote 检查
+        # 任意一边行情变动都触发 Quote 跟随
         if exchange == 'Lighter' or exchange == 'GRVT':
             if exchange == 'Lighter':
                 self._update_price_history(symbol, tick)
 
-            # 使用 create_task 异步更新，不阻塞
             asyncio.create_task(self._update_maker_quotes(symbol))
 
     def _update_price_history(self, symbol: str, tick: dict):
@@ -189,6 +200,7 @@ class GrvtLighterFarmStrategy:
                     continue
 
                 ref_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
+                # 1.5% 滑点保护
                 limit_price = ref_price * 1.015 if hedge_side == 'BUY' else ref_price * 0.985
 
                 logger.info(f"🌊 [FIRING HEDGE] Lighter {hedge_side} {hedge_size} @ ~{limit_price:.4f}")
@@ -268,11 +280,13 @@ class GrvtLighterFarmStrategy:
                         orders_to_place.append(('SELL', limit_price))
 
             else:
+                # 平仓模式
                 close_tolerance = min(self.slippage_tolerance, -0.0005)
                 if g_pos > 0:
                     ref = self._get_weighted_price(lighter_tick, 'SELL', abs(g_pos))
                     if ref:
                         target_price = ref * (1 + close_tolerance)
+                        # Clamping: 即使是平仓，也不能低于买一价（Post-Only限制）
                         limit_price = max(target_price, grvt_bid + tick_size)
                         orders_to_place.append(('SELL', limit_price))
                 elif g_pos < 0:
@@ -299,7 +313,7 @@ class GrvtLighterFarmStrategy:
         desired_map = {side: price for side, price in desired_orders}
         now = time.time()
 
-        # --- 1. 撤单逻辑 (增强版) ---
+        # --- 1. 撤单逻辑 (ACTIVE 订单才需要检查存活时间) ---
         sides_to_cancel = []
         for side, oid in current_orders.items():
             info = current_info.get(side, {})
@@ -313,37 +327,29 @@ class GrvtLighterFarmStrategy:
 
             # B: 价格是否需要调整?
             new_p = desired_map[side]
-
-            # 计算价格差异比例
             diff_pct = abs(curr_p - new_p) / curr_p if curr_p else 0
 
             life_span = now - ts
             is_urgent = diff_pct > self.urgent_threshold
-
-            # [关键] 如果价格有变化且超过阈值 (requote_threshold)，或者单子已经太老，都触发改单
             should_requote = diff_pct > self.requote_threshold
 
-            # 只有当单子足够"老" (避免限流) 或者 紧急情况 才允许撤单
+            # 存活时间逻辑: 只有 Active 订单才受此限制
+            # Rejected 订单已经在 _process_order_event 中被移除了，根本不会进入这个循环
             if is_urgent or (should_requote and life_span >= self.min_order_lifetime):
-                # 决定撤单重挂 -> 加入 cancel 列表
                 sides_to_cancel.append(side)
             elif should_requote and not is_urgent:
-                # 价格变了但还没到时间 -> 暂时不动，也不要发新单
-                del desired_map[side]
+                del desired_map[side]  # 没到时间，不动
             else:
-                # 价格没变 -> 完美，保留
-                del desired_map[side]
+                del desired_map[side]  # 价格没变，不动
 
-        # 执行撤单
         for side in sides_to_cancel:
             await self.grvt.cancel_order(current_orders[side], symbol=symbol)
-            # 乐观移除状态，允许立即发新单
             if side in self.active_maker_orders.get(symbol, {}):
                 del self.active_maker_orders[symbol][side]
-            if side in self.maker_order_info.get(symbol, {}):
                 del self.maker_order_info[symbol][side]
 
-        # --- 2. 下新单逻辑 ---
+        # --- 2. 下新单逻辑 (这里没有存活时间限制) ---
+        # 如果订单被 Reject 删除了，或者刚才被 Cancel 了，都会进入这里
         for side, price in desired_map.items():
             order_qty = qty
             if side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0:
