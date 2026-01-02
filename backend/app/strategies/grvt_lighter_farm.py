@@ -11,16 +11,16 @@ logger = logging.getLogger("GRVT_Lighter_Farm")
 
 class GrvtLighterFarmStrategy:
     """
-    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V6)
+    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V7)
 
-    修复核心:
-    1. [Price Clamping] 强制挂单价格不穿过盘口，杜绝 Post-Only Reject。
-    2. [Zombie Cleaner] 监听订单状态，自动清理被拒/被撤的僵尸单。
-    3. [State Recovery] 增强的 Watchdog 防止状态回滚。
+    核心升级:
+    1. Dynamic Chasing: 实时跟随 Lighter 价格变化进行改单，防止挂单“僵死”。
+    2. Price Clamping: 严格限制挂单价格不穿仓，防止被拒。
+    3. Zombie Cleaner: 自动清理无效订单。
     """
 
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v6_Clamped"
+        self.name = "GrvtLighter_Farm_v7_Chasing"
         self.adapters = adapters
 
         self.grvt = adapters.get('GRVT')
@@ -34,13 +34,13 @@ class GrvtLighterFarmStrategy:
         # 仓位状态
         self.pos_grvt: Dict[str, float] = {}
         self.pos_lighter: Dict[str, float] = {}
-        self.last_grvt_fill_ts: Dict[str, float] = {}  # 用于防止 REST 数据回滚
+        self.last_grvt_fill_ts: Dict[str, float] = {}
 
-        # 挂单管理 (Symbol -> Side -> OrderID)
+        # 挂单管理
         self.active_maker_orders: Dict[str, Dict[str, str]] = {}
         self.maker_order_info: Dict[str, Dict[str, dict]] = {}
 
-        # 价格动量历史
+        # 价格动量
         self.price_history: Dict[str, Deque[Tuple[float, float]]] = {}
 
         self.hedge_lock = asyncio.Lock()
@@ -52,17 +52,20 @@ class GrvtLighterFarmStrategy:
 
         self.farm_side = str(getattr(conf, 'side', 'BOTH')).upper()
         self.slippage_tolerance = float(conf.max_slippage_tolerance)
-        self.requote_threshold = float(conf.requote_threshold)
+        # 改单阈值: 降低这个值会让挂单跳动得更频繁，紧贴盘口
+        # 建议设为 0.0001 (1bps) 甚至更低
+        self.requote_threshold = float(getattr(conf, 'requote_threshold', 0.0001))
+
         self.required_depth_ratio = float(getattr(conf, 'required_depth_ratio', 3.0))
 
-        # 风控参数
-        self.min_order_lifetime = 2.0
-        self.urgent_threshold = 0.01
+        # 存活时间: 为了追单，我们可以允许更短的存活时间，比如 1秒
+        self.min_order_lifetime = 1.0
+        self.urgent_threshold = 0.005  # 0.5% 偏差就视为紧急改单
         self.momentum_window = 2.0
         self.momentum_threshold = 0.001
 
         self.running = True
-        logger.info(f"🛡️ [Strategy] V6 Started. Clamping=Active, Side={self.farm_side}")
+        logger.info(f"🛡️ [Strategy] V7 Started. Chasing Active. Requote={self.requote_threshold}")
 
         asyncio.create_task(self._watchdog_loop())
 
@@ -79,27 +82,18 @@ class GrvtLighterFarmStrategy:
             await self._process_tick(event)
         elif etype == 'trade':
             await self._process_trade(event)
-        elif etype == 'order':  # [关键] 监听订单状态变化
+        elif etype == 'order':
             await self._process_order_event(event)
 
     async def _process_order_event(self, event: dict):
-        """
-        处理订单状态回调 (CANCELED, REJECTED, FILLED)
-        这是防止 Post-Only 被拒后策略卡死的第二道防线。
-        注意: 需要 Adapter 支持推送此类事件。
-        """
         if event.get('exchange') != 'GRVT': return
-
         order_id = str(event.get('order_id', '') or event.get('id', ''))
         status = event.get('status', '').upper()
         symbol = event.get('symbol', '')
 
-        # 如果订单已结束 (被拒、被撤、完全成交)，清理本地状态
         if status in ['CANCELED', 'REJECTED', 'FILLED', 'CLOSED']:
             if status == 'REJECTED':
-                logger.warning(f"❌ [Order Rejected] {symbol} ID:{order_id} - Post-Only violation detected.")
-
-            # 安全移除
+                logger.warning(f"❌ [Order Rejected] {symbol} ID:{order_id}")
             self._remove_order_from_memory(symbol, order_id)
 
     def _remove_order_from_memory(self, symbol, order_id):
@@ -109,7 +103,6 @@ class GrvtLighterFarmStrategy:
                 if str(oid) == str(order_id):
                     found_side = side
                     break
-
             if found_side:
                 del self.active_maker_orders[symbol][found_side]
                 if found_side in self.maker_order_info.get(symbol, {}):
@@ -127,7 +120,6 @@ class GrvtLighterFarmStrategy:
         if exchange == 'GRVT':
             logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {trade.get('price')}")
             self.last_grvt_fill_ts[symbol] = time.time()
-
             async with self.hedge_lock:
                 current = self.pos_grvt.get(symbol, 0.0)
                 change = size if side == 'BUY' else -size
@@ -147,12 +139,13 @@ class GrvtLighterFarmStrategy:
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        if exchange == 'Lighter':
-            self._update_price_history(symbol, tick)
+        # 只要任意一边价格变动，都应该触发 Quote 检查
+        if exchange == 'Lighter' or exchange == 'GRVT':
+            if exchange == 'Lighter':
+                self._update_price_history(symbol, tick)
+
+            # 使用 create_task 异步更新，不阻塞
             asyncio.create_task(self._update_maker_quotes(symbol))
-        # GRVT tick 同样重要，用于 Price Clamping
-        elif exchange == 'GRVT':
-            pass
 
     def _update_price_history(self, symbol: str, tick: dict):
         mid = (float(tick['bid']) + float(tick['ask'])) / 2
@@ -173,10 +166,6 @@ class GrvtLighterFarmStrategy:
         if pct > self.momentum_threshold: return 'BULLISH'
         if pct < -self.momentum_threshold: return 'BEARISH'
         return 'NEUTRAL'
-
-    # ==================================================================
-    # 核心对冲逻辑 (Lighter Taker)
-    # ==================================================================
 
     async def _execute_hedge_logic(self, symbol: str):
         retry_count = 0
@@ -199,7 +188,6 @@ class GrvtLighterFarmStrategy:
                     retry_count += 1
                     continue
 
-                # Taker 对冲: 激进吃单
                 ref_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
                 limit_price = ref_price * 1.015 if hedge_side == 'BUY' else ref_price * 0.985
 
@@ -228,10 +216,6 @@ class GrvtLighterFarmStrategy:
         logger.critical(f"💀 [HEDGE FAILED] {symbol} - Stopping Quotes")
         asyncio.create_task(self._cancel_all_maker(symbol))
 
-    # ==================================================================
-    # Maker 挂单逻辑 (GRVT) - 核心修复: Price Clamping
-    # ==================================================================
-
     async def _update_maker_quotes(self, symbol: str):
         lock = self._get_lock(symbol)
         if lock.locked(): return
@@ -241,7 +225,6 @@ class GrvtLighterFarmStrategy:
             grvt_tick = self.tickers.get(symbol, {}).get('GRVT')
 
             if not lighter_tick or lighter_tick.get('bid') == 0: return
-            # 如果没有 GRVT 盘口，无法做 Clamping，暂时跳过
             if not grvt_tick or grvt_tick.get('bid') == 0: return
 
             g_pos = self.pos_grvt.get(symbol, 0.0)
@@ -251,14 +234,12 @@ class GrvtLighterFarmStrategy:
             qty = settings.get_trade_qty(symbol)
             orders_to_place = []
 
-            # 获取 GRVT 盘口，用于防止穿仓
             grvt_bid = grvt_tick['bid']
             grvt_ask = grvt_tick['ask']
-            # 获取 Tick Size
             info = self.grvt.contract_map.get(f"{symbol}-USDT")
             tick_size = float(info['tick_size']) if info else 0.1
 
-            # --- 场景 A: 正常做市 (OPEN) ---
+            # --- 计算目标价格 ---
             if is_balanced and abs(g_pos) < (qty * 0.1):
                 safe_qty = self._check_liquidity(lighter_tick, qty)
                 if safe_qty < (qty * 0.1):
@@ -278,37 +259,26 @@ class GrvtLighterFarmStrategy:
 
                     if should_buy and allow_buy:
                         target_price = bid_ref * (1 - self.slippage_tolerance)
-                        # Clamping: 买单最高不能超过 Ask - Tick (或者 Bid)
-                        # 为了稳健，不能高于 (GRVT_Ask - Tick)
                         limit_price = min(target_price, grvt_ask - tick_size)
                         orders_to_place.append(('BUY', limit_price))
 
                     if should_sell and allow_sell:
                         target_price = ask_ref * (1 + self.slippage_tolerance)
-                        # Clamping: 卖单最低不能低于 Bid + Tick
-                        # 为了稳健，不能低于 (GRVT_Bid + Tick)
                         limit_price = max(target_price, grvt_bid + tick_size)
                         orders_to_place.append(('SELL', limit_price))
 
-            # --- 场景 B: 平仓模式 (CLOSE) ---
             else:
                 close_tolerance = min(self.slippage_tolerance, -0.0005)
-
-                if g_pos > 0:  # Long -> Sell to Close
+                if g_pos > 0:
                     ref = self._get_weighted_price(lighter_tick, 'SELL', abs(g_pos))
                     if ref:
                         target_price = ref * (1 + close_tolerance)
-                        # [重要] 即使要平仓，Post-Only 也不能穿过买一价
-                        # 如果计算出的价格太低，强制提升到 GRVT_Bid + Tick
-                        # 虽然这可能导致无法立即成交，但比被拒单要好
                         limit_price = max(target_price, grvt_bid + tick_size)
                         orders_to_place.append(('SELL', limit_price))
-
-                elif g_pos < 0:  # Short -> Buy to Close
+                elif g_pos < 0:
                     ref = self._get_weighted_price(lighter_tick, 'BUY', abs(g_pos))
                     if ref:
                         target_price = ref * (1 - close_tolerance)
-                        # [重要] 强制降低到 GRVT_Ask - Tick
                         limit_price = min(target_price, grvt_ask - tick_size)
                         orders_to_place.append(('BUY', limit_price))
 
@@ -329,37 +299,51 @@ class GrvtLighterFarmStrategy:
         desired_map = {side: price for side, price in desired_orders}
         now = time.time()
 
+        # --- 1. 撤单逻辑 (增强版) ---
         sides_to_cancel = []
         for side, oid in current_orders.items():
             info = current_info.get(side, {})
-            curr_p, ts = info.get('price', 0), info.get('ts', 0)
+            curr_p = info.get('price', 0)
+            ts = info.get('ts', 0)
 
+            # A: 不需要了
             if side not in desired_map:
                 sides_to_cancel.append(side)
                 continue
 
+            # B: 价格是否需要调整?
             new_p = desired_map[side]
+
+            # 计算价格差异比例
             diff_pct = abs(curr_p - new_p) / curr_p if curr_p else 0
 
             life_span = now - ts
             is_urgent = diff_pct > self.urgent_threshold
-            is_mature = life_span >= self.min_order_lifetime
 
-            if is_urgent:
+            # [关键] 如果价格有变化且超过阈值 (requote_threshold)，或者单子已经太老，都触发改单
+            should_requote = diff_pct > self.requote_threshold
+
+            # 只有当单子足够"老" (避免限流) 或者 紧急情况 才允许撤单
+            if is_urgent or (should_requote and life_span >= self.min_order_lifetime):
+                # 决定撤单重挂 -> 加入 cancel 列表
                 sides_to_cancel.append(side)
-            elif diff_pct > self.requote_threshold:
-                if is_mature:
-                    sides_to_cancel.append(side)
-                else:
-                    del desired_map[side]
+            elif should_requote and not is_urgent:
+                # 价格变了但还没到时间 -> 暂时不动，也不要发新单
+                del desired_map[side]
             else:
+                # 价格没变 -> 完美，保留
                 del desired_map[side]
 
+        # 执行撤单
         for side in sides_to_cancel:
             await self.grvt.cancel_order(current_orders[side], symbol=symbol)
-            # 乐观移除，等待 _process_order_event 确认
-            self._remove_order_from_memory(symbol, current_orders[side])
+            # 乐观移除状态，允许立即发新单
+            if side in self.active_maker_orders.get(symbol, {}):
+                del self.active_maker_orders[symbol][side]
+            if side in self.maker_order_info.get(symbol, {}):
+                del self.maker_order_info[symbol][side]
 
+        # --- 2. 下新单逻辑 ---
         for side, price in desired_map.items():
             order_qty = qty
             if side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0:
