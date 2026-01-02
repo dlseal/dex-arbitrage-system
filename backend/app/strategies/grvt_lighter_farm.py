@@ -1,331 +1,449 @@
-# backend/app/strategies/grvt_lighter_farm.py
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional, Set, Tuple
-from app.config import settings  # <--- 修改导入
+from decimal import Decimal
+from typing import Dict, Any, Optional, Tuple, List
+from app.config import settings
 
-logger = logging.getLogger("SmartFarm_Pro_v13")
+logger = logging.getLogger("GRVT_Lighter_Farm")
 
 
 class GrvtLighterFarmStrategy:
+    """
+    GRVT (Maker) + Lighter (Taker) 严格对冲做市策略 (Leader-Follower模式)
+
+    核心原则:
+    1. GRVT 是 Leader (Maker)，Lighter 是 Follower (Taker)。
+    2. 任何时刻，目标状态必须满足: Lighter_Position = -1 * GRVT_Position。
+    3. GRVT 成交后(Partial/Full)，立即触发 Lighter 市价对冲。
+    4. 只有当双边持仓完全平衡(净敞口为0)时，才允许挂新的 Open 单。
+    """
+
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_SmartFarm_Pro_v13_ProfitUnlocked"
+        self.name = "GrvtLighter_Robust_Farm_v2"
         self.adapters = adapters
+
+        # --- 交易所适配器 ---
+        self.grvt = adapters.get('GRVT')
+        self.lighter = adapters.get('Lighter')
+        if not self.grvt or not self.lighter:
+            raise RuntimeError("CRITICAL: GRVT or Lighter adapter missing!")
+
+        # --- 状态数据 ---
         self.tickers: Dict[str, Dict[str, Dict]] = {}
 
-        # --- 订单状态 ---
-        self.active_orders: Dict[str, str] = {}
-        self.active_order_prices: Dict[str, float] = {}
-        self.pending_orders: Set[str] = set()
+        # 仓位状态 (内存缓存，定期与API同步)
+        self.pos_grvt: Dict[str, float] = {}
+        self.pos_lighter: Dict[str, float] = {}
 
-        self.order_create_time: Dict[str, float] = {}
-        self.last_heartbeat = time.time()
+        # 挂单状态
+        self.active_maker_orders: Dict[str, Dict[str, str]] = {}  # symbol -> {side: order_id}
+        self.maker_order_prices: Dict[str, Dict[str, float]] = {}
 
-        # --- 仓位 ---
-        self.pos_cache: Dict[str, float] = {}
-        self.pos_cache_time: Dict[str, float] = {}
+        # 锁与并发控制
+        self.hedge_lock = asyncio.Lock()  # 全局对冲锁，确保对冲逻辑串行
+        self.symbol_locks: Dict[str, asyncio.Lock] = {}
 
-        # --- 并发 ---
-        self.locks: Dict[str, asyncio.Lock] = {}
-        self.last_quote_time: Dict[str, float] = {}
-
-        # --- 配置读取 ---
+        # --- 配置参数 ---
         conf = settings.strategies.farming
-
-        self.symbol_sides: Dict[str, str] = {}
-        self.initial_side = conf.side.upper()
-        self.target_margin = conf.max_slippage_tolerance
+        self.target_symbols = settings.common.target_symbols
+        self.spread_margin = abs(conf.max_slippage_tolerance)  # 目标利润率 (如 0.0005)
+        self.max_inventory_usd = conf.max_inventory_usd
         self.requote_threshold = conf.requote_threshold
-        self.REQUIRED_DEPTH_RATIO = 1.5
 
-        logger.info(f"🛡️ SmartFarm v13 启动 | Profit Taker: ON | Post-Only: Hybrid")
+        # Lighter 对冲滑点 (市价单保护)
+        self.hedge_slippage = 0.02  # 2% 确保成交
+
+        self.running = True
+        logger.info(f"🛡️ [Strategy] GRVT(Maker) -> Lighter(Taker) Farm Started. Margin: {self.spread_margin}")
+
+        # 启动后台守护进程
+        asyncio.create_task(self._watchdog_loop())
 
     def _get_lock(self, symbol: str):
-        if symbol not in self.locks:
-            self.locks[symbol] = asyncio.Lock()
-        return self.locks[symbol]
-
-    def _get_current_side(self, symbol: str) -> str:
-        return self.symbol_sides.get(symbol, 'BUY' if self.initial_side == 'BOTH' else self.initial_side)
-
-    def _flip_side(self, symbol: str):
-        current = self._get_current_side(symbol)
-        new_side = 'SELL' if current == 'BUY' else 'BUY'
-        self.symbol_sides[symbol] = new_side
-        logger.info(f"🔄 [Flip] {symbol}: {current} -> {new_side}")
+        if symbol not in self.symbol_locks:
+            self.symbol_locks[symbol] = asyncio.Lock()
+        return self.symbol_locks[symbol]
 
     async def on_tick(self, event: dict):
-        if time.time() - self.last_heartbeat > 60:
-            logger.info(f"💓 Heartbeat | Active: {len(self.active_orders)}")
-            self.last_heartbeat = time.time()
+        if not self.running: return
 
-        try:
-            event_type = event.get('type', 'tick')
-            if event_type == 'trade':
-                await self._process_trade_fill(event)
-            elif event_type == 'tick':
-                await self._process_tick(event)
-        except Exception as e:
-            logger.error(f"Tick Error: {e}", exc_info=True)
+        etype = event.get('type')
+        if etype == 'tick':
+            await self._process_tick(event)
+        elif etype == 'trade':
+            await self._process_trade(event)
+
+    async def _process_trade(self, trade: dict):
+        """
+        处理成交事件 (核心触发点)
+        """
+        symbol = trade['symbol']
+        exchange = trade['exchange']
+        size = float(trade['size'])
+        side = trade['side']  # BUY or SELL
+
+        # 我们只关心 GRVT 的成交，因为它是 Leader
+        if exchange == 'GRVT':
+            logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {trade.get('price')}")
+
+            # 1. 更新本地 GRVT 持仓
+            async with self.hedge_lock:
+                current = self.pos_grvt.get(symbol, 0.0)
+                change = size if side == 'BUY' else -size
+                self.pos_grvt[symbol] = current + change
+
+                # 2. 立即触发对冲检查 (Fire and Forget but Awaited internally)
+                # 注意：这里直接调用对冲逻辑，而不是仅仅更新状态
+                await self._execute_hedge_logic(symbol)
+
+        elif exchange == 'Lighter':
+            # Lighter 成交仅更新持仓，作为对冲结果的确认
+            async with self.hedge_lock:
+                current = self.pos_lighter.get(symbol, 0.0)
+                change = size if side == 'BUY' else -size
+                self.pos_lighter[symbol] = current + change
+                logger.info(f"✅ [HEDGE CONFIRMED] Lighter {side} {size}. Net Lighter Pos: {self.pos_lighter[symbol]}")
 
     async def _process_tick(self, tick: dict):
         symbol = tick['symbol']
         exchange = tick['exchange']
+
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
-        lock = self._get_lock(symbol)
-        if lock.locked() or symbol in self.pending_orders: return
+        # 只有在不需要紧急对冲的时候，才更新 Maker 挂单
+        # 如果正在对冲，挂单逻辑会被锁阻塞
+        if exchange == 'Lighter':
+            # Lighter 价格变动触发 GRVT 挂单更新
+            asyncio.create_task(self._update_maker_quotes(symbol))
 
-        if 'Lighter' in self.tickers[symbol] and 'GRVT' in self.tickers[symbol]:
-            now = time.time()
-            if now - self.last_quote_time.get(symbol, 0) < 0.5: return
-            self.last_quote_time[symbol] = now
-            asyncio.create_task(self._manage_maker_orders(symbol))
+    # ==================================================================
+    # 核心对冲逻辑 (Critical Path)
+    # ==================================================================
 
-    async def _manage_maker_orders(self, symbol: str):
-        if self._get_lock(symbol).locked() or symbol in self.pending_orders: return
+    async def _execute_hedge_logic(self, symbol: str):
+        """
+        计算 GRVT 和 Lighter 的持仓差额，并在 Lighter 上执行市价对冲。
+        目标: Lighter_Pos + GRVT_Pos = 0
+        """
+        retry_count = 0
+        max_retries = 5
 
-        grvt_tick = self.tickers[symbol]['GRVT']
-        lighter_tick = self.tickers[symbol]['Lighter']
-
-        if grvt_tick.get('bid', 0) <= 0 or grvt_tick.get('ask', 0) <= 0: return
-
-        maker_side = self._get_current_side(symbol)
-
-        result = self._calculate_price_and_type(symbol, grvt_tick, lighter_tick, maker_side)
-        if not result: return
-
-        target_price, is_post_only = result
-
-        current_order_id = self.active_orders.get(symbol)
-        current_price = self.active_order_prices.get(symbol)
-        # 获取交易数量
-        quantity = settings.get_trade_qty(symbol)
-
-        # 挂单逻辑
-        if not current_order_id:
-            self.pending_orders.add(symbol)
-            tag = "⚡️ [TAKER]" if not is_post_only else "🆕 [MAKER]"
-            logger.info(f"{tag} {symbol} {maker_side} {quantity} @ {target_price}")
-            self.order_create_time[symbol] = time.time()
-            asyncio.create_task(self._place_order_task(symbol, maker_side, quantity, target_price, is_post_only))
-
-        # 改单逻辑
-        else:
-            order_age = time.time() - self.order_create_time.get(symbol, 0)
-            price_diff_pct = abs(target_price - current_price) / current_price if current_price else 0
-
-            should_requote = False
-            if not is_post_only and price_diff_pct > 0.0001:
-                should_requote = True
-            elif price_diff_pct > self.requote_threshold and order_age > 1.0:
-                should_requote = True
-            elif order_age > 15.0:
-                should_requote = True
-
-            if should_requote:
-                self.pending_orders.add(symbol)
-                logger.info(
-                    f"♻️ [Requote] {symbol} New: {target_price} (Type: {'PostOnly' if is_post_only else 'Taker'})")
-                asyncio.create_task(self._cancel_order_task(symbol, current_order_id))
-
-    def _calculate_price_and_type(self, symbol: str, grvt_tick: dict, lighter_tick: dict, side: str) -> Optional[
-        Tuple[float, bool]]:
-
-        adapter = self.adapters['GRVT']
-        info = adapter.contract_map.get(f"{symbol}-USDT")
-        tick_size = float(info['tick_size']) if info else 0.01
-
-        qty = settings.get_trade_qty(symbol)
-        required_qty = qty * self.REQUIRED_DEPTH_RATIO
-
-        hedge_price = self._get_depth_weighted_price(lighter_tick, 'SELL' if side == 'BUY' else 'BUY', required_qty)
-        if not hedge_price: return None
-
-        market_ask = grvt_tick['ask']
-        market_bid = grvt_tick['bid']
-        is_post_only = True
-        TAKER_PROFIT_THRESHOLD = 0.0005
-
-        if side == 'BUY':
-            raw_target = hedge_price * (1 - self.target_margin)
-            real_arb_target = hedge_price * (1 - TAKER_PROFIT_THRESHOLD)
-            if real_arb_target >= market_ask:
-                target_price = raw_target
-                is_post_only = False
-            else:
-                limit_price = market_ask - tick_size
-                target_price = min(raw_target, limit_price)
-                is_post_only = True
-        else:
-            raw_target = hedge_price * (1 + self.target_margin)
-            real_arb_target = hedge_price * (1 + TAKER_PROFIT_THRESHOLD)
-            if real_arb_target <= market_bid:
-                target_price = raw_target
-                is_post_only = False
-            else:
-                limit_price = market_bid + tick_size
-                target_price = max(raw_target, limit_price)
-                is_post_only = True
-
-        return target_price, is_post_only
-
-    def _get_depth_weighted_price(self, ticker, side, required_qty):
-        depth = ticker.get('asks_depth' if side == 'BUY' else 'bids_depth')
-        if not depth: return ticker.get('ask' if side == 'BUY' else 'bid')
-
-        collected, cost = 0.0, 0.0
-        for p_str, s_str in depth:
-            p, s = float(p_str), float(s_str)
-            take = min(s, required_qty - collected)
-            cost += take * p
-            collected += take
-            if collected >= required_qty: break
-
-        if collected < required_qty * 0.5: return None
-        return cost / collected
-
-    async def _place_order_task(self, symbol, side, qty, price, post_only):
-        current_pos = await self._check_actual_position(symbol)
-
-        if abs(current_pos) > (qty * 0.1):
-            is_closing = False
-            if current_pos > 0 and side.upper() == 'SELL': is_closing = True
-            if current_pos < 0 and side.upper() == 'BUY': is_closing = True
-
-            if is_closing:
-                logger.info(f"✅ [Interceptor] 放行平仓单: {side} {qty} (持仓: {current_pos})")
-            else:
-                logger.warning(f"⚠️ [State Mismatch] 持仓 {current_pos} 与意图 {side} 冲突，触发自动反转！")
-                correct_side = 'BUY' if current_pos < 0 else 'SELL'
-                self.symbol_sides[symbol] = correct_side
-                self.pending_orders.discard(symbol)
-                return
-
-        try:
-            new_id = await self.adapters['GRVT'].create_order(
-                symbol=f"{symbol}-USDT",
-                side=side,
-                amount=qty,
-                price=price,
-                params={'post_only': post_only}
-            )
-
-            if new_id:
-                self.active_orders[symbol] = new_id
-                self.active_order_prices[symbol] = price
-                logger.info(f"✅ Placed: {symbol} {side} {qty} @ {price} (ID: {new_id})")
-            else:
-                logger.warning(f"⚠️ No ID returned for {symbol}")
-
-        except Exception as e:
-            logger.error(f"❌ Order failed: {e}")
-        finally:
-            self.pending_orders.discard(symbol)
-
-    async def _check_actual_position(self, symbol: str) -> float:
-        now = time.time()
-        if symbol in self.pos_cache and (now - self.pos_cache_time.get(symbol, 0) < 2.0):
-            return self.pos_cache[symbol]
-
-        try:
-            adapter = self.adapters.get('GRVT')
-            if not adapter: return 0.0
-
-            loop = asyncio.get_running_loop()
-            positions = await loop.run_in_executor(
-                None,
-                lambda: adapter.rest_client.fetch_positions(
-                    params={'sub_account_id': adapter.trading_account_id}
-                )
-            )
-            found_size = 0.0
-            for p in positions:
-                inst_id = p.get('instrument') or p.get('symbol') or ""
-                if symbol in inst_id:
-                    size = float(p.get('size', 0) or p.get('contracts', 0))
-                    if size > 0 and p.get('side', '').upper() == 'SHORT':
-                        size = -size
-                    found_size = size
-                    break
-
-            self.pos_cache[symbol] = found_size
-            self.pos_cache_time[symbol] = now
-            return found_size
-
-        except Exception as e:
-            logger.error(f"Position check failed: {e}")
-            return self.pos_cache.get(symbol, 0.0)
-
-    async def _cancel_order_task(self, symbol, order_id):
-        cancel_success = False
-        try:
-            await self.adapters['GRVT'].cancel_order(order_id, symbol=symbol)
-            cancel_success = True
-            logger.info(f"🗑️ 撤单请求已发送: {symbol} (ID: {order_id})")
-
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "not found" in err_msg or "filled" in err_msg or "cancelled" in err_msg:
-                cancel_success = True
-                logger.warning(f"⚠️ 订单已失效，清理内存: {e}")
-            else:
-                logger.error(f"❌ 撤单失败 (保留内存状态): {e}")
-
-        if cancel_success:
-            if symbol in self.active_orders and self.active_orders[symbol] == order_id:
-                del self.active_orders[symbol]
-                if symbol in self.active_order_prices:
-                    del self.active_order_prices[symbol]
-
-        self.pending_orders.discard(symbol)
-
-    async def _process_trade_fill(self, trade: dict):
-        if trade['exchange'] != 'GRVT': return
-        symbol = trade['symbol']
-
-        lock = self._get_lock(symbol)
-        async with lock:
-            logger.info(f"🚨 [FILLED] GRVT {trade['side']} {trade['size']} -> HEDGING!")
-
-            if symbol in self.active_orders: del self.active_orders[symbol]
-            self.pending_orders.discard(symbol)
-
-            await self._execute_hedge_loop(symbol, trade['side'], float(trade['size']))
-
-    async def _execute_hedge_loop(self, symbol, grvt_side, size):
-        hedge_side = 'SELL' if grvt_side.upper() == 'BUY' else 'BUY'
-        retry = 0
-        while retry < 10:
+        while retry_count < max_retries:
             try:
+                # 在锁内计算，防止并发计算导致重复下单
+                needed_action = None  # (side, size)
+
+                grvt_p = self.pos_grvt.get(symbol, 0.0)
+                lighter_p = self.pos_lighter.get(symbol, 0.0)
+
+                # 目标 Lighter 持仓应为 -GRVT 持仓
+                target_lighter = -grvt_p
+                diff = target_lighter - lighter_p
+
+                # 忽略微小误差 (dust)
+                if abs(diff) < 0.0001:
+                    if retry_count > 0:
+                        logger.info(f"✅ [HEDGE DONE] {symbol} Balanced. G:{grvt_p} L:{lighter_p}")
+                    return  # 平衡，退出
+
+                # 确定对冲方向
+                hedge_side = 'BUY' if diff > 0 else 'SELL'
+                hedge_size = abs(diff)
+
+                logger.warning(
+                    f"🚨 [HEDGE REQUIRED] {symbol} | GRVT:{grvt_p} Lighter:{lighter_p} | Need Lighter {hedge_side} {hedge_size}")
+
+                # --- 执行对冲 (Lighter Taker) ---
+                # 获取 Lighter 盘口计算滑点保护价格
                 lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
                 if not lighter_tick:
-                    await asyncio.sleep(0.1);
+                    logger.error(f"❌ [Hedge] No Lighter tick data for {symbol}")
+                    await asyncio.sleep(0.5)
+                    retry_count += 1
                     continue
 
                 base_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
                 if base_price <= 0:
-                    retry += 1;
-                    await asyncio.sleep(0.2);
+                    # 可能是盘口空了，使用上次成交价或报错
+                    logger.error("❌ [Hedge] Lighter price is 0/Invalid")
+                    await asyncio.sleep(0.5)
+                    retry_count += 1
                     continue
 
-                exec_price = base_price * 1.05 if hedge_side == 'BUY' else base_price * 0.95
-                logger.info(f"🌊 [Hedge] {hedge_side} {size} @ {exec_price:.2f} (Try {retry + 1})")
+                # 激进市价单 (通过 Limit IOC 模拟或直接 Market)
+                # Lighter SDK 支持 create_market_order
+                # 这里我们使用 create_order (Adapter层适配)
+                # 为了保证成交，价格给予较大滑点
+                exec_price = base_price * (1 + self.hedge_slippage) if hedge_side == 'BUY' else base_price * (
+                            1 - self.hedge_slippage)
 
-                order_id = await self.adapters['Lighter'].create_order(
-                    symbol=symbol, side=hedge_side, amount=size, price=exec_price, order_type="MARKET"
+                logger.info(f"🌊 [FIRING HEDGE] Lighter {hedge_side} {hedge_size} @ ~{exec_price:.2f}")
+
+                order_id = await self.lighter.create_order(
+                    symbol=symbol,
+                    side=hedge_side,
+                    amount=hedge_size,
+                    price=exec_price,
+                    order_type="MARKET"  # 强制市价
                 )
 
                 if order_id:
-                    logger.info(f"✅ Hedge Success ID: {order_id}")
-                    self._flip_side(symbol)
-                    return
-            except Exception as e:
-                logger.error(f"❌ Hedge Retry {retry} Failed: {e}")
+                    # 假定成交，更新本地 Lighter 状态 (WS 会随后确认，这里先预更新防止重复下单)
+                    change = hedge_size if hedge_side == 'BUY' else -hedge_size
+                    self.pos_lighter[symbol] += change
+                    logger.info(f"✅ [HEDGE SENT] ID: {order_id}. Local State Updated.")
+                    # 重新循环检查是否完全平衡
+                    await asyncio.sleep(0.2)
+                    continue
+                else:
+                    logger.error("❌ [Hedge] Order Failed (No ID returned)")
 
-            retry += 1
+            except Exception as e:
+                logger.error(f"❌ [Hedge Error] {e}", exc_info=True)
+
+            retry_count += 1
             await asyncio.sleep(0.5)
 
-        logger.critical(f"💀💀💀 CRITICAL: {symbol} Hedge FAILED. Manual Intervention Required!")
+        logger.critical(f"💀 [HEDGE FAILED] {symbol} failed to balance after {max_retries} retries! Stopping Maker.")
+        # 紧急情况：清空 Maker 单以防风险扩大
+        asyncio.create_task(self._cancel_all_maker(symbol))
+
+    # ==================================================================
+    # Maker 挂单逻辑 (GRVT)
+    # ==================================================================
+
+    async def _update_maker_quotes(self, symbol: str):
+        """
+        根据 Lighter 盘口 + GRVT 持仓状态，更新 GRVT 挂单
+        """
+        lock = self._get_lock(symbol)
+        if lock.locked(): return  # 如果正在处理，跳过
+
+        async with lock:
+            # 1. 安全检查
+            lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
+            if not lighter_tick or lighter_tick.get('bid') == 0: return
+
+            # 2. 检查是否处于失衡状态 (Unbalanced)
+            # 如果 GRVT 和 Lighter 不匹配，优先等待对冲完成，禁止挂新单
+            g_pos = self.pos_grvt.get(symbol, 0.0)
+            l_pos = self.pos_lighter.get(symbol, 0.0)
+            if abs(g_pos + l_pos) > 0.0001:
+                # 只有当正在尝试平仓且方向正确时才允许
+                # 但为了安全，失衡时通常停止 Quote
+                await self._cancel_all_maker(symbol)
+                return
+
+            # 3. 计算目标挂单
+            qty = settings.get_trade_qty(symbol)
+            orders_to_place = []  # list of (side, price)
+
+            # --- CASE A: 无持仓 (OPEN 模式) ---
+            if abs(g_pos) < (qty * 0.1):
+                # 双边挂单，赚取 Spread + Rebate
+                # Lighter 买一价 -> GRVT 买单 (价格 = Lighter_Bid * (1 - margin))
+                # Lighter 卖一价 -> GRVT 卖单 (价格 = Lighter_Ask * (1 + margin))
+
+                # 使用深度加权价格更安全
+                bid_ref = self._get_weighted_price(lighter_tick, 'SELL', qty)  # Lighter 卖单深度对应我们要买的成本
+                ask_ref = self._get_weighted_price(lighter_tick, 'BUY', qty)  # Lighter 买单深度对应我们要卖的收入
+
+                if bid_ref and ask_ref:
+                    my_bid = bid_ref * (1 - self.spread_margin)
+                    my_ask = ask_ref * (1 + self.spread_margin)
+
+                    orders_to_place.append(('BUY', my_bid))
+                    orders_to_place.append(('SELL', my_ask))
+
+            # --- CASE B: 有持仓 (CLOSE 模式) ---
+            else:
+                # 必须挂平仓单
+                # 如果 GRVT 多头 (g_pos > 0)，我们需要 SELL Close
+                # 价格参考 Lighter 的 BUY 盘口 (因为平仓后我们要去 Lighter 卖出平掉空头? 不，平仓后 Lighter 买入平空)
+
+                # 逻辑梳理:
+                # 持有: GRVT Long, Lighter Short
+                # 平仓动作: GRVT Sell, Lighter Buy
+                # 成本: Lighter Ask (买入价)
+                # 收入: GRVT Bid (卖出价) -> 我们的 GRVT Sell Limit Price
+
+                if g_pos > 0:  # Long GRVT
+                    # 挂 SELL 单平仓
+                    # 参考 Lighter 的 Ask (我们要去 Lighter 买回来平空)
+                    ref_price = self._get_weighted_price(lighter_tick, 'SELL', abs(g_pos))  # Lighter Ask Depth
+                    if ref_price:
+                        # 我们希望: GRVT_Sell_Price > Lighter_Buy_Cost
+                        # 考虑到要尽快平仓，可以利润微薄甚至微亏(赚手续费)
+                        target_price = ref_price * (1 + self.spread_margin)
+                        orders_to_place.append(('SELL', target_price))
+
+                elif g_pos < 0:  # Short GRVT
+                    # 挂 BUY 单平仓
+                    # 参考 Lighter 的 Bid (我们要去 Lighter 卖出平多)
+                    ref_price = self._get_weighted_price(lighter_tick, 'BUY', abs(g_pos))  # Lighter Bid Depth
+                    if ref_price:
+                        target_price = ref_price * (1 - self.spread_margin)
+                        orders_to_place.append(('BUY', target_price))
+
+            # 4. 执行挂单/改单
+            await self._reconcile_orders(symbol, orders_to_place, qty)
+
+    async def _reconcile_orders(self, symbol: str, desired_orders: List[Tuple[str, float]], qty: float):
+        """
+        对比当前挂单和期望挂单，执行撤单和下单
+        """
+        current_orders = self.active_maker_orders.get(symbol, {})
+        current_prices = self.maker_order_prices.get(symbol, {})
+
+        # 期望的 orders 字典: side -> price
+        desired_map = {side: price for side, price in desired_orders}
+
+        # 1. 撤销不再需要的单子
+        sides_to_cancel = []
+        for side, oid in current_orders.items():
+            if side not in desired_map:
+                sides_to_cancel.append(side)
+                continue
+
+            # 检查价格是否需要更新 (Requote)
+            curr_p = current_prices.get(side, 0)
+            new_p = desired_map[side]
+            if abs(curr_p - new_p) / curr_p > self.requote_threshold:
+                sides_to_cancel.append(side)
+            else:
+                # 价格合适，保留，从 desired 中移除避免重复下单
+                del desired_map[side]
+
+        for side in sides_to_cancel:
+            oid = current_orders[side]
+            await self.grvt.cancel_order(oid, symbol=symbol)
+            del self.active_maker_orders[symbol][side]
+            del self.maker_order_prices[symbol][side]
+
+        # 2. 下新单
+        for side, price in desired_map.items():
+            # GRVT 必须使用 Post-Only
+            try:
+                # 确定数量：如果是 Close 模式，数量为持仓量；如果是 Open，数量为 qty
+                # 简化逻辑：_update_maker_quotes 决定逻辑，这里下单
+                order_qty = qty
+                if side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0:
+                    order_qty = abs(self.pos_grvt[symbol])  # Close Long
+                elif side == 'BUY' and self.pos_grvt.get(symbol, 0) < 0:
+                    order_qty = abs(self.pos_grvt[symbol])  # Close Short
+
+                # 精度修正
+                info = self.grvt.contract_map.get(f"{symbol}-USDT")
+                if info:
+                    tick_size = float(info['tick_size'])
+                    price = round(price / tick_size) * tick_size
+
+                oid = await self.grvt.create_order(
+                    symbol=f"{symbol}-USDT",
+                    side=side,
+                    amount=order_qty,
+                    price=price,
+                    order_type="LIMIT",
+                    post_only=True
+                )
+
+                if oid:
+                    if symbol not in self.active_maker_orders:
+                        self.active_maker_orders[symbol] = {}
+                        self.maker_order_prices[symbol] = {}
+                    self.active_maker_orders[symbol][side] = oid
+                    self.maker_order_prices[symbol][side] = price
+                    logger.info(f"🆕 [QUOTE] {symbol} {side} {order_qty} @ {price}")
+
+            except Exception as e:
+                logger.warning(f"⚠️ Quote Failed: {e}")
+
+    async def _cancel_all_maker(self, symbol):
+        if symbol in self.active_maker_orders:
+            for side, oid in list(self.active_maker_orders[symbol].items()):
+                await self.grvt.cancel_order(oid, symbol=symbol)
+            self.active_maker_orders[symbol] = {}
+            self.maker_order_prices[symbol] = {}
+
+    def _get_weighted_price(self, ticker, side, qty):
+        # 简单深度加权，防止假单
+        depth_key = 'asks_depth' if side == 'SELL' else 'bids_depth'
+        depth = ticker.get(depth_key, [])
+        if not depth: return ticker.get('ask' if side == 'SELL' else 'bid')
+
+        cum_vol = 0.0
+        cum_cost = 0.0
+        for p, v in depth:
+            p, v = float(p), float(v)
+            take = min(v, qty - cum_vol)
+            cum_cost += take * p
+            cum_vol += take
+            if cum_vol >= qty: break
+
+        if cum_vol == 0: return None
+        return cum_cost / cum_vol
+
+    # ==================================================================
+    # 后台守护 (Watchdog) - 防止 WS 丢包导致的永久缺腿
+    # ==================================================================
+
+    async def _watchdog_loop(self):
+        logger.info("🐶 Watchdog started...")
+        while self.running:
+            try:
+                await asyncio.sleep(5.0)  # 每 5 秒全量校验一次
+
+                # 1. 同步 GRVT 真实持仓
+                grvt_positions = await self.grvt.fetch_positions(symbols=self.target_symbols)
+                # 2. 同步 Lighter 真实持仓 (Lighter Adapter 需支持 fetch_positions，如不支持需依赖本地累加或实现 REST)
+                # 假设 Lighter Adapter 暂时返回本地缓存或通过 REST 获取
+                # 这里为了稳健，如果 Lighter API 没实现，我们只能信赖本地，但建议实现 REST Sync
+                lighter_positions = await self._fetch_lighter_positions_safe()
+
+                for symbol in self.target_symbols:
+                    # 提取 GRVT Pos
+                    g_pos = 0.0
+                    for p in grvt_positions:
+                        p_sym = p.get('instrument') or p.get('symbol')
+                        if symbol in p_sym:
+                            sz = float(p.get('size') or p.get('contracts', 0))
+                            sd = p.get('side', '').upper()
+                            if sd == 'SHORT': sz = -sz
+                            g_pos = sz
+                            break
+
+                    # 提取 Lighter Pos
+                    l_pos = lighter_positions.get(symbol, self.pos_lighter.get(symbol, 0.0))
+
+                    # 更新本地缓存
+                    async with self.hedge_lock:
+                        self.pos_grvt[symbol] = g_pos
+                        self.pos_lighter[symbol] = l_pos
+
+                        # 3. 校验平衡
+                        diff = g_pos + l_pos
+                        if abs(diff) > 0.0001:
+                            logger.warning(f"🐶 [Watchdog] Unbalanced {symbol}: G={g_pos} L={l_pos} Diff={diff}")
+                            # 触发对冲逻辑
+                            await self._execute_hedge_logic(symbol)
+
+            except Exception as e:
+                logger.error(f"🐶 Watchdog Error: {e}")
+                await asyncio.sleep(5)
+
+    async def _fetch_lighter_positions_safe(self) -> Dict[str, float]:
+        # 尝试调用 Lighter 的 REST 接口，如果失败返回空字典
+        # 实际生产中应在 LighterAdapter 中实现 fetch_positions
+        res = {}
+        if hasattr(self.lighter, 'fetch_positions'):
+            try:
+                # 假设返回标准 list dict
+                positions = await self.lighter.fetch_positions(symbols=self.target_symbols)
+                if positions:
+                    for p in positions:
+                        res[p['symbol']] = float(p['size']) if p['side'] == 'BUY' else -float(p['size'])
+            except:
+                pass
+        return res
