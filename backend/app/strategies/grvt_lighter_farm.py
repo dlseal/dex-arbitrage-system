@@ -11,16 +11,16 @@ logger = logging.getLogger("GRVT_Lighter_Farm")
 
 class GrvtLighterFarmStrategy:
     """
-    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V9)
+    GRVT (Maker) + Lighter (Taker) 生产级刷量对冲策略 (Pro V10)
 
-    核心升级 V9:
-    1. Clean State Reset: 一旦发生成交(Fill)，立即撤销所有剩余挂单，防止旧单残留。
-    2. Event-Driven Retry: 保持对 REJECTED/CANCELED 的即时响应。
-    3. Dynamic Chasing: 保持盘口跟随。
+    核心升级 V10:
+    1. Hyper-Active Closing: 平仓单采用极速追单模式 (阈值≈0, 寿命0.2s)，解决平仓单价格僵死问题。
+    2. Clean State Reset: 成交即重置挂单。
+    3. Event-Driven Retry: 拒绝即重试。
     """
 
     def __init__(self, adapters: Dict[str, Any]):
-        self.name = "GrvtLighter_Farm_v9_CleanReset"
+        self.name = "GrvtLighter_Farm_v10_HyperClose"
         self.adapters = adapters
 
         self.grvt = adapters.get('GRVT')
@@ -52,9 +52,11 @@ class GrvtLighterFarmStrategy:
 
         self.farm_side = str(getattr(conf, 'side', 'BOTH')).upper()
         self.slippage_tolerance = float(conf.max_slippage_tolerance)
+        # 开仓单的改单阈值
         self.requote_threshold = float(getattr(conf, 'requote_threshold', 0.0001))
         self.required_depth_ratio = float(getattr(conf, 'required_depth_ratio', 3.0))
 
+        # 开仓单的最小存活时间
         self.min_order_lifetime = 1.0
         self.urgent_threshold = 0.005
 
@@ -62,7 +64,7 @@ class GrvtLighterFarmStrategy:
         self.momentum_threshold = 0.001
 
         self.running = True
-        logger.info(f"🛡️ [Strategy] V9 Started. Clean Reset on Fill.")
+        logger.info(f"🛡️ [Strategy] V10 Started. Hyper-Close Active.")
 
         asyncio.create_task(self._watchdog_loop())
 
@@ -95,7 +97,6 @@ class GrvtLighterFarmStrategy:
 
             self._remove_order_from_memory(symbol, order_id)
 
-            # 如果是被拒或撤销，立即尝试补单
             if status in ['REJECTED', 'CANCELED']:
                 await asyncio.sleep(0.05)
                 asyncio.create_task(self._update_maker_quotes(symbol))
@@ -125,9 +126,7 @@ class GrvtLighterFarmStrategy:
             logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {trade.get('price')}")
             self.last_grvt_fill_ts[symbol] = time.time()
 
-            # [关键升级 V9] 一旦 GRVT 发生已成交，立即撤销剩余的所有挂单
-            # 防止单边成交后，另一边旧单此时变成"接盘侠"
-            # 我们希望一切从头开始
+            # 成交即重置，防止旧单残留
             asyncio.create_task(self._cancel_all_maker(symbol))
 
             async with self.hedge_lock:
@@ -142,7 +141,7 @@ class GrvtLighterFarmStrategy:
                 change = size if side == 'BUY' else -size
                 self.pos_lighter[symbol] = current + change
                 logger.info(f"✅ [HEDGE CONFIRMED] Lighter {side} {size}. Net: {self.pos_lighter[symbol]}")
-                # Lighter 对冲完成后，也可以触发一次 Quote 更新，确保状态回归
+                # 对冲后立即刷新挂单
                 asyncio.create_task(self._update_maker_quotes(symbol))
 
     async def _process_tick(self, tick: dict):
@@ -277,7 +276,7 @@ class GrvtLighterFarmStrategy:
                         orders_to_place.append(('SELL', limit_price))
 
             else:
-                # 平仓模式
+                # 平仓模式 (CLOSE)
                 close_tolerance = min(self.slippage_tolerance, -0.0005)
                 if g_pos > 0:
                     ref = self._get_weighted_price(lighter_tick, 'SELL', abs(g_pos))
@@ -309,31 +308,49 @@ class GrvtLighterFarmStrategy:
         desired_map = {side: price for side, price in desired_orders}
         now = time.time()
 
-        # --- 1. 撤单逻辑 ---
+        # --- 1. 撤单逻辑 (区分 Open/Close 灵敏度) ---
         sides_to_cancel = []
         for side, oid in current_orders.items():
             info = current_info.get(side, {})
             curr_p = info.get('price', 0)
             ts = info.get('ts', 0)
 
-            # A: 不需要了 (例如: 之前有双边单，现在只要单边，或者价格太旧)
+            # 识别当前是否为平仓单
+            is_closing_order = False
+            if side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0: is_closing_order = True
+            if side == 'BUY' and self.pos_grvt.get(symbol, 0) < 0: is_closing_order = True
+
+            # A: 不需要了
             if side not in desired_map:
                 sides_to_cancel.append(side)
                 continue
 
-            # B: 价格调整
+            # B: 价格调整检测
             new_p = desired_map[side]
             diff_pct = abs(curr_p - new_p) / curr_p if curr_p else 0
 
             life_span = now - ts
             is_urgent = diff_pct > self.urgent_threshold
-            should_requote = diff_pct > self.requote_threshold
 
-            if is_urgent or (should_requote and life_span >= self.min_order_lifetime):
+            # --- 双速模式配置 ---
+            if is_closing_order:
+                # [平仓单]: 极度敏感，0.2秒后，只要价格有微小变动(>1e-5)就改单
+                active_threshold = 0.00001
+                active_lifetime = 0.2
+            else:
+                # [开仓单]: 正常配置
+                active_threshold = self.requote_threshold
+                active_lifetime = self.min_order_lifetime
+
+            should_requote = diff_pct > active_threshold
+
+            if is_urgent or (should_requote and life_span >= active_lifetime):
                 sides_to_cancel.append(side)
             elif should_requote and not is_urgent:
+                # 价格变了但未到时间 -> 暂时保持原单
                 del desired_map[side]
             else:
+                # 价格没变 -> 保持原单
                 del desired_map[side]
 
         for side in sides_to_cancel:
@@ -370,7 +387,10 @@ class GrvtLighterFarmStrategy:
                         self.maker_order_info[symbol] = {}
                     self.active_maker_orders[symbol][side] = oid
                     self.maker_order_info[symbol][side] = {'price': price, 'ts': time.time()}
-                    logger.info(f"🆕 [QUOTE] {symbol} {side} {order_qty} @ {price:.2f}")
+
+                    log_tag = "CLOSE" if (side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0) or (
+                                side == 'BUY' and self.pos_grvt.get(symbol, 0) < 0) else "OPEN"
+                    logger.info(f"🆕 [QUOTE-{log_tag}] {symbol} {side} {order_qty} @ {price:.2f}")
             except Exception as e:
                 logger.warning(f"⚠️ Quote Failed: {e}")
 
