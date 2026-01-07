@@ -400,11 +400,17 @@ class HFTMarketMakingStrategy:
         return max(0.1, bid_v), max(0.1, ask_v)
 
     def _calculate_ofi(self, bid_p, bid_v, ask_p, ask_v) -> float:
+        """
+        修改版 OFI 计算逻辑 (针对刷量优化 - Normalized OFI)
+        原版返回的是净成交量的绝对值，容易造成价格跳动过大。
+        修改版返回的是 "OFI率" (区间约 -1 到 1)，让信号更平滑。
+        """
         if not self.prev_tick:
             self.prev_tick = {'bid': bid_p, 'ask': ask_p, 'bv': bid_v, 'av': ask_v}
             return 0.0
 
         e_bid = 0.0
+        # 这里的逻辑保持不变：计算买单流的变化
         if bid_p > self.prev_tick['bid']:
             e_bid = bid_v
         elif bid_p < self.prev_tick['bid']:
@@ -421,7 +427,24 @@ class HFTMarketMakingStrategy:
             e_ask = -(ask_v - self.prev_tick['av'])
 
         self.prev_tick = {'bid': bid_p, 'ask': ask_p, 'bv': bid_v, 'av': ask_v}
-        return e_bid + e_ask
+
+        # --- 关键修改开始 ---
+        raw_ofi = e_bid + e_ask
+
+        # 计算当前盘口的总深度 (买单量 + 卖单量)
+        current_depth = bid_v + ask_v
+
+        # 归一化处理 (Normalization)
+        # 为什么要改：防止大户挂单导致你的机器人价格瞬间飞走。
+        # 效果：无论盘口是 0.1 BTC 还是 100 BTC，OFI 输出都在 -1 到 1 之间。
+        if current_depth > 0:
+            normalized_ofi = raw_ofi / current_depth
+        else:
+            normalized_ofi = 0.0
+
+        # 额外加一道锁：为了刷量，我们不希望预测信号太强
+        # 强制截断在 -1 和 1 之间，防止极端数据干扰
+        return max(min(normalized_ofi, 1.0), -1.0)
 
     async def _dispatch_orders(self, target_bid, target_ask, allow_buy, allow_sell):
         tasks = []
