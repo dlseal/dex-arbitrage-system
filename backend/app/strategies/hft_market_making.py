@@ -304,66 +304,106 @@ class HFTMarketMakingStrategy:
 
     async def _execute_strict_bailout(self, inventory: float):
         """
-        [PROD] 严格的平仓流程
-        1. Cancel All (原子级)
-        2. Sync Position (确认真实持仓)
-        3. Market Close (一次性)
+        [PROD] 优化后的严格平仓 (Smart Bailout)
+        优化点:
+        1. 使用激进的 Limit 单代替 Market 单，控制滑点风险。
+        2. 动态获取盘口价格，确保以当前市场最优结构退出。
+        3. 循环重试直到仓位归零。
         """
         adapter = self.adapters[self.exchange_name]
-        side = 'SELL' if inventory > 0 else 'BUY'
 
-        logger.warning("🛑 [BAILOUT] Phase 1: Cancelling all orders...")
+        logger.warning(f"🛑 [BAILOUT] TRIGGERED | Inv: {inventory:.4f} | Phase 1: Cancel All")
 
-        # 1. 撤单
+        # 1. 撤销所有挂单，防止加重仓位
         try:
-            # 优先调用适配器实现的原子撤单
             if hasattr(adapter, 'cancel_all_orders'):
                 await adapter.cancel_all_orders(symbol=self.symbol)
             else:
-                # 降级方案
                 if self.active_orders['BUY']: await self._cancel_order_side('BUY')
                 if self.active_orders['SELL']: await self._cancel_order_side('SELL')
         except Exception as e:
             logger.error(f"❌ Bailout Cancel Failed: {e}")
 
-        await asyncio.sleep(0.5)  # 等待交易所撮合落地
+        await asyncio.sleep(0.5)  # 等待交易所撤单落地
 
-        # 2. 确认持仓 (从 API 获取最新，而非依赖本地)
-        logger.warning("🛑 [BAILOUT] Phase 2: Verifying position...")
-        real_size = await self._sync_position(force=True)
-        if real_size is None:
-            real_size = inventory  # 如果同步失败，回退到本地记录
+        # 2. 循环检测与平仓
+        # 设定最大尝试次数，防止死循环
+        max_retries = 10
 
-        if abs(real_size) < (self.quantity * 0.1):
-            logger.info("✅ [BAILOUT] Position already closed.")
-            self.is_bailout_active = False
-            return
+        for i in range(max_retries):
+            # A. 强制同步最新持仓 (从交易所API获取)
+            real_size = await self._sync_position(force=True)
+            if real_size is None:
+                real_size = inventory  # 如果同步失败，暂时信任本地数据
 
-        # 3. 市价平仓
-        close_side = 'SELL' if real_size > 0 else 'BUY'
-        close_qty = abs(real_size)
-        logger.warning(f"🛑 [BAILOUT] Phase 3: Market Close {close_side} {close_qty}...")
+            # B. 检查是否已安全 (仓位小于最小交易单位)
+            if abs(real_size) < (self.quantity * 0.1):
+                logger.info("✅ [BAILOUT] Position successfully closed.")
+                self.is_bailout_active = False
+                return
 
-        try:
-            for i in range(5):
-                try:
-                    await adapter.create_order(
-                        symbol=self.symbol,
-                        side=close_side,
-                        amount=close_qty,
-                        order_type='MARKET'
-                    )
-                    logger.info("✅ [BAILOUT] Close Order Sent.")
-                    break
-                except Exception as ex:
-                    logger.error(f"Retry {i + 1} Failed: {ex}")
+            # C. 获取最新盘口价格 (用于计算 Limit 价格)
+            try:
+                ticker = await adapter.fetch_ticker(self.symbol)
+                if not ticker or not ticker.get('bid') or not ticker.get('ask'):
+                    logger.warning("⚠️ [BAILOUT] Ticker data missing, retrying...")
                     await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.critical(f"❌❌❌ BAILOUT FAILED: {e}")
-        finally:
+                    continue
+
+                bid_p = float(ticker['bid'])
+                ask_p = float(ticker['ask'])
+            except Exception as e:
+                logger.error(f"❌ [BAILOUT] Fetch Ticker Error: {e}")
+                await asyncio.sleep(1.0)
+                continue
+
+            # D. 计算平仓参数
+            close_side = 'SELL' if real_size > 0 else 'BUY'
+            close_qty = abs(real_size)
+
+            # [关键策略] 激进限价单 (Aggressive Limit)
+            # 逻辑：为了在 Taker 费率下止损，我们需要确保成交，但不能像 Market 单那样无限滑点。
+            # 设定：在对手价基础上给予 0.5% ~ 1% 的滑点空间。
+            # 这会作为 Taker 立即成交，但保护了极端情况下的本金。
+            slippage_pct = 0.005  # 0.5% 滑点保护
+
+            if close_side == 'SELL':
+                # 卖出平多：挂单价 = 买一价 * (1 - 滑点)
+                # 意图：哪怕价格瞬间下跌 0.5%，我也愿意卖，但不能更低了
+                price = bid_p * (1 - slippage_pct)
+                if self.quantizer:
+                    price = self.quantizer.quantize(price, 'FLOOR')
+            else:
+                # 买入平空：挂单价 = 卖一价 * (1 + 滑点)
+                price = ask_p * (1 + slippage_pct)
+                if self.quantizer:
+                    price = self.quantizer.quantize(price, 'CEILING')
+
+            logger.warning(f"🛑 [BAILOUT] Phase 2 (Try {i + 1}): {close_side} {close_qty} @ {price}")
+
+            # E. 发送订单
+            try:
+                # 注意：这里千万不要加 post_only=True，因为Bailout必须成交
+                await adapter.create_order(
+                    symbol=self.symbol,
+                    side=close_side,
+                    amount=close_qty,
+                    price=price,
+                    order_type='LIMIT'  # 使用 LIMIT 此时比 MARKET 更安全
+                )
+                logger.info("✅ [BAILOUT] Close Order Sent.")
+            except Exception as ex:
+                logger.error(f"Retry {i + 1} Failed: {ex}")
+
+            # F. 等待成交 (给予撮合时间)
             await asyncio.sleep(2.0)
-            await self._sync_position(force=True)
-            self.is_bailout_active = False  # 恢复正常
+
+        # 3. 最终检查
+        final_size = await self._sync_position(force=True)
+        if final_size and abs(final_size) > (self.quantity * 0.1):
+            logger.critical(f"❌❌❌ BAILOUT FAILED: Still holding {final_size}. Manual Intervention Required!")
+        else:
+            self.is_bailout_active = False
 
     async def _sync_position(self, force=False):
         """
