@@ -193,17 +193,20 @@ class HFTMarketMakingStrategy:
 
                 # --- 模型更新 ---
                 self.mid_price_stats.update(mid_price)
+
+                # 使用修改后的 Normalized OFI
                 ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
                 avg_ofi = self.ofi_ema.update(ofi)
 
                 volatility = self.mid_price_stats.get_std_dev()
+                # [Optimization] 如果波动率过小，给一个极小的底数，防止除零或过窄
                 if volatility <= 0: volatility = mid_price * 0.00005
 
                 # --- 风控检查 ---
                 current_inv = self.inventory
                 pos_value = current_inv * mid_price
 
-                # [Strict] 熔断检查: 超过硬限制 -> 触发 Bailout
+                # [Strict] 熔断检查
                 if abs(pos_value) > self.hard_limit_usd:
                     logger.critical(
                         f"🚨 [RISK] Pos ${pos_value:.1f} > HardLimit ${self.hard_limit_usd}. TRIGGER BAILOUT.")
@@ -211,40 +214,62 @@ class HFTMarketMakingStrategy:
                     asyncio.create_task(self._execute_strict_bailout(current_inv))
                     return
 
-                # --- 报价计算 ---
-                raw_inv_risk = current_inv * self.risk_aversion * (volatility ** 2)
-                # 限制偏斜度
-                inv_risk = max(-self.max_skew_usd, min(self.max_skew_usd, raw_inv_risk))
+                # --- 报价计算 (核心修改部分) ---
 
+                # 1. [Fix] 风险偏斜 (Skew) 改为线性波动率
+                # 原代码使用 (volatility ** 2)，在 BTC 9wU 且 Vol=20 时会导致计算值爆炸(400倍)。
+                # 改为线性，并限制最大偏斜量。
+                # 逻辑：Inventory * RiskAversion * Volatility
+                raw_inv_risk = current_inv * self.risk_aversion * volatility
+
+                # 再次限制 Skew 的绝对值，防止单边报价飞出盘口
+                max_skew_cap = 10.0 * self.tick_size  # 限制最大偏斜为 10 个 tick
+                inv_risk = max(-max_skew_cap, min(max_skew_cap, raw_inv_risk))
+
+                # 2. OFI 冲击 (保持原样，或轻微调整)
                 ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
+
+                # 计算中心保留价
                 reservation_price = mid_price + ofi_impact - inv_risk
 
+                # 3. [Fix] 价差 (Spread) 阻尼处理
+                # 为了刷量，我们不希望 Spread 随波动率线性扩大，而是要压制它。
+                # 使用 log1p 让波动率很大时，Spread 增加得慢一点。
+                damped_vol = math.log1p(volatility)
+
                 half_spread = ((self.min_spread_ticks * 0.5) * self.tick_size) + \
-                              (self.volatility_factor * volatility)
+                              (self.volatility_factor * damped_vol)
+
+                # [Strict Cap] 强制限制半边价差不超过 5-10 ticks (为了刷量)
+                max_half_spread = 5.0 * self.tick_size
+                half_spread = min(half_spread, max_half_spread)
 
                 raw_bid = reservation_price - half_spread
                 raw_ask = reservation_price + half_spread
 
-                # 价格保护带
+                # 价格保护带 (防止报价太离谱)
                 max_dist = mid_price * self.max_dist_pct
                 min_safe_bid = mid_price - max_dist
                 max_safe_ask = mid_price + max_dist
 
+                # 最终裁定
                 final_bid = max(min(raw_bid, ask_p - self.tick_size), min_safe_bid)
                 final_ask = min(max(raw_ask, bid_p + self.tick_size), max_safe_ask)
 
                 target_bid = self.quantizer.quantize(final_bid, 'FLOOR')
                 target_ask = self.quantizer.quantize(final_ask, 'CEILING')
 
-                # 最小价差保护
-                if target_ask - target_bid < self.tick_size:
+                # 最小价差保护 & 防止交叉
+                if target_ask <= target_bid:
                     center = self.quantizer.quantize(mid_price, 'FLOOR')
                     target_bid = center - self.tick_size
                     target_ask = center + self.tick_size
+                elif target_ask - target_bid < self.tick_size:
+                    # 如果算出来价差太窄，强制拉开 1 tick
+                    target_bid -= self.tick_size  # 尝试两边各拉一点，或者只拉一边
 
                 # --- 订单派发逻辑 ---
 
-                # 软限制: 接近上限时，禁止同向开仓
                 allow_buy = pos_value < self.soft_limit_usd
                 allow_sell = pos_value > -self.soft_limit_usd
 
@@ -253,13 +278,11 @@ class HFTMarketMakingStrategy:
                 ))
 
                 # --- 状态同步 ---
-                # [Strict] 缩短同步周期至 3s
                 current_ts = time.time()
                 if current_ts - self.pos_sync_time > 3.0:
                     self.pos_sync_time = current_ts
                     asyncio.create_task(self._sync_position())
 
-                # 日志采样
                 if current_ts - self.last_log_ts > 5.0:
                     log_payload = {
                         'tick_ts': tick.get('ts', 0) / 1000.0,
@@ -275,7 +298,8 @@ class HFTMarketMakingStrategy:
             lag = time.time() - log_payload['tick_ts']
             logger.info(
                 f"🧮 [Calc] Lag:{lag * 1000:.1f}ms | Inv:{log_payload['inv']:.4f} | "
-                f"Vol:{log_payload['vol']:.2f} | Mkt:{log_payload['bp']:.0f}/{log_payload['ap']:.0f}"
+                f"Vol:{log_payload['vol']:.2f} | Skew:{log_payload['skew']:.2f} | "
+                f"Mkt:{log_payload['bp']:.1f}/{log_payload['ap']:.1f}"
             )
 
     async def _execute_strict_bailout(self, inventory: float):
