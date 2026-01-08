@@ -240,8 +240,6 @@ class HFTMarketMakingStrategy:
                 half_spread = ((self.min_spread_ticks * 0.5) * self.tick_size) + \
                               (self.volatility_factor * damped_vol)
 
-                # [Strict Cap] 强制限制半边价差不超过 5-10 ticks (为了刷量)
-                max_half_spread = 5.0 * self.tick_size
                 half_spread = min(half_spread, max_half_spread)
 
                 raw_bid = reservation_price - half_spread
