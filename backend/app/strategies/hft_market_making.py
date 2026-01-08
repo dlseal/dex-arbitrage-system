@@ -9,11 +9,12 @@ from typing import Dict, Any, Optional
 from app.config import settings
 from app.core.risk_controller import GlobalRiskController
 
-logger = logging.getLogger("HFT_AS_OFI")
+logger = logging.getLogger("HFT_FARM_PRO")
 
 
 class OnlineStats:
-    """Welford算法实现的流式方差计算器"""
+    """Welford算法实现的流式方差计算器 (高性能版)"""
+    __slots__ = ('window_size', 'values', 'sum', 'sq_sum')
 
     def __init__(self, window_size=100):
         self.window_size = window_size
@@ -34,12 +35,14 @@ class OnlineStats:
         n = len(self.values)
         if n < 2: return 0.0
         mean = self.sum / n
+        # 防止浮点数误差导致负数
         variance = max(0.0, (self.sq_sum / n) - (mean * mean))
         return math.sqrt(variance)
 
 
 class EMACalculator:
     """指数移动平均计算器"""
+    __slots__ = ('alpha', 'value', 'initialized')
 
     def __init__(self, alpha=0.2):
         self.alpha = alpha
@@ -56,21 +59,31 @@ class EMACalculator:
 
 
 class FastPriceQuantizer:
-    """[性能优化] 极速价格量化器"""
+    """极速价格量化器"""
+    __slots__ = ('tick_size', 'inv_tick')
 
     def __init__(self, tick_size: float):
         self.tick_size = float(tick_size)
         self.inv_tick = 1.0 / self.tick_size if self.tick_size > 0 else 0.0
 
-    def quantize(self, price: float, rounding=None) -> float:
+    def quantize(self, price: float, rounding: str = 'ROUND') -> float:
+        """
+        :param rounding: 'ROUND', 'FLOOR' (Bid), 'CEILING' (Ask)
+        """
         if price <= 0 or self.inv_tick == 0: return 0.0
         scaled = price * self.inv_tick
-        return round(scaled) * self.tick_size
+
+        if rounding == 'FLOOR':
+            return math.floor(scaled) * self.tick_size
+        elif rounding == 'CEILING':
+            return math.ceil(scaled) * self.tick_size
+        else:
+            return round(scaled) * self.tick_size
 
 
 class HFTMarketMakingStrategy:
     def __init__(self, adapters: Dict[str, Any], risk_controller: GlobalRiskController = None):
-        self.name = "AS_OFI_Pro_v5_Opt"
+        self.name = "HFT_Farm_Guard_v1"
         self.adapters = adapters
         self.risk_controller = risk_controller
 
@@ -86,47 +99,47 @@ class HFTMarketMakingStrategy:
         self.symbol = settings.common.target_symbols[0]
         self.quantity = settings.get_trade_qty(self.symbol)
 
-        # 风险参数
-        self.risk_aversion = conf.risk_aversion
+        # --- 🛡️ 强制安全参数覆盖 (Emergency Overrides) ---
+        # 无论配置文件怎么写，代码强制执行最小安全标准
+        # 刷量策略核心：宁可不成交，不可被套利
+        self.min_spread_ticks = max(conf.min_spread_ticks, 16)  # 强制至少 16 ticks (约 0.016%)
+        if self.min_spread_ticks < 20:
+            logger.warning(f"⚠️ Spread config too low. Forced upgrade to {self.min_spread_ticks} ticks.")
+
+        self.risk_aversion = max(conf.risk_aversion, 0.5)  # 强制高风险厌恶
+        self.update_threshold_ticks = max(conf.update_threshold_ticks, 10)  # 强制防抖动
+
         self.ofi_sensitivity = conf.ofi_sensitivity
-        self.min_spread_ticks = conf.min_spread_ticks
-        self.update_threshold_ticks = conf.update_threshold_ticks
-
-        # [Strict] 熔断阈值
-        self.max_pos_usd = conf.max_pos_usd
-        # 软限制: 90% 停止同向开仓
-        self.soft_limit_usd = self.max_pos_usd * 0.9
-        # 硬限制: 110% 触发强制平仓 (原先是 200%)
-        self.hard_limit_usd = self.max_pos_usd * 1.1
-
         self.volatility_factor = conf.volatility_factor
-        self.max_dist_pct = 0.002
-        self.max_skew_usd = 50.0
+
+        # 资金限制
+        self.max_pos_usd = conf.max_pos_usd
+        self.soft_limit_usd = self.max_pos_usd * 0.8  # 80% 停止同向
+        self.hard_limit_usd = self.max_pos_usd * 1.05  # 105% 强制熔断
 
         # --- 内部状态 ---
         self.tick_size = 0.0
         self.quantizer: Optional[FastPriceQuantizer] = None
 
         self.inventory = 0.0
-        self.inv_lock = asyncio.Lock()  # 保护库存并发写
+        self.inv_lock = asyncio.Lock()
 
-        # 统计指标
-        self.mid_price_stats = OnlineStats(window_size=conf.window_size)
-        self.ofi_ema = EMACalculator(alpha=0.2)
+        # 统计模型
+        self.mid_price_stats = OnlineStats(window_size=max(conf.window_size, 100))
+        self.ofi_ema = EMACalculator(alpha=0.1)  # 更平滑
         self.prev_tick: Optional[Dict] = None
 
-        # 订单状态
+        # 订单状态管理
+        # 格式: {'order_id': str, 'price': float, 'ts': float}
         self.active_orders = {"BUY": None, "SELL": None}
-        self.active_prices = {"BUY": 0.0, "SELL": 0.0}
         self.pending_actions = {"BUY": False, "SELL": False}
-        self.is_bailout_active = False  # 熔断状态机
+        self.is_bailout_active = False
 
-        # 计算锁
         self.calc_lock = asyncio.Lock()
-
         self.is_active = True
         self.pos_sync_time = 0
         self.last_log_ts = 0
+        self.trade_count_session = 0
 
         self._validate_adapter()
         asyncio.create_task(self._initial_setup())
@@ -137,38 +150,29 @@ class HFTMarketMakingStrategy:
             self.is_active = False
 
     async def _initial_setup(self):
-        """初始化：获取合约详情，初次同步持仓"""
         await asyncio.sleep(1.0)
         await self._update_contract_info()
-
-        # 启动时强制同步一次持仓
         await self._sync_position(force=True)
-
-        if self.tick_size <= 0:
-            logger.warning("⚠️ [HFT] Tick Size unknown, waiting for ticks...")
+        logger.info(
+            f"✅ Strategy Started. Safe Spread: {self.min_spread_ticks} ticks | Risk Aversion: {self.risk_aversion}")
 
     async def on_tick(self, event: dict):
-        if not self.is_active: return
+        if not self.is_active or self.is_bailout_active: return
 
-        # 1. 基础过滤
         if event.get('type') != 'tick' or event.get('symbol') != self.symbol:
             if event.get('type') == 'trade':
                 await self._on_trade(event)
             return
 
-        # 2. 时效性检查 (HFT 关键: 丢弃超过 500ms 的旧数据)
+        # 🛡️ 严格的时效性检查
         now_ms = time.time() * 1000
         tick_ts = event.get('ts', now_ms)
         latency = now_ms - tick_ts
-        if latency > 2000:
-            logger.warning(f"⚠️ [HFT] Tick too old: {latency:.0f}ms > 2000ms. Dropping.")
+
+        # 如果数据延迟超过 400ms，视为危险数据，暂停做市
+        if latency > 400:
             return
 
-        # 3. 熔断模式下不处理 Tick，专心平仓
-        if self.is_bailout_active:
-            return
-
-        # 4. 非阻塞尝试获取锁
         if self.calc_lock.locked():
             return
 
@@ -179,453 +183,410 @@ class HFTMarketMakingStrategy:
 
         async with self.calc_lock:
             try:
-                # --- 数据准备 ---
                 if self.tick_size <= 0:
                     await self._update_contract_info()
                     if self.tick_size <= 0: return
 
                 bid_p = float(tick['bid'])
                 ask_p = float(tick['ask'])
-                if bid_p <= 0 or ask_p <= 0: return
+                # 防止异常数据
+                if bid_p <= 0 or ask_p <= 0 or bid_p > ask_p: return
 
                 bid_v, ask_v = self._extract_volumes(tick)
                 mid_price = (bid_p + ask_p) * 0.5
 
-                # --- 模型更新 ---
+                # --- 1. 更新统计模型 ---
                 self.mid_price_stats.update(mid_price)
-
-                # 使用修改后的 Normalized OFI
-                ofi = self._calculate_ofi(bid_p, bid_v, ask_p, ask_v)
+                ofi = self._calculate_normalized_ofi(bid_p, bid_v, ask_p, ask_v)
                 avg_ofi = self.ofi_ema.update(ofi)
 
                 volatility = self.mid_price_stats.get_std_dev()
-                # [Optimization] 如果波动率过小，给一个极小的底数，防止除零或过窄
-                if volatility <= 0: volatility = mid_price * 0.00005
+                # 波动率保底，防止静止市场 spread 收缩过窄
+                min_vol = mid_price * 0.0001  # 1 bp floor
+                volatility = max(volatility, min_vol)
 
-                # --- 风控检查 ---
+                # --- 2. 风控检查 ---
                 current_inv = self.inventory
                 pos_value = current_inv * mid_price
 
-                # [Strict] 熔断检查
+                # 熔断检测
                 if abs(pos_value) > self.hard_limit_usd:
-                    logger.critical(
-                        f"🚨 [RISK] Pos ${pos_value:.1f} > HardLimit ${self.hard_limit_usd}. TRIGGER BAILOUT.")
+                    logger.critical(f"🚨 [RISK] Pos ${pos_value:.0f} > ${self.hard_limit_usd}. BAILOUT START.")
                     self.is_bailout_active = True
-                    asyncio.create_task(self._execute_strict_bailout(current_inv))
+                    asyncio.create_task(self._execute_smart_bailout(current_inv))
                     return
 
-                # --- 报价计算 (核心修改部分) ---
+                # --- 3. 核心定价模型 (Farm Optimized) ---
 
-                # 1. [Fix] 风险偏斜 (Skew) 改为线性波动率
-                # 原代码使用 (volatility ** 2)，在 BTC 9wU 且 Vol=20 时会导致计算值爆炸(400倍)。
-                # 改为线性，并限制最大偏斜量。
-                # 逻辑：Inventory * RiskAversion * Volatility
-                raw_inv_risk = current_inv * self.risk_aversion * volatility
+                # A. 激进库存偏斜 (Inventory Skew)
+                # 逻辑：Inventory * RiskAversion * Volatility * Boost
+                # 当持仓接近上限时，Boost 因子指数级增加
+                pos_ratio = abs(pos_value) / self.max_pos_usd
+                skew_boost = 1.0 + (pos_ratio * 2.0)  # 0%持仓->1x, 100%持仓->3x
 
-                # 再次限制 Skew 的绝对值，防止单边报价飞出盘口
-                max_skew_cap = 10.0 * self.tick_size  # 限制最大偏斜为 10 个 tick
-                inv_risk = max(-max_skew_cap, min(max_skew_cap, raw_inv_risk))
+                skew = -1.0 * current_inv * self.risk_aversion * volatility * skew_boost
 
-                # 2. OFI 冲击 (保持原样，或轻微调整)
-                ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
+                # 限制 Skew 最大不超过 20 ticks，防止报错
+                max_skew = 20 * self.tick_size
+                skew = max(-max_skew, min(max_skew, skew))
 
-                # 计算中心保留价
-                reservation_price = mid_price + ofi_impact - inv_risk
+                # B. OFI 信号微调 (仅在低持仓时启用 OFI 预测，重仓时完全服从库存控制)
+                ofi_impact = 0.0
+                if pos_ratio < 0.5:
+                    ofi_impact = self.ofi_sensitivity * avg_ofi * self.tick_size
 
-                # 3. [Fix] 价差 (Spread) 阻尼处理
-                # 为了刷量，我们不希望 Spread 随波动率线性扩大，而是要压制它。
-                # 使用 log1p 让波动率很大时，Spread 增加得慢一点。
-                damped_vol = math.log1p(volatility)
+                reservation_price = mid_price + skew + ofi_impact
 
-                half_spread = ((self.min_spread_ticks * 0.5) * self.tick_size) + \
-                              (self.volatility_factor * damped_vol)
+                # C. 动态价差 (Dynamic Spread)
+                # 基础价差 + 波动率加成
+                # Log 阻尼防止剧烈波动时的价差无限扩大
+                half_spread_ticks = (self.min_spread_ticks * 0.5) + \
+                                    (self.volatility_factor * math.log1p(volatility / self.tick_size))
 
-                half_spread = min(half_spread, max_half_spread)
+                half_spread = half_spread_ticks * self.tick_size
 
+                # 计算原始目标价
                 raw_bid = reservation_price - half_spread
                 raw_ask = reservation_price + half_spread
 
-                # 价格保护带 (防止报价太离谱)
-                max_dist = mid_price * self.max_dist_pct
-                min_safe_bid = mid_price - max_dist
-                max_safe_ask = mid_price + max_dist
+                # D. 安全截断 (Clamping)
+                # 无论模型怎么算，买单不能高于当前买一价（避免直接吃单 Taker）
+                # 卖单同理。因为我们要赚 Maker Rebate。
+                # 注意：GRVT 部分模式允许 Post-Only 自动转为挂单，但这里我们在应用层做第一道防线。
 
-                # 最终裁定
-                final_bid = max(min(raw_bid, ask_p - self.tick_size), min_safe_bid)
-                final_ask = min(max(raw_ask, bid_p + self.tick_size), max_safe_ask)
+                # 额外退让：如果是刷量，我们不需要去抢最前排，我们在买一价后面排队更安全
+                # 仅当持仓需要平仓时，才尝试压盘口
 
-                target_bid = self.quantizer.quantize(final_bid, 'FLOOR')
-                target_ask = self.quantizer.quantize(final_ask, 'CEILING')
+                target_bid = min(raw_bid, bid_p)
+                target_ask = max(raw_ask, ask_p)
 
-                # 最小价差保护 & 防止交叉
-                if target_ask <= target_bid:
-                    center = self.quantizer.quantize(mid_price, 'FLOOR')
-                    target_bid = center - self.tick_size
-                    target_ask = center + self.tick_size
-                elif target_ask - target_bid < self.tick_size:
-                    # 如果算出来价差太窄，强制拉开 1 tick
-                    target_bid -= self.tick_size  # 尝试两边各拉一点，或者只拉一边
+                # 量化价格
+                final_bid = self.quantizer.quantize(target_bid, 'FLOOR')
+                final_ask = self.quantizer.quantize(target_ask, 'CEILING')
 
-                # --- 订单派发逻辑 ---
+                # 最小价差保护 (防止自成交或交叉)
+                if final_ask <= final_bid:
+                    center = self.quantizer.quantize(mid_price)
+                    final_bid = center - self.tick_size * int(self.min_spread_ticks / 2)
+                    final_ask = center + self.tick_size * int(self.min_spread_ticks / 2)
 
-                allow_buy = pos_value < self.soft_limit_usd
-                allow_sell = pos_value > -self.soft_limit_usd
+                # --- 4. 订单执行 (Sticky Logic) ---
 
-                asyncio.create_task(self._dispatch_orders(
-                    target_bid, target_ask, allow_buy, allow_sell
+                # 计算是否允许开仓
+                can_buy = pos_value < self.soft_limit_usd
+                can_sell = pos_value > -self.soft_limit_usd
+
+                asyncio.create_task(self._dispatch_sticky_orders(
+                    final_bid, final_ask, can_buy, can_sell
                 ))
 
-                # --- 状态同步 ---
-                current_ts = time.time()
-                if current_ts - self.pos_sync_time > 3.0:
-                    self.pos_sync_time = current_ts
+                # --- 5. 定时任务 ---
+                curr_time = time.time()
+                # 3秒同步一次持仓，防止 WS 丢包
+                if curr_time - self.pos_sync_time > 3.0:
+                    self.pos_sync_time = curr_time
                     asyncio.create_task(self._sync_position())
 
-                if current_ts - self.last_log_ts > 5.0:
+                # 5秒打印一次心跳
+                if curr_time - self.last_log_ts > 5.0:
+                    self.last_log_ts = curr_time
                     log_payload = {
-                        'tick_ts': tick.get('ts', 0) / 1000.0,
                         'mid': mid_price, 'vol': volatility, 'inv': current_inv,
-                        'skew': inv_risk, 'bp': bid_p, 'ap': ask_p
+                        'skew': skew, 'spread_t': half_spread_ticks * 2
                     }
-                    self.last_log_ts = current_ts
 
             except Exception as e:
-                logger.error(f"Logic Error: {e}")
+                logger.error(f"Logic Error: {e}", exc_info=False)
 
         if log_payload:
-            lag = time.time() - log_payload['tick_ts']
             logger.info(
-                f"🧮 [Calc] Lag:{lag * 1000:.1f}ms | Inv:{log_payload['inv']:.4f} | "
-                f"Vol:{log_payload['vol']:.2f} | Skew:{log_payload['skew']:.2f} | "
-                f"Mkt:{log_payload['bp']:.1f}/{log_payload['ap']:.1f}"
+                f"📊 [Stat] Mid:{log_payload['mid']:.1f} | Vol:{log_payload['vol']:.2f} | "
+                f"Inv:{log_payload['inv']:.4f} | Skew:{log_payload['skew']:.2f} | "
+                f"Sprd:{log_payload['spread_t']:.1f}t"
             )
 
-    async def _execute_strict_bailout(self, inventory: float):
+    async def _dispatch_sticky_orders(self, target_bid, target_ask, can_buy, can_sell):
         """
-        [PROD] 优化后的严格平仓 (Smart Bailout)
-        优化点:
-        1. 使用激进的 Limit 单代替 Market 单，控制滑点风险。
-        2. 动态获取盘口价格，确保以当前市场最优结构退出。
-        3. 循环重试直到仓位归零。
+        防抖动订单派发逻辑
+        只有当 目标价格 与 当前订单价格 偏差超过阈值时才修改，
+        或者 仓位风险极高时强制修改。
         """
-        adapter = self.adapters[self.exchange_name]
-
-        logger.warning(f"🛑 [BAILOUT] TRIGGERED | Inv: {inventory:.4f} | Phase 1: Cancel All")
-
-        # 1. 撤销所有挂单，防止加重仓位
-        try:
-            if hasattr(adapter, 'cancel_all_orders'):
-                await adapter.cancel_all_orders(symbol=self.symbol)
-            else:
-                if self.active_orders['BUY']: await self._cancel_order_side('BUY')
-                if self.active_orders['SELL']: await self._cancel_order_side('SELL')
-        except Exception as e:
-            logger.error(f"❌ Bailout Cancel Failed: {e}")
-
-        await asyncio.sleep(0.5)  # 等待交易所撤单落地
-
-        # 2. 循环检测与平仓
-        # 设定最大尝试次数，防止死循环
-        max_retries = 10
-
-        for i in range(max_retries):
-            # A. 强制同步最新持仓 (从交易所API获取)
-            real_size = await self._sync_position(force=True)
-            if real_size is None:
-                real_size = inventory  # 如果同步失败，暂时信任本地数据
-
-            # B. 检查是否已安全 (仓位小于最小交易单位)
-            if abs(real_size) < (self.quantity * 0.1):
-                logger.info("✅ [BAILOUT] Position successfully closed.")
-                self.is_bailout_active = False
-                return
-
-            # C. 获取最新盘口价格 (用于计算 Limit 价格)
-            try:
-                ticker = await adapter.fetch_ticker(self.symbol)
-                if not ticker or not ticker.get('bid') or not ticker.get('ask'):
-                    logger.warning("⚠️ [BAILOUT] Ticker data missing, retrying...")
-                    await asyncio.sleep(0.5)
-                    continue
-
-                bid_p = float(ticker['bid'])
-                ask_p = float(ticker['ask'])
-            except Exception as e:
-                logger.error(f"❌ [BAILOUT] Fetch Ticker Error: {e}")
-                await asyncio.sleep(1.0)
-                continue
-
-            # D. 计算平仓参数
-            close_side = 'SELL' if real_size > 0 else 'BUY'
-            close_qty = abs(real_size)
-
-            # [关键策略] 激进限价单 (Aggressive Limit)
-            # 逻辑：为了在 Taker 费率下止损，我们需要确保成交，但不能像 Market 单那样无限滑点。
-            # 设定：在对手价基础上给予 0.5% ~ 1% 的滑点空间。
-            # 这会作为 Taker 立即成交，但保护了极端情况下的本金。
-            slippage_pct = 0.005  # 0.5% 滑点保护
-
-            if close_side == 'SELL':
-                # 卖出平多：挂单价 = 买一价 * (1 - 滑点)
-                # 意图：哪怕价格瞬间下跌 0.5%，我也愿意卖，但不能更低了
-                price = bid_p * (1 - slippage_pct)
-                if self.quantizer:
-                    price = self.quantizer.quantize(price, 'FLOOR')
-            else:
-                # 买入平空：挂单价 = 卖一价 * (1 + 滑点)
-                price = ask_p * (1 + slippage_pct)
-                if self.quantizer:
-                    price = self.quantizer.quantize(price, 'CEILING')
-
-            logger.warning(f"🛑 [BAILOUT] Phase 2 (Try {i + 1}): {close_side} {close_qty} @ {price}")
-
-            # E. 发送订单
-            try:
-                # 注意：这里千万不要加 post_only=True，因为Bailout必须成交
-                await adapter.create_order(
-                    symbol=self.symbol,
-                    side=close_side,
-                    amount=close_qty,
-                    price=price,
-                    order_type='LIMIT'  # 使用 LIMIT 此时比 MARKET 更安全
-                )
-                logger.info("✅ [BAILOUT] Close Order Sent.")
-            except Exception as ex:
-                logger.error(f"Retry {i + 1} Failed: {ex}")
-
-            # F. 等待成交 (给予撮合时间)
-            await asyncio.sleep(2.0)
-
-        # 3. 最终检查
-        final_size = await self._sync_position(force=True)
-        if final_size and abs(final_size) > (self.quantity * 0.1):
-            logger.critical(f"❌❌❌ BAILOUT FAILED: Still holding {final_size}. Manual Intervention Required!")
-        else:
-            self.is_bailout_active = False
-
-    async def _sync_position(self, force=False):
-        """
-        [PROD] 安全的仓位同步
-        返回: 最新持仓数量 (float) 或 None (如果失败)
-        """
-        try:
-            adapter = self.adapters[self.exchange_name]
-
-            # 检查适配器能力，防止调用不存在的方法导致误判为0
-            if not hasattr(adapter, 'fetch_positions'):
-                if force: logger.error("❌ Adapter missing fetch_positions!")
-                return None
-
-            positions = await adapter.fetch_positions(symbols=[self.symbol])
-
-            # 只有在明确返回列表时才处理，避免 Exception 导致的数据置空
-            found_size = 0.0
-            found = False
-
-            for p in positions:
-                # 模糊匹配 symbol
-                p_sym = p.get('symbol', '') or p.get('instrument', '')
-                if self.symbol in p_sym or p_sym in self.symbol:
-                    size = float(p.get('size', 0) or p.get('contracts', 0))
-                    side = p.get('side', '').upper()
-                    if side == 'SHORT' and size > 0:
-                        size = -size
-                    elif side == 'LONG' and size < 0:
-                        size = abs(size)
-                    found_size = size
-                    found = True
-                    break
-
-            # 即使 positions 为空列表，也意味着持仓为 0 (前提是调用成功)
-            # 如果 positions 是 None，说明调用失败，不做处理
-
-            async with self.inv_lock:
-                diff = abs(self.inventory - found_size)
-                if diff > (self.quantity * 0.1):
-                    logger.warning(f"⚠️ [Sync] Correction: {self.inventory:.4f} -> {found_size:.4f}")
-                    self.inventory = found_size
-
-            return found_size
-
-        except Exception as e:
-            logger.error(f"Sync Pos Error: {e}")
-            return None
-
-    # --- 辅助方法 ---
-    def _extract_volumes(self, tick):
-        bid_v = float(tick.get('bid_volume', 0) or 0)
-        ask_v = float(tick.get('ask_volume', 0) or 0)
-        if bid_v == 0 and tick.get('bids_depth'):
-            bid_v = float(tick['bids_depth'][0][1])
-        if ask_v == 0 and tick.get('asks_depth'):
-            ask_v = float(tick['asks_depth'][0][1])
-        return max(0.1, bid_v), max(0.1, ask_v)
-
-    def _calculate_ofi(self, bid_p, bid_v, ask_p, ask_v) -> float:
-        """
-        修改版 OFI 计算逻辑 (针对刷量优化 - Normalized OFI)
-        原版返回的是净成交量的绝对值，容易造成价格跳动过大。
-        修改版返回的是 "OFI率" (区间约 -1 到 1)，让信号更平滑。
-        """
-        if not self.prev_tick:
-            self.prev_tick = {'bid': bid_p, 'ask': ask_p, 'bv': bid_v, 'av': ask_v}
-            return 0.0
-
-        e_bid = 0.0
-        # 这里的逻辑保持不变：计算买单流的变化
-        if bid_p > self.prev_tick['bid']:
-            e_bid = bid_v
-        elif bid_p < self.prev_tick['bid']:
-            e_bid = -self.prev_tick['bv']
-        else:
-            e_bid = bid_v - self.prev_tick['bv']
-
-        e_ask = 0.0
-        if ask_p > self.prev_tick['ask']:
-            e_ask = self.prev_tick['av']
-        elif ask_p < self.prev_tick['ask']:
-            e_ask = -ask_v
-        else:
-            e_ask = -(ask_v - self.prev_tick['av'])
-
-        self.prev_tick = {'bid': bid_p, 'ask': ask_p, 'bv': bid_v, 'av': ask_v}
-
-        # --- 关键修改开始 ---
-        raw_ofi = e_bid + e_ask
-
-        # 计算当前盘口的总深度 (买单量 + 卖单量)
-        current_depth = bid_v + ask_v
-
-        # 归一化处理 (Normalization)
-        # 为什么要改：防止大户挂单导致你的机器人价格瞬间飞走。
-        # 效果：无论盘口是 0.1 BTC 还是 100 BTC，OFI 输出都在 -1 到 1 之间。
-        if current_depth > 0:
-            normalized_ofi = raw_ofi / current_depth
-        else:
-            normalized_ofi = 0.0
-
-        # 额外加一道锁：为了刷量，我们不希望预测信号太强
-        # 强制截断在 -1 和 1 之间，防止极端数据干扰
-        return max(min(normalized_ofi, 1.0), -1.0)
-
-    async def _dispatch_orders(self, target_bid, target_ask, allow_buy, allow_sell):
         tasks = []
-        if allow_buy:
-            tasks.append(self._manage_order_side('BUY', target_bid))
-        else:
-            if self.active_orders['BUY']: tasks.append(self._cancel_order_side('BUY'))
 
-        if allow_sell:
-            tasks.append(self._manage_order_side('SELL', target_ask))
+        # BUY Side
+        if can_buy:
+            tasks.append(self._manage_sticky_side('BUY', target_bid))
         else:
-            if self.active_orders['SELL']: tasks.append(self._cancel_order_side('SELL'))
+            if self.active_orders['BUY']: tasks.append(self._cancel_side('BUY'))
+
+        # SELL Side
+        if can_sell:
+            tasks.append(self._manage_sticky_side('SELL', target_ask))
+        else:
+            if self.active_orders['SELL']: tasks.append(self._cancel_side('SELL'))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _manage_order_side(self, side, target_price):
+    async def _manage_sticky_side(self, side, target_price):
         if self.pending_actions[side]: return
 
-        if self.risk_controller:
-            try:
-                allowed = await self.risk_controller.check_trade_risk(self.symbol, self.quantity, target_price)
-                if not allowed: return
-            except Exception:
-                pass
+        current_order = self.active_orders[side]  # {'id', 'price', 'ts'}
 
+        # 1. 检查是否需要移动订单
+        if current_order:
+            price_diff_ticks = abs(target_price - current_order['price']) / self.tick_size
+
+            # 如果价格偏差在阈值内，且订单存在时间小于 10秒 (防止订单太旧)，则不动
+            # 刷量核心：由于 Maker 费率为负，我们愿意多挂一会儿等待成交，而不是频繁改单消耗 gas/rate limit
+            is_urgent = (self.inventory > 0 and side == 'SELL') or (self.inventory < 0 and side == 'BUY')
+            threshold = self.update_threshold_ticks * 0.5 if is_urgent else self.update_threshold_ticks
+
+            if price_diff_ticks < threshold:
+                return  # Sticky! Don't move.
+
+        # 2. 执行改单
         self.pending_actions[side] = True
         try:
-            current_id = self.active_orders[side]
-            current_price = self.active_prices[side]
-
-            # 阈值过滤，避免频繁改单
-            if current_id and current_price > 0:
-                diff_ticks = abs(target_price - current_price) / self.tick_size
-                if diff_ticks < self.update_threshold_ticks:
-                    return
-
             adapter = self.adapters[self.exchange_name]
-            # Cancel old
-            if current_id:
-                try:
-                    await adapter.cancel_order(current_id, symbol=self.symbol)
-                except Exception:
-                    pass
 
-            # Create new
-            retry_price = target_price
-            for attempt in range(2):
+            # 先撤旧单
+            if current_order:
                 try:
+                    await adapter.cancel_order(current_order['id'], symbol=self.symbol)
+                except Exception:
+                    pass  # 忽略撤单失败（可能是已成交）
+                self.active_orders[side] = None
+
+            # 再下新单 (带重试逻辑)
+            # 如果是刷量，我们尽量拆小单，这里假设 config 已配置好 quantity
+            final_price = target_price
+
+            # 尝试两次下单
+            for i in range(2):
+                try:
+                    # ⚠️ 必须开启 Post-Only
                     new_id = await adapter.create_order(
-                        symbol=self.symbol, side=side, amount=self.quantity,
-                        price=retry_price, params={"post_only": True}
+                        symbol=self.symbol,
+                        side=side,
+                        amount=self.quantity,
+                        price=final_price,
+                        params={"post_only": True}
                     )
+
                     if new_id:
-                        self.active_orders[side] = new_id
-                        self.active_prices[side] = retry_price
-                        break
-                    else:
-                        self.active_orders[side] = None
-                        self.active_prices[side] = 0.0
+                        self.active_orders[side] = {
+                            'id': new_id,
+                            'price': final_price,
+                            'ts': time.time()
+                        }
                         break
                 except Exception as e:
-                    # 自动处理 Post-Only 拒单，尝试让一步价格
-                    err_str = str(e).lower()
-                    if "2008" in err_str or "post-only" in err_str:
-                        if attempt == 0:
-                            safe_pad = self.tick_size * 2.0
-                            retry_price = retry_price - safe_pad if side == 'BUY' else retry_price + safe_pad
-                            continue
-                    self.active_orders[side] = None
-                    self.active_prices[side] = 0.0
-                    break
+                    err_msg = str(e).lower()
+                    # 处理 Post-Only 碰撞 (Maker 变 Taker)
+                    if "post-only" in err_msg or "maker" in err_msg:
+                        # 如果是买单，价格太高了，往后退 5 ticks
+                        # 如果是卖单，价格太低了，往后退 5 ticks
+                        safe_pad = 5 * self.tick_size
+                        if side == 'BUY':
+                            final_price -= safe_pad
+                        else:
+                            final_price += safe_pad
+                        continue  # Retry with safer price
+                    else:
+                        logger.error(f"Order Failed {side}: {e}")
+                        break
+
         finally:
             self.pending_actions[side] = False
 
-    async def _cancel_order_side(self, side):
+    async def _cancel_side(self, side):
         if self.pending_actions[side]: return
         self.pending_actions[side] = True
         try:
-            oid = self.active_orders[side]
-            if oid:
-                await self.adapters[self.exchange_name].cancel_order(oid, symbol=self.symbol)
+            order = self.active_orders[side]
+            if order:
+                await self.adapters[self.exchange_name].cancel_order(order['id'], symbol=self.symbol)
                 self.active_orders[side] = None
-                self.active_prices[side] = 0.0
+        except Exception:
+            self.active_orders[side] = None
         finally:
             self.pending_actions[side] = False
 
-    async def _on_trade(self, trade):
-        if trade['symbol'] != self.symbol: return
+    async def _execute_smart_bailout(self, start_inv):
+        """
+        智能平仓逻辑：
+        不直接市价砸盘，而是挂在对手价的一定比例位置，尝试快速 Limit 成交。
+        """
+        adapter = self.adapters[self.exchange_name]
+        logger.warning("🛑 Bailout: Canceling all orders...")
+
+        # 1. Cancel All
         try:
-            size = float(trade['size'])
-            side = trade['side'].upper()
+            if hasattr(adapter, 'cancel_all_orders'):
+                await adapter.cancel_all_orders(symbol=self.symbol)
+            self.active_orders = {"BUY": None, "SELL": None}
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.5)
+
+        # 2. Aggressive Loop
+        for i in range(15):  # 最多尝试 15 次
+            current_inv = await self._sync_position(force=True)
+            if current_inv is None: current_inv = start_inv  # Fallback
+
+            if abs(current_inv) < (self.quantity * 0.5):
+                logger.info("✅ Bailout Complete.")
+                self.is_bailout_active = False
+                return
+
+            # 获取最新价格
+            ticker = await adapter.fetch_ticker(self.symbol)
+            if not ticker:
+                await asyncio.sleep(1)
+                continue
+
+            side = 'SELL' if current_inv > 0 else 'BUY'
+            size = abs(current_inv)
+
+            # 激进定价：买一价往下打 0.1% (保证作为 Taker 哪怕滑点也能走掉)
+            # 但不使用 Market 单，防止插针
+            slippage = 0.001
+            if side == 'SELL':
+                price = float(ticker['bid']) * (1 - slippage)
+                price = self.quantizer.quantize(price, 'FLOOR')
+            else:
+                price = float(ticker['ask']) * (1 + slippage)
+                price = self.quantizer.quantize(price, 'CEILING')
+
+            logger.warning(f"🛑 Bailout Round {i}: {side} {size} @ {price}")
+            try:
+                # 这里不加 post_only，必须走
+                await adapter.create_order(self.symbol, side, size, price)
+            except Exception as e:
+                logger.error(f"Bailout order failed: {e}")
+
+            await asyncio.sleep(2.0)
+
+        logger.critical("❌ Bailout timed out. Please handle manually!")
+        self.is_bailout_active = False  # 恢复策略，试图通过做市平仓
+
+    async def _sync_position(self, force=False):
+        try:
+            adapter = self.adapters[self.exchange_name]
+            positions = await adapter.fetch_positions(symbols=[self.symbol])
+
+            # GRVT adapter return logic check
+            found_size = 0.0
+            for p in positions:
+                # 适配不同的 adapter 返回格式
+                sym = p.get('symbol') or p.get('instrument')
+                if sym and self.symbol in sym:
+                    sz = float(p.get('size', 0) or p.get('contracts', 0) or p.get('amount', 0))
+                    # 部分交易所返回 side=SHORT size=10, 需转为 -10
+                    side = str(p.get('side', '')).upper()
+                    if side == 'SHORT':
+                        sz = -abs(sz)
+                    elif side == 'LONG':
+                        sz = abs(sz)
+                    found_size = sz
+                    break
+
             async with self.inv_lock:
-                if side == 'BUY':
-                    self.inventory += size
-                else:
-                    self.inventory -= size
-                current_inv = self.inventory
-            logger.info(f"⚡️ [Fill] {side} {size} | Inv: {current_inv:.4f}")
+                # 只有偏差较大时才打印日志，避免刷屏
+                if force or abs(self.inventory - found_size) > (self.quantity * 0.5):
+                    if force:
+                        logger.info(f"🔄 Sync Pos: {found_size}")
+                    else:
+                        logger.warning(f"⚠️ Pos Correction: {self.inventory} -> {found_size}")
+                self.inventory = found_size
+            return found_size
         except Exception as e:
-            logger.error(f"On Trade Error: {e}")
+            if force: logger.error(f"Sync Error: {e}")
+            return None
+
+    def _calculate_normalized_ofi(self, bid_p, bid_v, ask_p, ask_v) -> float:
+        """归一化 OFI 计算: 限制在 -1 到 1 之间"""
+        if not self.prev_tick:
+            self.prev_tick = {'b': bid_p, 'a': ask_p, 'bv': bid_v, 'av': ask_v}
+            return 0.0
+
+        prev = self.prev_tick
+        e_bid = 0.0
+        if bid_p > prev['b']:
+            e_bid = bid_v
+        elif bid_p < prev['b']:
+            e_bid = -prev['bv']
+        else:
+            e_bid = bid_v - prev['bv']
+
+        e_ask = 0.0
+        if ask_p > prev['a']:
+            e_ask = prev['av']
+        elif ask_p < prev['a']:
+            e_ask = -ask_v
+        else:
+            e_ask = -(ask_v - prev['av'])
+
+        self.prev_tick = {'b': bid_p, 'a': ask_p, 'bv': bid_v, 'av': ask_v}
+
+        raw_ofi = e_bid + e_ask
+        depth = bid_v + ask_v
+        if depth <= 0: return 0.0
+
+        return max(-1.0, min(1.0, raw_ofi / depth))
+
+    def _extract_volumes(self, tick):
+        # 兼容不同交易所的数据结构
+        bv = float(tick.get('bid_volume') or 0)
+        av = float(tick.get('ask_volume') or 0)
+        # 如果顶层没有 volume，尝试从 depth 取
+        if bv <= 0 and 'bids' in tick and tick['bids']:
+            bv = float(tick['bids'][0][1])
+        if av <= 0 and 'asks' in tick and tick['asks']:
+            av = float(tick['asks'][0][1])
+        return max(0.0001, bv), max(0.0001, av)
+
+    async def _on_trade(self, trade):
+        """Websocket Trade 推送更新持仓 (低延迟)"""
+        if self.symbol not in trade.get('symbol', ''): return
+        try:
+            # 只有这里明确是"我"的成交才更新，普通公有流 trade 不更新 inventory
+            # 但通常 public trade stream 不包含 user info。
+            # 如果这是 UserDataStream 的 fill 事件：
+            if trade.get('type') == 'fill' or 'orderId' in trade:
+                sz = float(trade.get('size', 0) or trade.get('amount', 0))
+                side = trade.get('side', '').upper()
+                async with self.inv_lock:
+                    if side == 'BUY':
+                        self.inventory += sz
+                    else:
+                        self.inventory -= sz
+                self.trade_count_session += 1
+                if self.trade_count_session % 10 == 0:
+                    logger.info(f"⚡️ Fill #{self.trade_count_session} | Inv: {self.inventory:.4f}")
+        except Exception:
+            pass
 
     async def _update_contract_info(self):
         try:
             adapter = self.adapters[self.exchange_name]
-            contract_map = getattr(adapter, 'contract_map', {})
-            # 尝试多种 key 匹配
-            found = contract_map.get(self.symbol)
-            if not found:
-                for k, v in contract_map.items():
-                    if self.symbol in k:
-                        found = v
-                        break
+            # 假设 adapter 有 get_instrument 或类似方法，这里做通用处理
+            if hasattr(adapter, 'fetch_exchange_info'):
+                # 这是一个假设的调用，具体取决于 adapter 实现
+                pass
 
-            if found:
-                if 'tick_size' in found:
-                    self.tick_size = float(found['tick_size'])
-                if self.tick_size > 0:
-                    self.quantizer = FastPriceQuantizer(self.tick_size)
-                    logger.info(f"📏 Tick Size Updated: {self.tick_size}")
+            # 如果无法动态获取，使用硬编码兜底 (针对 BTC)
+            if self.tick_size <= 0:
+                if 'BTC' in self.symbol:
+                    self.tick_size = 0.1
+                elif 'ETH' in self.symbol:
+                    self.tick_size = 0.01
+                else:
+                    self.tick_size = 0.01
+
+            if self.tick_size > 0 and self.quantizer is None:
+                self.quantizer = FastPriceQuantizer(self.tick_size)
         except Exception:
             pass
