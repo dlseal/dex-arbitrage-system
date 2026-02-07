@@ -102,9 +102,11 @@ class HFTMarketMakingStrategy:
         # --- 🛡️ 强制安全参数覆盖 (Emergency Overrides) ---
         # 无论配置文件怎么写，代码强制执行最小安全标准
         # 刷量策略核心：宁可不成交，不可被套利
-        self.min_spread_ticks = max(conf.min_spread_ticks, 16)  # 强制至少 16 ticks (约 0.016%)
-        if self.min_spread_ticks < 20:
-            logger.warning(f"⚠️ Spread config too low. Forced upgrade to {self.min_spread_ticks} ticks.")
+        # self.min_spread_ticks = max(conf.min_spread_ticks, 16)  # 强制至少 16 ticks (约 0.016%)
+        # if self.min_spread_ticks < 20:
+        #     logger.warning(f"⚠️ Spread config too low. Forced upgrade to {self.min_spread_ticks} ticks.")
+
+        self.min_spread_ticks = max(conf.min_spread_ticks, 2)
 
         self.risk_aversion = max(conf.risk_aversion, 0.5)  # 强制高风险厌恶
         self.update_threshold_ticks = max(conf.update_threshold_ticks, 10)  # 强制防抖动

@@ -56,6 +56,10 @@ class GrvtLighterFarmStrategy:
         self.requote_threshold = float(getattr(conf, 'requote_threshold', 0.0001))
         self.required_depth_ratio = float(getattr(conf, 'required_depth_ratio', 3.0))
 
+        # [NEW] 生产级风控参数
+        self.max_inventory_usd = float(getattr(conf, 'max_inventory_usd', 2000.0))
+        self.circuit_breaker = False  # 熔断开关：True表示系统已瘫痪，停止一切操作
+
         # 开仓单的最小存活时间
         self.min_order_lifetime = 1.0
         self.urgent_threshold = 0.005
@@ -64,7 +68,7 @@ class GrvtLighterFarmStrategy:
         self.momentum_threshold = 0.001
 
         self.running = True
-        logger.info(f"🛡️ [Strategy] V10 Started. Hyper-Close Active.")
+        logger.info(f"🛡️ [Strategy] V10 Started. Circuit Breaker Ready. Max Inventory: ${self.max_inventory_usd}")
 
         asyncio.create_task(self._watchdog_loop())
 
@@ -119,11 +123,12 @@ class GrvtLighterFarmStrategy:
         try:
             size = float(trade['size'])
             side = trade['side']
+            price = float(trade.get('price', 0))
         except:
             return
 
         if exchange == 'GRVT':
-            logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {trade.get('price')}")
+            logger.info(f"⚡️ [FILL DETECTED] GRVT {side} {size} @ {price}")
             self.last_grvt_fill_ts[symbol] = time.time()
 
             # 成交即重置，防止旧单残留
@@ -132,8 +137,23 @@ class GrvtLighterFarmStrategy:
             async with self.hedge_lock:
                 current = self.pos_grvt.get(symbol, 0.0)
                 change = size if side == 'BUY' else -size
-                self.pos_grvt[symbol] = current + change
-                await self._execute_hedge_logic(symbol)
+                new_pos = current + change
+
+                # [NEW] 硬性库存风控 (Hard Inventory Cap)
+                current_usd_value = abs(new_pos) * price
+                if current_usd_value > self.max_inventory_usd:
+                    logger.critical(
+                        f"🚫 [RISK] Inventory limit breached ({current_usd_value:.2f} > {self.max_inventory_usd}). TRIGGERING CIRCUIT BREAKER.")
+                    self.circuit_breaker = True
+                    self.pos_grvt[symbol] = new_pos
+                    await self._cancel_all_maker(symbol)
+                    return  # 立即终止，不再对冲
+
+                self.pos_grvt[symbol] = new_pos
+
+                # 如果未熔断，才执行对冲
+                if not self.circuit_breaker:
+                    await self._execute_hedge_logic(symbol)
 
         elif exchange == 'Lighter':
             async with self.hedge_lock:
@@ -141,18 +161,29 @@ class GrvtLighterFarmStrategy:
                 change = size if side == 'BUY' else -size
                 self.pos_lighter[symbol] = current + change
                 logger.info(f"✅ [HEDGE CONFIRMED] Lighter {side} {size}. Net: {self.pos_lighter[symbol]}")
-                # 对冲后立即刷新挂单
-                asyncio.create_task(self._update_maker_quotes(symbol))
+
+                # 对冲后立即刷新挂单 (仅当系统健康时)
+                if not self.circuit_breaker:
+                    asyncio.create_task(self._update_maker_quotes(symbol))
 
     async def _process_tick(self, tick: dict):
+        # [NEW] 熔断检查：如果策略已熔断，不再处理任何行情，防止死灰复燃
+        if not self.running or self.circuit_breaker:
+            return
+
+        etype = tick.get(
+            'type')  # Note: original code passed event to on_tick, this method receives tick dict directly from on_tick wrapper
+        # 兼容逻辑：如果直接调用 _process_tick，参数是 tick 数据
         symbol = tick['symbol']
         exchange = tick['exchange']
+
         if symbol not in self.tickers: self.tickers[symbol] = {}
         self.tickers[symbol][exchange] = tick
 
         if exchange == 'Lighter' or exchange == 'GRVT':
             if exchange == 'Lighter':
                 self._update_price_history(symbol, tick)
+            # 只有在未熔断时才更新挂单
             asyncio.create_task(self._update_maker_quotes(symbol))
 
     def _update_price_history(self, symbol: str, tick: dict):
@@ -176,6 +207,8 @@ class GrvtLighterFarmStrategy:
         return 'NEUTRAL'
 
     async def _execute_hedge_logic(self, symbol: str):
+        if self.circuit_breaker: return
+
         retry_count = 0
         max_retries = 5
 
@@ -197,7 +230,8 @@ class GrvtLighterFarmStrategy:
                     continue
 
                 ref_price = lighter_tick['ask'] if hedge_side == 'BUY' else lighter_tick['bid']
-                limit_price = ref_price * 1.015 if hedge_side == 'BUY' else ref_price * 0.985
+                # 稍微放宽对冲滑点，确保成交
+                limit_price = ref_price * 1.02 if hedge_side == 'BUY' else ref_price * 0.98
 
                 logger.info(f"🌊 [FIRING HEDGE] Lighter {hedge_side} {hedge_size} @ ~{limit_price:.4f}")
 
@@ -213,7 +247,8 @@ class GrvtLighterFarmStrategy:
                     change = hedge_size if hedge_side == 'BUY' else -hedge_size
                     self.pos_lighter[symbol] += change
                     await asyncio.sleep(0.1)
-                    continue
+                    # 对冲成功，直接返回
+                    return
 
             except Exception as e:
                 logger.error(f"❌ [Hedge Error] {e}")
@@ -221,14 +256,23 @@ class GrvtLighterFarmStrategy:
             retry_count += 1
             await asyncio.sleep(0.3)
 
-        logger.critical(f"💀 [HEDGE FAILED] {symbol} - Stopping Quotes")
+        # [NEW] 重试耗尽，严重故障 -> 触发熔断
+        logger.critical(f"💀 [HEDGE FAILED] {symbol} after {max_retries} retries. SYSTEM HALTED.")
+        self.circuit_breaker = True
         asyncio.create_task(self._cancel_all_maker(symbol))
 
     async def _update_maker_quotes(self, symbol: str):
+        # [NEW] 熔断锁：一旦熔断，严禁任何挂单逻辑执行
+        if self.circuit_breaker:
+            return
+
         lock = self._get_lock(symbol)
         if lock.locked(): return
 
         async with lock:
+            # 双重检查，防止在等待锁的过程中熔断被触发
+            if self.circuit_breaker: return
+
             lighter_tick = self.tickers.get(symbol, {}).get('Lighter')
             grvt_tick = self.tickers.get(symbol, {}).get('GRVT')
 
@@ -389,7 +433,7 @@ class GrvtLighterFarmStrategy:
                     self.maker_order_info[symbol][side] = {'price': price, 'ts': time.time()}
 
                     log_tag = "CLOSE" if (side == 'SELL' and self.pos_grvt.get(symbol, 0) > 0) or (
-                                side == 'BUY' and self.pos_grvt.get(symbol, 0) < 0) else "OPEN"
+                            side == 'BUY' and self.pos_grvt.get(symbol, 0) < 0) else "OPEN"
                     logger.info(f"🆕 [QUOTE-{log_tag}] {symbol} {side} {order_qty} @ {price:.2f}")
             except Exception as e:
                 logger.warning(f"⚠️ Quote Failed: {e}")
